@@ -67,6 +67,9 @@ pub struct Dependency {
     /// `current` was guessed from a range like `^14.0.0` because nothing was installed or locked.
     pub approximate: bool,
     pub latest: Option<String>,
+    /// Newest version on the current release line, when newer than `current`.
+    #[serde(default)]
+    pub safe_latest: Option<String>,
     pub status: Status,
     pub vulns: Vec<String>,
     pub note: Option<String>,
@@ -85,6 +88,7 @@ impl Dependency {
             current: None,
             approximate: false,
             latest: None,
+            safe_latest: None,
             status: Status::Pending,
             vulns: Vec::new(),
             note: None,

@@ -25,7 +25,7 @@ impl Version {
         Some(Self { parts, prerelease })
     }
 
-    fn part(&self, i: usize) -> u64 {
+    pub fn part(&self, i: usize) -> u64 {
         self.parts.get(i).copied().unwrap_or(0)
     }
 }
@@ -61,6 +61,20 @@ pub fn max_version<'a>(versions: impl IntoIterator<Item = &'a str>) -> Option<St
         .max_by(by_version)
         .or_else(|| parsed.iter().max_by(by_version))
         .map(|(_, raw)| raw.to_string())
+}
+
+/// Newest stable version on the same release line as `current` - same major,
+/// or same minor for 0.x, where minor bumps are the breaking ones. `None`
+/// when nothing newer exists on that line.
+pub fn safe_target(current: &str, versions: &[String]) -> Option<String> {
+    let c = Version::parse(current)?;
+    let same_line = |v: &Version| if c.part(0) == 0 { v.part(0) == 0 && v.part(1) == c.part(1) } else { v.part(0) == c.part(0) };
+    versions
+        .iter()
+        .filter_map(|raw| Version::parse(raw).map(|v| (v, raw)))
+        .filter(|(v, _)| !v.prerelease && same_line(v) && *v > c)
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.0.parts.len().cmp(&b.0.parts.len())))
+        .map(|(_, raw)| raw.clone())
 }
 
 /// Compares only as precisely as `current` was written, so a floating `v7`
@@ -117,6 +131,15 @@ mod tests {
         assert_eq!(compare("18.2.0", "18.3.1"), Status::Minor);
         assert_eq!(compare("13.0.1", "13.0.3"), Status::Patch);
         assert_eq!(compare("1.2", "1.2.9"), Status::UpToDate);
+    }
+
+    #[test]
+    fn safe_target_stays_on_release_line() {
+        let versions: Vec<String> = ["4.1.0", "4.9.2", "5.0.0", "5.1.0-beta", "0.3.9"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(safe_target("4.1.0", &versions).as_deref(), Some("4.9.2"));
+        assert_eq!(safe_target("4.9.2", &versions), None);
+        assert_eq!(safe_target("0.3.1", &versions).as_deref(), Some("0.3.9"));
+        assert_eq!(safe_target("5.0.0", &versions), None);
     }
 
     #[test]

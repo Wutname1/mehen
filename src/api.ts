@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, StoreStats } from './types'
+import type { Change, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, StoreStats, UpdateEvent, UpdateOutcome, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -56,6 +56,33 @@ export async function scanAndCheck(refresh: boolean): Promise<Inventory> {
   }
   return invoke<Inventory>('scan_and_check', { refresh })
 }
+
+export interface ApplyResult {
+  outcome: UpdateOutcome
+  inventory: Inventory | null
+}
+
+export async function planUpdate(projectId: string, changes: Change[]): Promise<UpdatePlan> {
+  if (!inTauri) return mock.planUpdate(projectId, changes)
+  return invoke<UpdatePlan>('plan_update', { projectId, changes })
+}
+
+export async function applyUpdate(plan: UpdatePlan, verify: boolean): Promise<ApplyResult> {
+  if (!inTauri) return mock.applyUpdate(plan, verify)
+  return invoke<ApplyResult>('apply_update', { plan, verify })
+}
+
+export async function onUpdateEvent(handler: (e: UpdateEvent) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    mockUpdateListener = handler
+    return () => {
+      if (mockUpdateListener === handler) mockUpdateListener = null
+    }
+  }
+  return listen<UpdateEvent>('mehen://update', (e) => handler(e.payload))
+}
+
+let mockUpdateListener: ((e: UpdateEvent) => void) | null = null
 
 export async function storeStats(): Promise<StoreStats | null> {
   if (!inTauri) return null
@@ -149,5 +176,37 @@ const mock = (() => {
       }))
     },
     inventory: filtered,
+    // Fake plan and apply so the update flow can be exercised in a browser.
+    planUpdate: async (projectId: string, changes: Change[]): Promise<UpdatePlan> => {
+      const inv = await load()
+      const project = inv?.projects.find((p) => p.id === projectId)
+      if (!project) throw new Error('Project not found')
+      const planned = changes.map((c) => ({ name: c.name, from: c.from, to: c.to, writtenBefore: c.from, writtenAfter: c.to }))
+      const diff = [`--- ${project.manifest}`, `+++ ${project.manifest}`, '@@ -1,3 +1,3 @@', ...planned.flatMap((c) => [`-  "${c.name}": "${c.writtenBefore}",`, `+  "${c.name}": "${c.writtenAfter}",`])].join('\n')
+      return {
+        projectId,
+        projectName: project.name,
+        ecosystem: project.ecosystem,
+        changes: planned,
+        edits: [{ path: project.manifest, before: '', after: '', diff }],
+        steps: [
+          { kind: 'install', label: 'npm install', program: 'npm', args: ['install'], cwd: project.dir },
+          { kind: 'verify', label: 'npm run build', program: 'npm', args: ['run', 'build'], cwd: project.dir },
+        ],
+        snapshots: [],
+        warnings: [],
+      }
+    },
+    applyUpdate: async (plan: UpdatePlan, verify: boolean): Promise<ApplyResult> => {
+      const steps = plan.steps.filter((s) => verify || s.kind === 'install')
+      const results = []
+      for (const [index, step] of steps.entries()) {
+        mockUpdateListener?.({ index, label: step.label, state: 'running' })
+        await new Promise((r) => setTimeout(r, 700))
+        mockUpdateListener?.({ index, label: step.label, state: 'ok' })
+        results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 700 })
+      }
+      return { outcome: { ok: true, rolledBack: false, error: null, steps: results }, inventory: await filtered() }
+    },
   }
 })()

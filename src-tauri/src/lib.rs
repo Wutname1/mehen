@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use mehen_core::store::StoreStats;
-use mehen_core::{CheckOptions, DiscoveredProject, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
+use mehen_core::update::{self, Change, UpdateEvent, UpdateOutcome, UpdatePlan};
+use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -108,6 +109,42 @@ async fn scan_and_check(app: AppHandle, state: State<'_, AppState>, refresh: boo
     Ok(mehen_core::check(inventory, &state.store, options, emit).await)
 }
 
+/// Works out exactly what an update would change, without writing anything.
+#[tauri::command]
+fn plan_update(state: State<'_, AppState>, project_id: String, changes: Vec<Change>) -> Result<UpdatePlan, String> {
+    let inventory = state.store.last_inventory().ok_or("Run a check first")?;
+    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
+    update::plan(project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyResult {
+    outcome: UpdateOutcome,
+    /// A fresh check after a successful update (served from the cache).
+    inventory: Option<Inventory>,
+}
+
+/// Applies a reviewed plan, then re-checks so the results show the new versions.
+#[tauri::command]
+async fn apply_update(app: AppHandle, state: State<'_, AppState>, plan: UpdatePlan, verify: bool) -> Result<ApplyResult, String> {
+    let outcome = update::apply(&plan, verify, |e: UpdateEvent| {
+        let _ = app.emit("mehen://update", e);
+    })
+    .await;
+    if !outcome.ok {
+        return Ok(ApplyResult { outcome, inventory: None });
+    }
+    let roots = state.roots();
+    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
+    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
+    let emit = |p: Progress| {
+        let _ = app.emit("mehen://progress", p);
+    };
+    let inventory = mehen_core::check(inventory, &state.store, CheckOptions::default(), emit).await;
+    Ok(ApplyResult { outcome, inventory: Some(inventory) })
+}
+
 #[tauri::command]
 fn store_stats(state: State<'_, AppState>) -> Result<StoreStats, String> {
     state.store.stats().map_err(err)
@@ -155,6 +192,8 @@ pub fn run() {
             discover,
             last_inventory,
             scan_and_check,
+            plan_update,
+            apply_update,
             store_stats,
             clear_cache,
             open_in_editor

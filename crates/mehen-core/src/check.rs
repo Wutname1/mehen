@@ -12,7 +12,7 @@ use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Statu
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Store};
-use crate::version::{Version, compare, from_spec};
+use crate::version::{Version, compare, from_spec, safe_target};
 
 const LOOKUP_CONCURRENCY: usize = 8;
 
@@ -137,6 +137,7 @@ fn is_commit_sha(s: &str) -> bool {
 /// Clears results from a previous check and decides what "current" means before lookup.
 fn reset(dep: &mut Dependency) {
     dep.latest = None;
+    dep.safe_latest = None;
     dep.vulns.clear();
     dep.approximate = false;
     if dep.status == Status::Local {
@@ -181,6 +182,12 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>) 
         (Some(current), Some(latest)) => compare(current, latest),
         _ => Status::Unknown,
     };
+
+    // A floating `v4` action tag already tracks its whole major line.
+    let floating_tag = dep.ecosystem == Ecosystem::GithubActions && Version::parse(&dep.requested).is_some_and(|v| v.parts.len() == 1);
+    if !floating_tag {
+        dep.safe_latest = dep.current.as_deref().and_then(|c| safe_target(c, &info.versions)).filter(|s| Some(s) != dep.latest.as_ref());
+    }
 }
 
 async fn find_vulnerabilities(

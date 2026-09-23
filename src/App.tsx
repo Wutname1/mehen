@@ -392,7 +392,7 @@ export default function App() {
 
           <main className="min-h-0 flex-1 overflow-auto">
             {tab === 'packages' && <PackagesView groups={groups} roots={roots} onIgnore={ignore} />}
-            {tab === 'projects' && <ProjectsView projects={projects} roots={roots} depVisible={depVisible} onIgnore={ignore} />}
+            {tab === 'projects' && <ProjectsView projects={projects} roots={roots} depVisible={depVisible} onIgnore={ignore} onInventory={setInventory} />}
             {tab === 'vulns' && <VulnsView vulns={vulns} total={inventory.vulnerabilities.length} usages={usagesByVuln} roots={roots} />}
           </main>
 

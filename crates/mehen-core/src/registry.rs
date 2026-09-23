@@ -11,6 +11,9 @@ use crate::version::{Version, max_version};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PackageInfo {
     pub latest: Option<String>,
+    /// Every published version (tags for Actions), for picking safe targets.
+    #[serde(default)]
+    pub versions: Vec<String>,
     /// GitHub Actions only: (tag, commit SHA) pairs, so SHA pins can be named.
     pub tags: Vec<(String, String)>,
 }
@@ -77,10 +80,12 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
     struct Packument {
         #[serde(rename = "dist-tags", default)]
         dist_tags: std::collections::HashMap<String, String>,
+        #[serde(default)]
+        versions: std::collections::HashMap<String, serde::de::IgnoredAny>,
     }
     let url = format!("https://registry.npmjs.org/{}", name.replace('/', "%2f"));
     let doc: Packument = get(http, &url, Some("application/vnd.npm.install-v1+json")).await?.json().await?;
-    Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), ..Default::default() })
+    Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), ..Default::default() })
 }
 
 /// Uses the sparse index (static files behind a CDN) rather than the crates.io
@@ -106,7 +111,7 @@ async fn crates(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInf
         .filter(|e| !e.yanked)
         .map(|e| e.vers)
         .collect();
-    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), ..Default::default() })
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, ..Default::default() })
 }
 
 async fn nuget(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
@@ -116,7 +121,7 @@ async fn nuget(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo
     }
     let url = format!("https://api.nuget.org/v3-flatcontainer/{}/index.json", name.to_ascii_lowercase());
     let index: Index = get(http, &url, None).await?.json().await?;
-    Ok(PackageInfo { latest: max_version(index.versions.iter().map(String::as_str)), ..Default::default() })
+    Ok(PackageInfo { latest: max_version(index.versions.iter().map(String::as_str)), versions: index.versions, ..Default::default() })
 }
 
 /// `git ls-remote` does not count against GitHub's 60-requests-an-hour API
@@ -147,5 +152,6 @@ async fn github_tags(name: &str) -> anyhow::Result<PackageInfo> {
         }
     }
     let latest = max_version(tags.iter().map(|(t, _)| t.as_str()));
-    Ok(PackageInfo { latest, tags })
+    let versions = tags.iter().map(|(t, _)| t.clone()).filter(|t| Version::parse(t).is_some()).collect();
+    Ok(PackageInfo { latest, versions, tags })
 }

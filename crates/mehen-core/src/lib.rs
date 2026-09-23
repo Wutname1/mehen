@@ -10,6 +10,7 @@ pub mod osv;
 pub mod registry;
 pub mod scan;
 pub mod store;
+pub mod update;
 pub mod version;
 
 pub use check::{CheckOptions, check};

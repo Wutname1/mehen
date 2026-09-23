@@ -15,6 +15,7 @@ export interface Dependency {
   current: string | null
   approximate: boolean
   latest: string | null
+  safeLatest: string | null
   status: Status
   vulns: string[]
   note: string | null
@@ -106,4 +107,67 @@ export interface DiscoveredProject {
   repo: string | null
   dependencyCount: number
   ignoredBy: number | null
+}
+
+export interface Change {
+  name: string
+  from: string
+  to: string
+}
+
+export interface PlannedChange {
+  name: string
+  from: string
+  to: string
+  writtenBefore: string
+  writtenAfter: string
+}
+
+export interface FileEdit {
+  path: string
+  before: string
+  after: string
+  diff: string
+}
+
+export type StepKind = 'install' | 'verify'
+
+export interface Step {
+  kind: StepKind
+  label: string
+  program: string
+  args: string[]
+  cwd: string
+}
+
+export interface UpdatePlan {
+  projectId: string
+  projectName: string
+  ecosystem: Ecosystem
+  changes: PlannedChange[]
+  edits: FileEdit[]
+  steps: Step[]
+  snapshots: string[]
+  warnings: string[]
+}
+
+export interface StepResult {
+  label: string
+  kind: StepKind
+  ok: boolean
+  output: string
+  ms: number
+}
+
+export interface UpdateOutcome {
+  ok: boolean
+  rolledBack: boolean
+  error: string | null
+  steps: StepResult[]
+}
+
+export interface UpdateEvent {
+  index: number
+  label: string
+  state: 'running' | 'ok' | 'failed' | 'rolled-back'
 }
