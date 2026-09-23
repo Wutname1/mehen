@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::compat::Requirement;
 use crate::model::Ecosystem;
 use crate::version::{Version, max_version};
 
@@ -16,6 +17,9 @@ pub struct PackageInfo {
     pub versions: Vec<String>,
     /// GitHub Actions only: (tag, commit SHA) pairs, so SHA pins can be named.
     pub tags: Vec<(String, String)>,
+    /// What individual versions need from a project (frameworks, Rust, Node).
+    #[serde(default)]
+    pub requirements: Vec<(String, Requirement)>,
 }
 
 impl PackageInfo {
@@ -81,11 +85,25 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         #[serde(rename = "dist-tags", default)]
         dist_tags: std::collections::HashMap<String, String>,
         #[serde(default)]
-        versions: std::collections::HashMap<String, serde::de::IgnoredAny>,
+        versions: std::collections::HashMap<String, PackumentVersion>,
+    }
+    #[derive(Deserialize)]
+    struct PackumentVersion {
+        // Old packages sometimes publish `engines` as an array; keep it loose.
+        #[serde(default)]
+        engines: Option<serde_json::Value>,
     }
     let url = format!("https://registry.npmjs.org/{}", name.replace('/', "%2f"));
     let doc: Packument = get(http, &url, Some("application/vnd.npm.install-v1+json")).await?.json().await?;
-    Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), ..Default::default() })
+    let requirements = doc
+        .versions
+        .iter()
+        .filter_map(|(v, meta)| {
+            let range = meta.engines.as_ref()?.get("node")?.as_str()?.trim();
+            (!range.is_empty() && range != "*").then(|| (v.clone(), Requirement::Node { range: range.to_string() }))
+        })
+        .collect();
+    Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
 }
 
 /// Uses the sparse index (static files behind a CDN) rather than the crates.io
@@ -96,6 +114,8 @@ async fn crates(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInf
         vers: String,
         #[serde(default)]
         yanked: bool,
+        #[serde(default)]
+        rust_version: Option<String>,
     }
     let lower = name.to_ascii_lowercase();
     let prefix = match lower.len() {
@@ -105,23 +125,78 @@ async fn crates(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInf
         _ => format!("{}/{}", &lower[..2], &lower[2..4]),
     };
     let body = get(http, &format!("https://index.crates.io/{prefix}/{lower}"), None).await?.text().await?;
-    let versions: Vec<String> = body
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
-        .filter(|e| !e.yanked)
-        .map(|e| e.vers)
+    let entries: Vec<Entry> = body.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).filter(|e| !e.yanked).collect();
+    let requirements = entries
+        .iter()
+        .filter_map(|e| e.rust_version.as_ref().map(|r| (e.vers.clone(), Requirement::Rust { version: r.clone() })))
         .collect();
-    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, ..Default::default() })
+    let versions: Vec<String> = entries.into_iter().map(|e| e.vers).collect();
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
 }
 
+/// Uses the registration API rather than the flat version list because it
+/// also says which target frameworks each version ships for. Small packages
+/// inline every version in the index; large ones split into pages.
 async fn nuget(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
     #[derive(Deserialize)]
     struct Index {
-        versions: Vec<String>,
+        items: Vec<Page>,
     }
-    let url = format!("https://api.nuget.org/v3-flatcontainer/{}/index.json", name.to_ascii_lowercase());
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(rename = "@id")]
+        id: String,
+        #[serde(default)]
+        items: Option<Vec<Leaf>>,
+    }
+    #[derive(Deserialize)]
+    struct PageBody {
+        items: Vec<Leaf>,
+    }
+    #[derive(Deserialize)]
+    struct Leaf {
+        #[serde(rename = "catalogEntry")]
+        entry: Entry,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        version: String,
+        #[serde(default = "listed_default")]
+        listed: bool,
+        #[serde(rename = "dependencyGroups", default)]
+        groups: Vec<Group>,
+    }
+    #[derive(Deserialize)]
+    struct Group {
+        #[serde(rename = "targetFramework", default)]
+        framework: Option<String>,
+    }
+    fn listed_default() -> bool {
+        true
+    }
+
+    let url = format!("https://api.nuget.org/v3/registration5-gz-semver2/{}/index.json", name.to_ascii_lowercase());
     let index: Index = get(http, &url, None).await?.json().await?;
-    Ok(PackageInfo { latest: max_version(index.versions.iter().map(String::as_str)), versions: index.versions, ..Default::default() })
+    let mut leaves = Vec::new();
+    for page in index.items {
+        match page.items {
+            Some(items) => leaves.extend(items),
+            None => leaves.extend(get(http, &page.id, None).await?.json::<PageBody>().await?.items),
+        }
+    }
+
+    let mut versions = Vec::new();
+    let mut requirements = Vec::new();
+    for Leaf { entry } in leaves.into_iter().filter(|l| l.entry.listed) {
+        // Build metadata ("+abc") is not part of the version NuGet restores.
+        let version = entry.version.split('+').next().unwrap_or(&entry.version).to_string();
+        let frameworks: Vec<String> = entry.groups.into_iter().filter_map(|g| g.framework).filter(|f| !f.is_empty()).collect();
+        if !frameworks.is_empty() {
+            requirements.push((version.clone(), Requirement::Frameworks { frameworks }));
+        }
+        versions.push(version);
+    }
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
 }
 
 /// `git ls-remote` does not count against GitHub's 60-requests-an-hour API
@@ -153,5 +228,5 @@ async fn github_tags(name: &str) -> anyhow::Result<PackageInfo> {
     }
     let latest = max_version(tags.iter().map(|(t, _)| t.as_str()));
     let versions = tags.iter().map(|(t, _)| t.clone()).filter(|t| Version::parse(t).is_some()).collect();
-    Ok(PackageInfo { latest, versions, tags })
+    Ok(PackageInfo { latest, versions, tags, requirements: Vec::new() })
 }

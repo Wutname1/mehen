@@ -16,6 +16,9 @@ export interface Dependency {
   approximate: boolean
   latest: string | null
   safeLatest: string | null
+  /** Newest published version when this project can't use it; `latest` is then the newest it can. */
+  newest: string | null
+  blockedReason: string | null
   status: Status
   vulns: string[]
   note: string | null
@@ -29,6 +32,9 @@ export interface Project {
   manifest: string
   repo: string | null
   frameworks: string[]
+  rustVersion: string | null
+  nodeVersion: string | null
+  nodeEngines: string | null
   dependencies: Dependency[]
 }
 

@@ -72,7 +72,8 @@ export function groupPackages(inventory: Inventory): PackageGroup[] {
         group = { key, ecosystem: dep.ecosystem, name: dep.name, latest: dep.latest, usages: [], versions: [], worst: 'local', vulnIds: [] }
         groups.set(key, group)
       }
-      group.latest ??= dep.latest
+      const best = dep.newest ?? dep.latest
+      if (best && (!group.latest || compareVersions(best, group.latest) > 0)) group.latest = best
       group.usages.push({ project, dep })
       const version = displayVersion(dep)
       let bucket = group.versions.find((v) => v.version === version)

@@ -659,6 +659,9 @@ mod tests {
             manifest: dir.join(manifest).display().to_string(),
             repo: Some(dir.display().to_string()),
             frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
             dependencies: deps,
         }
     }
@@ -745,8 +748,8 @@ mod tests {
         p.manifest = dir.join(".github").display().to_string();
         let info = |name: &str| -> Option<PackageInfo> {
             Some(match name {
-                "actions/checkout" => PackageInfo { latest: Some("v7.0.1".into()), versions: vec![], tags: vec![("v7".into(), "a".repeat(40)), ("v7.0.1".into(), "a".repeat(40))] },
-                _ => PackageInfo { latest: Some("v4.1.0".into()), versions: vec![], tags: vec![("v4.1.0".into(), "2".repeat(40))] },
+                "actions/checkout" => PackageInfo { latest: Some("v7.0.1".into()), versions: vec![], requirements: vec![], tags: vec![("v7".into(), "a".repeat(40)), ("v7.0.1".into(), "a".repeat(40))] },
+                _ => PackageInfo { latest: Some("v4.1.0".into()), versions: vec![], requirements: vec![], tags: vec![("v4.1.0".into(), "2".repeat(40))] },
             })
         };
         let changes = [Change { from: None, name: "actions/checkout".into(), to: "v7.0.1".into() }, Change { from: None, name: "docker/login-action".into(), to: "v4.1.0".into() }];

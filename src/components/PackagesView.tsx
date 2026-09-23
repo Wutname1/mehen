@@ -108,7 +108,9 @@ function UsageList({
     return [...new Set([group.latest, ...inUse].filter((v): v is string => !!v))]
   }, [group])
   const [target, setTarget] = useState<string | null>(targets[0] ?? null)
-  const movable = (u: Usage) => !!target && canRetarget(u.dep) && isBehind(u.dep.current!, target)
+  // A project can only move as far as the newest version it can use.
+  const outOfReach = (u: Usage) => !!target && !!u.dep.newest && !!u.dep.latest && isBehind(u.dep.latest, target)
+  const movable = (u: Usage) => !!target && canRetarget(u.dep) && isBehind(u.dep.current!, target) && !outOfReach(u)
   const usageKey = (u: Usage) => `${u.project.id}|${u.dep.requested}`
   const [picked, setPicked] = useState<Set<string>>(() => new Set(usages.filter(movable).map(usageKey)))
   const [bulk, setBulk] = useState<BulkTarget[] | null>(null)
@@ -206,6 +208,11 @@ function UsageList({
                   {displayVersion(dep)}
                 </span>
                 <div className="truncate text-[10.5px] text-dim">{dep.installedFrom ?? (dep.approximate ? 'from version range' : (dep.note ?? ''))}</div>
+                {outOfReach(u) && (
+                  <div className="truncate text-[10.5px] text-amber" title={`${target} ${dep.blockedReason}`}>
+                    can't use {target}: {dep.blockedReason}; newest usable {dep.latest}
+                  </div>
+                )}
               </div>
               <div className="flex items-center gap-1.5">
                 <StatusPill status={dep.status} />

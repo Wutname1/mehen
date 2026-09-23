@@ -142,13 +142,19 @@ function ProjectDetail({
           <div className="mt-1 truncate text-[12px] text-dim" title={project.manifest}>
             {relativePath(roots, project.manifest)}
           </div>
-          {project.frameworks.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1">
-              {project.frameworks.map((f) => (
-                <span key={f} className="rounded border border-line-strong bg-raised px-1.5 py-px font-mono text-[11px] text-muted">
-                  {f}
-                </span>
-              ))}
+          {(project.frameworks.length > 0 || project.rustVersion || project.nodeVersion || project.nodeEngines) && (
+            <div className="mt-2 flex flex-wrap gap-1" title="Only versions that work with these are offered">
+              {[
+                ...project.frameworks,
+                project.rustVersion && `Rust ${project.rustVersion}`,
+                project.nodeVersion ? `Node ${project.nodeVersion}` : project.nodeEngines && `Node ${project.nodeEngines}`,
+              ]
+                .filter(Boolean)
+                .map((f) => (
+                  <span key={f as string} className="rounded border border-line-strong bg-raised px-1.5 py-px font-mono text-[11px] text-muted">
+                    {f}
+                  </span>
+                ))}
             </div>
           )}
         </div>
@@ -264,6 +270,11 @@ function ProjectDetail({
                           {d.latest ?? '-'}
                           {d.safeLatest && <div className="text-[10.5px] text-dim">safe: {d.safeLatest}</div>}
                         </>
+                      )}
+                      {d.newest && (
+                        <div className="font-sans text-[10.5px] text-amber" title={`${d.newest} is out: ${d.blockedReason}`}>
+                          {d.newest} {d.blockedReason}
+                        </div>
                       )}
                     </td>
                     <td className="px-3 py-1.5">

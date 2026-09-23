@@ -3,6 +3,7 @@
 //! desktop app today, a VS Code extension later) only call `scan` and `check`.
 
 pub mod check;
+pub mod compat;
 pub mod ignore;
 pub mod lockfiles;
 pub mod model;

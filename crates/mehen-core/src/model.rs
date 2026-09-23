@@ -70,6 +70,12 @@ pub struct Dependency {
     /// Newest version on the current release line, when newer than `current`.
     #[serde(default)]
     pub safe_latest: Option<String>,
+    /// The newest published version when this project cannot use it (then
+    /// `latest` is the newest it can), with the reason.
+    #[serde(default)]
+    pub newest: Option<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
     pub status: Status,
     pub vulns: Vec<String>,
     pub note: Option<String>,
@@ -89,6 +95,8 @@ impl Dependency {
             approximate: false,
             latest: None,
             safe_latest: None,
+            newest: None,
+            blocked_reason: None,
             status: Status::Pending,
             vulns: Vec::new(),
             note: None,
@@ -108,6 +116,15 @@ pub struct Project {
     pub repo: Option<String>,
     /// Target frameworks for .NET projects.
     pub frameworks: Vec<String>,
+    /// Declared minimum Rust version (`rust-version`).
+    #[serde(default)]
+    pub rust_version: Option<String>,
+    /// Exact Node version pinned by `.nvmrc` or `.node-version`.
+    #[serde(default)]
+    pub node_version: Option<String>,
+    /// The `engines.node` range from package.json.
+    #[serde(default)]
+    pub node_engines: Option<String>,
     pub dependencies: Vec<Dependency>,
 }
 

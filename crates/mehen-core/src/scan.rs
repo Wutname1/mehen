@@ -241,9 +241,9 @@ impl Scanner {
         self.roots.iter().find(|r| dir.starts_with(r)).cloned().unwrap_or_else(|| dir.to_path_buf())
     }
 
-    fn push(&mut self, manifest: &Path, name: String, ecosystem: Ecosystem, frameworks: Vec<String>, dependencies: Vec<Dependency>) {
+    fn push(&mut self, manifest: &Path, name: String, ecosystem: Ecosystem, frameworks: Vec<String>, dependencies: Vec<Dependency>) -> Option<&mut Project> {
         if dependencies.is_empty() {
-            return;
+            return None;
         }
         let dir = manifest.parent().unwrap_or(manifest);
         self.projects.push(Project {
@@ -254,8 +254,12 @@ impl Scanner {
             manifest: manifest.display().to_string(),
             repo: find_repo(dir).map(|r| r.display().to_string()),
             frameworks,
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
             dependencies,
         });
+        self.projects.last_mut()
     }
 
     fn push_workflow_project(&mut self, dir: &Path, found: Vec<(Dependency, PathBuf)>) {
@@ -293,6 +297,9 @@ impl Scanner {
             manifest: manifest.display().to_string(),
             repo: find_repo(dir).map(|r| r.display().to_string()),
             frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
             dependencies: merged,
         });
     }
@@ -324,8 +331,26 @@ impl Scanner {
                 deps.push(dep);
             }
         }
-        self.push(path, name, Ecosystem::Npm, Vec::new(), deps);
+        let engines = json["engines"]["node"].as_str().map(str::to_string);
+        let pinned = self.node_version_file(dir);
+        if let Some(project) = self.push(path, name, Ecosystem::Npm, Vec::new(), deps) {
+            project.node_version = pinned;
+            project.node_engines = engines;
+        }
         Ok(())
+    }
+
+    /// `.nvmrc` or `.node-version` in the project or a parent, when it names a
+    /// version rather than an alias like `lts/*`.
+    fn node_version_file(&self, dir: &Path) -> Option<String> {
+        let root = self.root_of(dir);
+        dir.ancestors().take_while(|d| d.starts_with(&root)).find_map(|d| {
+            [".nvmrc", ".node-version"].iter().find_map(|f| {
+                let text = fs::read_to_string(d.join(f)).ok()?;
+                let v = text.trim().trim_start_matches(['v', 'V']);
+                v.starts_with(|c: char| c.is_ascii_digit()).then(|| v.to_string())
+            })
+        })
     }
 
     fn npm_installed(&mut self, dir: &Path, name: &str) -> Option<(String, &'static str)> {
@@ -373,7 +398,18 @@ impl Scanner {
             Some(n) => n.to_string(),
             None => format!("{} (workspace)", dir_name(dir)),
         };
-        self.push(path, name, Ecosystem::Cargo, Vec::new(), deps);
+        let rust = rust_version(&table).or_else(|| {
+            // `rust-version.workspace = true` (or a workspace-only manifest):
+            // the value lives in [workspace.package] further up.
+            let root = self.root_of(dir);
+            dir.ancestors().skip(1).take_while(|d| d.starts_with(&root)).find_map(|d| {
+                let t: toml::Table = toml::from_str(&fs::read_to_string(d.join("Cargo.toml")).ok()?).ok()?;
+                t.get("workspace")?.get("package")?.get("rust-version")?.as_str().map(str::to_string)
+            })
+        });
+        if let Some(project) = self.push(path, name, Ecosystem::Cargo, Vec::new(), deps) {
+            project.rust_version = rust;
+        }
         Ok(())
     }
 
@@ -504,6 +540,15 @@ impl Scanner {
         self.push(path, format!("{} (central packages)", dir_name(dir)), Ecosystem::Nuget, Vec::new(), deps);
         Ok(())
     }
+}
+
+fn rust_version(table: &toml::Table) -> Option<String> {
+    table
+        .get("package")
+        .and_then(|p| p.get("rust-version"))
+        .and_then(|v| v.as_str())
+        .or_else(|| table.get("workspace")?.get("package")?.get("rust-version")?.as_str())
+        .map(str::to_string)
 }
 
 fn npm_local_reason(spec: &str) -> Option<&'static str> {

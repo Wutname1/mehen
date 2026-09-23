@@ -38,8 +38,9 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
 
 ### Check
 
-- Latest versions from npm, the crates.io sparse index, NuGet, and `git ls-remote` for Actions (no GitHub API rate limit)
+- Latest versions from npm, the crates.io sparse index, the NuGet registration API, and `git ls-remote` for Actions (no GitHub API rate limit)
 - A **safe** target alongside the latest: the newest release on the current major line (or minor line for `0.x`), where breaking changes are unlikely
+- **Only versions the project can use** are offered. .NET: the version must ship for the project's target framework (`net8.0` is offered EF Core 9, with 10 marked "only supports net10.0"). Cargo: the crate's `rust-version` must fit the project's (or your installed Rust). npm: its `engines.node` must accept the Node the project runs on (`.nvmrc`, or your installed Node when it fits `engines`). A version already in use is never filtered out, so Mehen never suggests a downgrade
 - Vulnerabilities from OSV, with severity, summary and fixed versions
 - Versions guessed from a range (nothing installed or locked) are marked `~` so a match against them is flagged as possible, not certain
 
@@ -61,7 +62,7 @@ Every network answer is kept in a local SQLite database so repeat checks only as
 
 | Answer | Kept for |
 |---|---|
-| Latest version and version list | 6 hours |
+| Latest version, version list and what each version needs | 6 hours |
 | Vulnerability matches | 12 hours |
 | Advisory details | 7 days |
 | Package not found (404) | 24 hours |
@@ -93,6 +94,7 @@ Key modules in `mehen-core`:
 | `store.rs` | SQLite: cache, watched folders, ignore rules, saved results |
 | `ignore.rs` | Folder, project and pattern rules |
 | `update.rs` | Update plans (edits + steps), apply, rollback |
+| `compat.rs` | Which versions a project can use: .NET target frameworks (ported from nuget-compass), Rust `rust-version`, npm `engines.node` |
 | `version.rs` | Lenient version parsing that copes with NuGet four-part versions and `v4` tags |
 
 ## Development
@@ -124,7 +126,6 @@ cargo run -p mehen-core --example survey -- C:\code --json public/dev-inventory.
 
 ## Roadmap
 
-- Compatibility filtering: only offer versions a project can use (.NET target frameworks, npm `engines`, Rust `rust-version`)
 - Optional git branch and commit after an update
 - Private NuGet feeds and authenticated registries
 - Tray icon with nightly background checks and notifications for new advisories

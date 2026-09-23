@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt, stream};
 
+use crate::compat::{self, ProjectEnv};
 use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Status, Vulnerability};
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Store};
-use crate::version::{Version, compare, from_spec, safe_target};
+use crate::version::{Version, compare, from_spec, max_version, safe_target};
 
 const LOOKUP_CONCURRENCY: usize = 8;
 
@@ -106,8 +107,16 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
     drop(lookups);
     stats.throttled = throttled.into_inner().unwrap().into_iter().map(|e| e.osv_name().to_string()).collect();
 
-    for dep in all_deps(&mut inventory) {
-        apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())));
+    let toolchain = Toolchain::detect().await;
+    for project in &mut inventory.projects {
+        let env = ProjectEnv {
+            frameworks: project.frameworks.clone(),
+            rust: project.rust_version.clone().or_else(|| toolchain.rust.clone()),
+            node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
+        };
+        for dep in &mut project.dependencies {
+            apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env);
+        }
     }
 
     progress(Progress { phase: "Checking for vulnerabilities".into(), done: 0, total: 1 });
@@ -126,6 +135,45 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
     inventory
 }
 
+/// The Node version a project actually runs on: an exact `.nvmrc` pin, else
+/// the installed Node when `engines` allows it, else the bottom of the
+/// `engines` range. `engines: ">=22"` is a floor, not a pin to 22.0.0.
+fn project_node(pinned: Option<&str>, engines: Option<&str>, installed: Option<&str>) -> Option<String> {
+    if let Some(p) = pinned {
+        return Some(p.to_string());
+    }
+    match (engines, installed) {
+        (Some(range), Some(have)) if compat::node_satisfies(have, range) => Some(have.to_string()),
+        (Some(range), _) => from_spec(range),
+        (None, have) => have.map(str::to_string),
+    }
+}
+
+/// Installed Rust and Node, used when a project does not declare its own.
+struct Toolchain {
+    rust: Option<String>,
+    node: Option<String>,
+}
+
+impl Toolchain {
+    async fn detect() -> Self {
+        Toolchain { rust: version_of("rustc", 1).await, node: version_of("node", 0).await }
+    }
+}
+
+/// Runs `<program> --version` and takes the given whitespace-separated word:
+/// `rustc 1.97.1 (8bab26f4f 2026-07-14)` -> word 1, `v26.3.1` -> word 0.
+async fn version_of(program: &str, word: usize) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg("--version").kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let raw = text.split_whitespace().nth(word)?.trim_start_matches('v');
+    Version::parse(raw).map(|_| raw.to_string())
+}
+
 fn all_deps(inventory: &mut Inventory) -> impl Iterator<Item = &mut Dependency> {
     inventory.projects.iter_mut().flat_map(|p| p.dependencies.iter_mut())
 }
@@ -138,6 +186,8 @@ fn is_commit_sha(s: &str) -> bool {
 fn reset(dep: &mut Dependency) {
     dep.latest = None;
     dep.safe_latest = None;
+    dep.newest = None;
+    dep.blocked_reason = None;
     dep.vulns.clear();
     dep.approximate = false;
     if dep.status == Status::Local {
@@ -156,7 +206,7 @@ fn reset(dep: &mut Dependency) {
     };
 }
 
-fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>) {
+fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, env: &ProjectEnv) {
     if dep.status != Status::Pending {
         return;
     }
@@ -172,7 +222,27 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>) 
             return;
         }
     };
+    // Only versions this project can actually use count as update targets.
+    // When the newest release is out of reach, keep it (and why) for display.
+    let requirements: HashMap<&str, &compat::Requirement> = info.requirements.iter().map(|(v, r)| (v.as_str(), r)).collect();
+    let check = |v: &str| requirements.get(v).map_or(Ok(()), |r| compat::check(r, env));
+    // If the version already in use fails the check, our picture of the
+    // project's environment is wrong; trust reality and skip filtering rather
+    // than suggest a downgrade.
+    let env_is_wrong = dep.current.as_deref().is_some_and(|c| {
+        let c = c.trim_start_matches(['v', 'V']);
+        info.versions.iter().any(|v| v.trim_start_matches(['v', 'V']) == c) && check(c).is_err()
+    });
+    let usable = |v: &str| if env_is_wrong { Ok(()) } else { check(v) };
+    let usable_versions: Vec<String> = info.versions.iter().filter(|v| usable(v).is_ok()).cloned().collect();
     dep.latest = info.latest.clone();
+    if let Some(newest) = &info.latest {
+        if let Err(reason) = usable(newest) {
+            dep.newest = Some(newest.clone());
+            dep.blocked_reason = Some(reason);
+            dep.latest = max_version(usable_versions.iter().map(String::as_str));
+        }
+    }
 
     if dep.ecosystem == Ecosystem::GithubActions && is_commit_sha(&dep.requested) {
         dep.current = info.tag_for_commit(&dep.requested).or_else(|| dep.pinned_comment.clone());
@@ -186,7 +256,7 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>) 
     // A floating `v4` action tag already tracks its whole major line.
     let floating_tag = dep.ecosystem == Ecosystem::GithubActions && Version::parse(&dep.requested).is_some_and(|v| v.parts.len() == 1);
     if !floating_tag {
-        dep.safe_latest = dep.current.as_deref().and_then(|c| safe_target(c, &info.versions)).filter(|s| Some(s) != dep.latest.as_ref());
+        dep.safe_latest = dep.current.as_deref().and_then(|c| safe_target(c, &usable_versions)).filter(|s| Some(s) != dep.latest.as_ref());
     }
 }
 
@@ -244,6 +314,52 @@ fn osv_version(dep: &Dependency) -> Option<String> {
     let current = dep.current.as_deref()?;
     let parsed = Version::parse(current)?;
     (parsed.parts.len() >= 3 || dep.ecosystem == Ecosystem::Nuget).then(|| current.trim_start_matches(['v', 'V']).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compat::Requirement;
+    use crate::model::DepKind;
+
+    fn info(versions: &[(&str, Option<&str>)]) -> PackageInfo {
+        PackageInfo {
+            latest: versions.last().map(|(v, _)| v.to_string()),
+            versions: versions.iter().map(|(v, _)| v.to_string()).collect(),
+            tags: Vec::new(),
+            requirements: versions.iter().filter_map(|(v, fw)| fw.map(|f| (v.to_string(), Requirement::Frameworks { frameworks: vec![f.to_string()] }))).collect(),
+        }
+    }
+
+    #[test]
+    fn newest_out_of_reach_falls_back_to_newest_usable() {
+        let mut dep = Dependency::new("Microsoft.EntityFrameworkCore", Ecosystem::Nuget, DepKind::Normal, "8.0.0");
+        reset(&mut dep);
+        let env = ProjectEnv { frameworks: vec!["net8.0".into()], ..Default::default() };
+        apply_info(&mut dep, Some(&Ok(info(&[("8.0.0", Some("net8.0")), ("9.0.20", Some("net8.0")), ("10.0.12", Some("net10.0"))]))), &env);
+        assert_eq!(dep.latest.as_deref(), Some("9.0.20"));
+        assert_eq!(dep.newest.as_deref(), Some("10.0.12"));
+        assert_eq!(dep.blocked_reason.as_deref(), Some("only supports net10.0"));
+        assert_eq!(dep.status, Status::Major);
+    }
+
+    #[test]
+    fn never_suggests_a_downgrade_when_the_environment_looks_wrong() {
+        let mut dep = Dependency::new("x", Ecosystem::Nuget, DepKind::Normal, "10.0.0");
+        reset(&mut dep);
+        let env = ProjectEnv { frameworks: vec!["net8.0".into()], ..Default::default() };
+        apply_info(&mut dep, Some(&Ok(info(&[("9.0.0", Some("net8.0")), ("10.0.0", Some("net10.0")), ("10.0.5", Some("net10.0"))]))), &env);
+        assert_eq!(dep.latest.as_deref(), Some("10.0.5"));
+        assert!(dep.newest.is_none());
+    }
+
+    #[test]
+    fn node_floor_is_not_a_pin() {
+        assert_eq!(project_node(None, Some(">=22"), Some("26.3.1")).as_deref(), Some("26.3.1"));
+        assert_eq!(project_node(None, Some("^18"), Some("26.3.1")).as_deref(), Some("18"));
+        assert_eq!(project_node(Some("20.11.0"), Some(">=18"), Some("26.3.1")).as_deref(), Some("20.11.0"));
+        assert_eq!(project_node(None, None, Some("26.3.1")).as_deref(), Some("26.3.1"));
+    }
 }
 
 fn severity_rank(severity: &Option<String>) -> u8 {

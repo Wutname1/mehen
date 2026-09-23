@@ -119,6 +119,9 @@ impl Store {
         if version < 3 {
             conn.execute_batch("ALTER TABLE package ADD COLUMN versions_json TEXT; PRAGMA user_version = 3;")?;
         }
+        if version < 4 {
+            conn.execute_batch("ALTER TABLE package ADD COLUMN requirements_json TEXT; PRAGMA user_version = 4;")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -126,24 +129,26 @@ impl Store {
     /// for a remembered "not found".
     pub fn package(&self, ecosystem: Ecosystem, name: &str, max_age: Duration) -> Option<Result<PackageInfo, String>> {
         let conn = self.conn.lock().unwrap();
-        let row: Option<(Option<String>, Option<String>, Option<String>, i64, Option<String>)> = conn
+        type Row = (Option<String>, Option<String>, Option<String>, i64, Option<String>, Option<String>);
+        let row: Option<Row> = conn
             .query_row(
-                "SELECT latest, tags_json, error, fetched_at, versions_json FROM package WHERE ecosystem = ?1 AND name = ?2",
+                "SELECT latest, tags_json, error, fetched_at, versions_json, requirements_json FROM package WHERE ecosystem = ?1 AND name = ?2",
                 params![eco_key(ecosystem), name],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()
             .ok()
             .flatten();
-        let (latest, tags_json, error, fetched_at, versions_json) = row?;
+        let (latest, tags_json, error, fetched_at, versions_json, requirements_json) = row?;
         match error {
             Some(e) => (fetched_at >= fresh_after(NOT_FOUND_TTL)).then_some(Err(e)),
-            // Rows saved before version lists were kept have no list; refetch them.
-            None if versions_json.is_none() => None,
+            // Rows saved before version lists or requirements were kept are refetched.
+            None if versions_json.is_none() || requirements_json.is_none() => None,
             None => (fetched_at >= fresh_after(max_age)).then(|| {
                 let tags = tags_json.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
                 let versions = versions_json.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-                Ok(PackageInfo { latest, versions, tags })
+                let requirements = requirements_json.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+                Ok(PackageInfo { latest, versions, tags, requirements })
             }),
         }
     }
@@ -157,10 +162,11 @@ impl Store {
     pub fn put_package(&self, ecosystem: Ecosystem, name: &str, info: &PackageInfo) {
         let tags = (!info.tags.is_empty()).then(|| serde_json::to_string(&info.tags).unwrap_or_default());
         let versions = serde_json::to_string(&info.versions).unwrap_or_else(|_| "[]".into());
+        let requirements = serde_json::to_string(&info.requirements).unwrap_or_else(|_| "[]".into());
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT OR REPLACE INTO package (ecosystem, name, latest, tags_json, error, fetched_at, versions_json) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-            params![eco_key(ecosystem), name, info.latest, tags, now(), versions],
+            "INSERT OR REPLACE INTO package (ecosystem, name, latest, tags_json, error, fetched_at, versions_json, requirements_json) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            params![eco_key(ecosystem), name, info.latest, tags, now(), versions, requirements],
         );
     }
 
@@ -318,7 +324,7 @@ mod tests {
     #[test]
     fn caches_round_trip_and_expire() {
         let store = Store::open_in_memory().unwrap();
-        let info = PackageInfo { latest: Some("7.0.1".into()), versions: vec!["v7.0.1".into()], tags: vec![("v7.0.1".into(), "abc".into())] };
+        let info = PackageInfo { latest: Some("7.0.1".into()), versions: vec!["v7.0.1".into()], tags: vec![("v7.0.1".into(), "abc".into())], requirements: vec![] };
         store.put_package(Ecosystem::GithubActions, "actions/checkout", &info);
         let cached = store.package(Ecosystem::GithubActions, "actions/checkout", PACKAGE_TTL).unwrap().unwrap();
         assert_eq!(cached.latest.as_deref(), Some("7.0.1"));
