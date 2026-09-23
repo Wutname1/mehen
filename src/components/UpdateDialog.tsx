@@ -1,7 +1,7 @@
-import { ArrowRight, Check, ChevronRight, CircleAlert, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
+import { ArrowRight, Check, ChevronRight, CircleAlert, GitCommitHorizontal, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import * as api from '../api'
-import { relativePath } from '../derive'
+import { commitMessageFor, relativePath } from '../derive'
 import type { Change, Inventory, StepResult, UpdateOutcome, UpdatePlan } from '../types'
 import { cx } from './bits'
 
@@ -24,6 +24,8 @@ export function UpdateDialog({
   const [phase, setPhase] = useState<Phase>({ name: 'planning' })
   const [plan, setPlan] = useState<UpdatePlan | null>(null)
   const [verify, setVerify] = useState(true)
+  const [commit, setCommit] = useState(false)
+  const [message, setMessage] = useState('')
   const [stepStates, setStepStates] = useState<StepState[]>([])
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
 
@@ -34,6 +36,7 @@ export function UpdateDialog({
       .then((p) => {
         if (cancelled) return
         setPlan(p)
+        setMessage(commitMessageFor(p.changes))
         setPhase({ name: 'review' })
       })
       .catch((e) => !cancelled && setPhase({ name: 'plan-failed', error: String(e) }))
@@ -67,14 +70,14 @@ export function UpdateDialog({
 
   const apply = async () => {
     if (!plan) return
-    setStepStates(plan.steps.map((s) => (s.kind === 'verify' && !verify ? 'skipped' : 'waiting')))
+    setStepStates([...plan.steps.map((s): StepState => (s.kind === 'verify' && !verify ? 'skipped' : 'waiting')), commit ? 'waiting' : 'skipped'])
     setPhase({ name: 'applying' })
     try {
-      const result = await api.applyUpdate(plan, verify)
+      const result = await api.applyUpdate(plan, verify, true, commit && !plan.commitBlocked ? message : null)
       setRefreshed(result.inventory)
       setPhase({ name: 'done', outcome: result.outcome })
     } catch (e) {
-      setPhase({ name: 'done', outcome: { ok: false, rolledBack: false, error: String(e), steps: [] } })
+      setPhase({ name: 'done', outcome: { ok: false, rolledBack: false, error: String(e), steps: [], committed: null, commitError: null } })
     }
   }
 
@@ -176,6 +179,44 @@ export function UpdateDialog({
                 </section>
               )}
 
+              {plan.repo && (
+                <section>
+                  <label className={cx('flex items-center gap-2 text-[12.5px]', plan.commitBlocked ? 'text-dim' : 'text-muted')}>
+                    <input
+                      type="checkbox"
+                      checked={commit && !plan.commitBlocked}
+                      disabled={!!plan.commitBlocked || phase.name !== 'review'}
+                      onChange={(e) => setCommit(e.target.checked)}
+                      className="size-3.5 accent-[var(--color-gold)]"
+                    />
+                    <GitCommitHorizontal size={14} />
+                    Commit the changed files to git
+                    {plan.commitBlocked && <span className="text-amber">(not available: {plan.commitBlocked})</span>}
+                  </label>
+                  {commit && !plan.commitBlocked && (
+                    <>
+                      <textarea
+                        value={message}
+                        onChange={(e) => setMessage(e.target.value)}
+                        disabled={phase.name !== 'review'}
+                        rows={Math.min(6, message.split('\n').length + 1)}
+                        aria-label="Commit message"
+                        className="mt-2 w-full rounded-lg border border-line bg-panel px-3 py-2 font-mono text-[12px] focus:border-line-strong"
+                      />
+                      <p className="mt-1 text-[11.5px] text-dim">
+                        Only the manifest and lockfile are committed, on the current branch. Your git hooks run; nothing is pushed.
+                      </p>
+                    </>
+                  )}
+                  {commit && stepStates[plan.steps.length] && stepStates[plan.steps.length] !== 'skipped' && (
+                    <div className="mt-2 flex items-center gap-2.5 rounded-lg border border-line px-3 py-2">
+                      <StepIcon state={stepStates[plan.steps.length]} />
+                      <span className="font-mono text-[12px]">git commit</span>
+                    </div>
+                  )}
+                </section>
+              )}
+
               {plan.warnings.length > 0 && (
                 <ul className="flex flex-col gap-1">
                   {plan.warnings.map((w) => (
@@ -263,9 +304,20 @@ function Result({ outcome, restoredFiles }: { outcome: UpdateOutcome; restoredFi
   const failed = outcome.steps.find((s) => !s.ok)
   if (outcome.ok) {
     return (
-      <div className="flex items-center gap-2 rounded-lg border border-[#1f4c42] bg-turq-soft px-4 py-3 text-turq">
-        <Check size={16} />
-        <span>Updated. The results have been refreshed with the new versions.</span>
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center gap-2 rounded-lg border border-[#1f4c42] bg-turq-soft px-4 py-3 text-turq">
+          <Check size={16} />
+          <span>
+            Updated{outcome.committed && <> and committed as <span className="font-mono">{outcome.committed}</span></>}. The results have been refreshed with
+            the new versions.
+          </span>
+        </div>
+        {outcome.commitError && (
+          <div className="rounded-lg border border-[#54421b] bg-amber-soft px-4 py-3 text-[12.5px] text-amber">
+            The update is in place but the commit failed, so the changes are left uncommitted:
+            <pre className="mt-1 max-h-40 overflow-auto font-mono text-[11px]">{outcome.commitError}</pre>
+          </div>
+        )}
       </div>
     )
   }

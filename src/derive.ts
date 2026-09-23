@@ -120,6 +120,12 @@ export function isBehind(current: string, target: string): boolean {
   return false
 }
 
+/** Default commit message for an update, conventional-commit style. */
+export function commitMessageFor(changes: { name: string; to: string }[]): string {
+  if (changes.length === 1) return `chore(deps): update ${changes[0].name} to ${changes[0].to}`
+  return `chore(deps): update ${changes.length} packages\n\n${changes.map((c) => `- ${c.name} to ${c.to}`).join('\n')}`
+}
+
 /** A usage that can be moved to another version by the updater. */
 export function canRetarget(dep: Dependency): boolean {
   return dep.status !== 'local' && dep.status !== 'unpinned' && dep.status !== 'unknown' && !!dep.current

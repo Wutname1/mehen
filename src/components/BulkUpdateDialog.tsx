@@ -1,7 +1,7 @@
 import { ArrowRight, Check, ChevronRight, CircleAlert, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
-import { relativePath } from '../derive'
+import { commitMessageFor, relativePath } from '../derive'
 import type { Change, Ecosystem, Inventory, Project, UpdateOutcome, UpdatePlan } from '../types'
 import { EcoBadge, cx } from './bits'
 
@@ -46,6 +46,7 @@ export function BulkUpdateDialog({
   const [rows, setRows] = useState<Row[]>(() => targets.map((target) => ({ target, state: 'planning' })))
   const [phase, setPhase] = useState<Phase>('planning')
   const [verify, setVerify] = useState(true)
+  const [commit, setCommit] = useState(false)
   const [open, setOpen] = useState<string | null>(null)
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
   const [applyTotal, setApplyTotal] = useState(0)
@@ -94,11 +95,13 @@ export function BulkUpdateDialog({
       current.current = i
       patch(i, { state: 'running' })
       try {
-        const result = await api.applyUpdate(row.plan!, verify, false)
+        const plan = row.plan!
+        const message = commit && !plan.commitBlocked ? commitMessageFor(plan.changes) : null
+        const result = await api.applyUpdate(plan, verify, false, message)
         anyOk ||= result.outcome.ok
         patch(i, { state: result.outcome.ok ? 'ok' : 'failed', outcome: result.outcome, step: undefined })
       } catch (e) {
-        patch(i, { state: 'failed', outcome: { ok: false, rolledBack: false, error: String(e), steps: [] }, step: undefined })
+        patch(i, { state: 'failed', outcome: { ok: false, rolledBack: false, error: String(e), steps: [], committed: null, commitError: null }, step: undefined })
       }
     }
     current.current = null
@@ -170,6 +173,12 @@ export function BulkUpdateDialog({
                       <span className="text-gold">{row.step ?? 'Writing changes…'}</span>
                     ) : row.state === 'failed' ? (
                       <span className="text-carnelian">{row.outcome?.rolledBack ? 'Failed, restored' : 'Failed'}</span>
+                    ) : row.state === 'ok' && (row.outcome?.committed || row.outcome?.commitError) ? (
+                      row.outcome.committed ? (
+                        <span className="font-mono text-turq">committed {row.outcome.committed}</span>
+                      ) : (
+                        <span className="text-amber">updated, commit failed</span>
+                      )
                     ) : change ? (
                       <span className="font-mono text-muted">
                         {change.writtenBefore} <span className="text-dim">→</span> <span className="text-turq">{change.writtenAfter}</span>
@@ -261,6 +270,18 @@ export function BulkUpdateDialog({
               </span>
             )}
           </div>
+          {phase === 'review' && rows.some((r) => r.plan?.repo) && (
+            <label
+              className="flex items-center gap-2 text-muted"
+              title="Commits each project's manifest and lockfile on its current branch. Projects with uncommitted changes in those files are left uncommitted."
+            >
+              <input type="checkbox" checked={commit} onChange={(e) => setCommit(e.target.checked)} className="size-3.5 accent-[var(--color-gold)]" />
+              Commit each
+              {commit && rows.some((r) => r.state === 'ready' && r.plan?.commitBlocked) && (
+                <span className="text-amber">({rows.filter((r) => r.state === 'ready' && r.plan?.commitBlocked).length} can't)</span>
+              )}
+            </label>
+          )}
           {phase === 'review' && hasVerify && (
             <label className="flex items-center gap-2 text-muted">
               <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} className="size-3.5 accent-[var(--color-gold)]" />

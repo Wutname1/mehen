@@ -155,6 +155,9 @@ export interface UpdatePlan {
   steps: Step[]
   snapshots: string[]
   warnings: string[]
+  repo: string | null
+  /** Why this update can't be committed, if it can't. */
+  commitBlocked: string | null
 }
 
 export interface StepResult {
@@ -170,6 +173,8 @@ export interface UpdateOutcome {
   rolledBack: boolean
   error: string | null
   steps: StepResult[]
+  committed: string | null
+  commitError: string | null
 }
 
 export interface UpdateEvent {

@@ -67,9 +67,9 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
   return invoke<UpdatePlan>('plan_update', { projectId, changes })
 }
 
-export async function applyUpdate(plan: UpdatePlan, verify: boolean, rescan = true): Promise<ApplyResult> {
-  if (!inTauri) return mock.applyUpdate(plan, verify)
-  return invoke<ApplyResult>('apply_update', { plan, verify, rescan })
+export async function applyUpdate(plan: UpdatePlan, verify: boolean, rescan = true, commitMessage: string | null = null): Promise<ApplyResult> {
+  if (!inTauri) return mock.applyUpdate(plan, verify, commitMessage)
+  return invoke<ApplyResult>('apply_update', { plan, verify, rescan, commitMessage })
 }
 
 export async function onUpdateEvent(handler: (e: UpdateEvent) => void): Promise<UnlistenFn> {
@@ -195,9 +195,11 @@ const mock = (() => {
         ],
         snapshots: [],
         warnings: [],
+        repo: project.repo,
+        commitBlocked: project.repo ? null : 'not inside a git repository',
       }
     },
-    applyUpdate: async (plan: UpdatePlan, verify: boolean): Promise<ApplyResult> => {
+    applyUpdate: async (plan: UpdatePlan, verify: boolean, commitMessage: string | null): Promise<ApplyResult> => {
       const steps = plan.steps.filter((s) => verify || s.kind === 'install')
       const results = []
       for (const [index, step] of steps.entries()) {
@@ -206,7 +208,15 @@ const mock = (() => {
         mockUpdateListener?.({ index, label: step.label, state: 'ok' })
         results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 700 })
       }
-      return { outcome: { ok: true, rolledBack: false, error: null, steps: results }, inventory: await filtered() }
+      if (commitMessage) {
+        mockUpdateListener?.({ index: plan.steps.length, label: 'git commit', state: 'running' })
+        await new Promise((r) => setTimeout(r, 300))
+        mockUpdateListener?.({ index: plan.steps.length, label: 'git commit', state: 'ok' })
+      }
+      return {
+        outcome: { ok: true, rolledBack: false, error: null, steps: results, committed: commitMessage ? 'abc1234' : null, commitError: null },
+        inventory: await filtered(),
+      }
     },
   }
 })()

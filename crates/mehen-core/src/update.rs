@@ -82,6 +82,13 @@ pub struct UpdatePlan {
     /// Files the steps may rewrite (lockfiles); restored along with the edits on failure.
     pub snapshots: Vec<String>,
     pub warnings: Vec<String>,
+    /// The git repo the project lives in, if any.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Why the update cannot be committed (not a repo, or the files already
+    /// have uncommitted changes that would be swept into the commit).
+    #[serde(default)]
+    pub commit_blocked: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +108,12 @@ pub struct UpdateOutcome {
     pub rolled_back: bool,
     pub error: Option<String>,
     pub steps: Vec<StepResult>,
+    /// Short hash of the commit made for this update.
+    #[serde(default)]
+    pub committed: Option<String>,
+    /// The update stayed applied but the commit failed (a hook, for example).
+    #[serde(default)]
+    pub commit_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +145,8 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         steps: Vec::new(),
         snapshots: Vec::new(),
         warnings: Vec::new(),
+        repo: project.repo.clone(),
+        commit_blocked: None,
     };
     // One edit covers every entry with the same name and spelling (e.g. the
     // package listed in both dependencies and devDependencies).
@@ -162,7 +177,56 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
     for edit in &mut plan.edits {
         edit.diff = unified_diff(&edit.path, &edit.before, &edit.after, repo.as_deref().unwrap_or(&dir));
     }
+    plan.commit_blocked = match &repo {
+        None => Some("not inside a git repository".into()),
+        Some(r) => dirty_files(r, &touched_paths(&plan)).map(|dirty| format!("uncommitted changes in {dirty}")),
+    };
     Ok(plan)
+}
+
+/// Every file an update writes: the edits plus lockfiles the steps rewrite.
+fn touched_paths(plan: &UpdatePlan) -> Vec<String> {
+    let mut paths: Vec<String> = plan.edits.iter().map(|e| e.path.clone()).chain(plan.snapshots.iter().cloned()).collect();
+    paths.dedup();
+    paths
+}
+
+fn git(repo: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(repo);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// Names of files that already differ from HEAD, so committing them would
+/// also commit someone else's work. `None` when all are clean.
+fn dirty_files(repo: &Path, paths: &[String]) -> Option<String> {
+    let out = git(repo).args(["status", "--porcelain", "--"]).args(paths).output().ok()?;
+    let dirty: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.starts_with("??"))
+        .filter_map(|l| l.get(3..).map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()))
+        .collect();
+    (!dirty.is_empty()).then(|| dirty.join(", "))
+}
+
+/// Commits exactly the files this update touched, on the current branch.
+/// Other staged changes are left alone; hooks run as usual; nothing is pushed.
+fn commit(plan: &UpdatePlan, message: &str) -> Result<String, String> {
+    let repo = PathBuf::from(plan.repo.as_ref().ok_or("not inside a git repository")?);
+    let paths: Vec<String> = touched_paths(plan).into_iter().filter(|p| Path::new(p).exists()).collect();
+    let run = |cmd: &mut std::process::Command| -> Result<String, String> {
+        let out = cmd.output().map_err(|e| format!("could not run git: {e}"))?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if out.status.success() { Ok(text) } else { Err(tail(&text)) }
+    };
+    run(git(&repo).args(["add", "--"]).args(&paths))?;
+    run(git(&repo).args(["commit", "-m", message, "--"]).args(&paths))?;
+    run(git(&repo).args(["rev-parse", "--short", "HEAD"])).map(|h| h.trim().to_string())
 }
 
 fn unified_diff(path: &str, before: &str, after: &str, base: &Path) -> String {
@@ -580,8 +644,8 @@ async fn run_step(step: &Step) -> (bool, String) {
 /// Writes the plan's edits and runs its steps. If the files changed since the
 /// plan was made, nothing is written. If any step fails, every edited file and
 /// lockfile is put back exactly as it was.
-pub async fn apply(plan: &UpdatePlan, run_verify: bool, on_event: impl Fn(UpdateEvent)) -> UpdateOutcome {
-    let mut outcome = UpdateOutcome { ok: false, rolled_back: false, error: None, steps: Vec::new() };
+pub async fn apply(plan: &UpdatePlan, run_verify: bool, commit_message: Option<&str>, on_event: impl Fn(UpdateEvent)) -> UpdateOutcome {
+    let mut outcome = UpdateOutcome { ok: false, rolled_back: false, error: None, steps: Vec::new(), committed: None, commit_error: None };
 
     for edit in &plan.edits {
         match std::fs::read_to_string(&edit.path) {
@@ -636,6 +700,20 @@ pub async fn apply(plan: &UpdatePlan, run_verify: bool, on_event: impl Fn(Update
     }
 
     outcome.ok = true;
+    if let Some(message) = commit_message.filter(|m| !m.trim().is_empty()) {
+        let index = plan.steps.len();
+        on_event(UpdateEvent { index, label: "git commit".into(), state: "running".into() });
+        match commit(plan, message) {
+            Ok(hash) => {
+                outcome.committed = Some(hash);
+                on_event(UpdateEvent { index, label: "git commit".into(), state: "ok".into() });
+            }
+            Err(e) => {
+                outcome.commit_error = Some(e);
+                on_event(UpdateEvent { index, label: "git commit".into(), state: "failed".into() });
+            }
+        }
+    }
     outcome
 }
 
@@ -760,6 +838,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commits_only_the_touched_files() {
+        let dir = temp("commit");
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("package.json"), "{ \"dependencies\": { \"react\": \"^18.2.0\" } }").unwrap();
+        std::fs::write(dir.join("other.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        // Someone else's staged work must stay out of the update commit.
+        std::fs::write(dir.join("other.txt"), "two").unwrap();
+        git(&["add", "other.txt"]);
+
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^18.2.0", "18.2.0")]);
+        let mut first = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into() }], |_| None).unwrap();
+        assert!(first.commit_blocked.is_none(), "{:?}", first.commit_blocked);
+        first.steps.clear();
+        let outcome = apply(&first, false, Some("chore(deps): update react to 19.1.0"), |_| {}).await;
+        assert!(outcome.ok && outcome.committed.is_some(), "{:?}", outcome.commit_error);
+
+        let files = String::from_utf8(git(&["show", "--name-only", "--format=", "HEAD"]).stdout).unwrap();
+        assert_eq!(files.trim(), "package.json");
+        let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
+        assert_eq!(staged.trim(), "other.txt");
+
+        // A manifest with uncommitted edits cannot be committed by Mehen.
+        std::fs::write(dir.join("package.json"), "{ \"dependencies\": { \"react\": \"^19.1.0\" }, \"x\": 1 }").unwrap();
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^19.1.0", "19.1.0")]);
+        let second = plan(&p, &[Change { from: None, name: "react".into(), to: "19.2.0".into() }], |_| None).unwrap();
+        assert!(second.commit_blocked.as_deref().is_some_and(|r| r.contains("package.json")), "{:?}", second.commit_blocked);
+    }
+
+    #[tokio::test]
     async fn failed_step_restores_files() {
         let dir = temp("rollback");
         let manifest = dir.join("package.json");
@@ -775,7 +887,7 @@ mod tests {
             args: if cfg!(windows) { vec![] } else { vec!["-c".into(), "echo broken > package-lock.json; exit 1".into()] },
             cwd: dir.display().to_string(),
         }];
-        let outcome = apply(&plan, true, |_| {}).await;
+        let outcome = apply(&plan, true, None, |_| {}).await;
         assert!(!outcome.ok);
         assert!(outcome.rolled_back, "{:?}", outcome.error);
         assert_eq!(std::fs::read_to_string(&manifest).unwrap(), "{ \"dependencies\": { \"react\": \"^18.2.0\" } }");

@@ -55,6 +55,7 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
   - Actions keep their pin style: `@v4` becomes `@v7`, and a commit pin becomes the new tag's commit with a `# v7.0.1` comment
 - Then runs an install for the right tool (npm/pnpm/yarn/bun chosen by lockfile, `cargo update -p` for only the chosen crates, `dotnet restore`) and optionally a build check (`npm run build`, `cargo check`, `dotnet build`)
 - **Rollback**: the manifest and lockfile are saved first. If any step fails they are restored byte for byte. If the files changed since you reviewed the update, nothing is written.
+- **Optional git commit** of exactly the files the update touched (default message `chore(deps): update X to Y`, editable), on the current branch. Other staged work is left alone, hooks run, nothing is pushed. Not offered when those files already had uncommitted edits.
 
 ### Cache
 
@@ -126,7 +127,7 @@ cargo run -p mehen-core --example survey -- C:\code --json public/dev-inventory.
 
 ## Roadmap
 
-- Optional git branch and commit after an update
+- Optional branch per update
 - Private NuGet feeds and authenticated registries
 - Tray icon with nightly background checks and notifications for new advisories
 - Release notes and breaking-change summaries between your version and the target
