@@ -122,6 +122,9 @@ impl Store {
         if version < 4 {
             conn.execute_batch("ALTER TABLE package ADD COLUMN requirements_json TEXT; PRAGMA user_version = 4;")?;
         }
+        if version < 5 {
+            conn.execute_batch("CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version = 5;")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -257,6 +260,17 @@ impl Store {
         serde_json::from_str(&json).ok()
     }
 
+    pub fn setting(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM setting WHERE key = ?1", params![key], |r| r.get(0)).optional().ok().flatten()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)", params![key, value])?;
+        Ok(())
+    }
+
     pub fn folders(&self) -> Vec<String> {
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare("SELECT path FROM folder ORDER BY added_at, path") else { return Vec::new() };
@@ -332,6 +346,10 @@ mod tests {
 
         store.put_package_missing(Ecosystem::Npm, "no-such-pkg", "not found");
         assert!(store.package(Ecosystem::Npm, "no-such-pkg", PACKAGE_TTL).unwrap().is_err());
+
+        assert_eq!(store.setting("background_hours"), None);
+        store.set_setting("background_hours", "12").unwrap();
+        assert_eq!(store.setting("background_hours").as_deref(), Some("12"));
 
         store.add_folder("C:\\code").unwrap();
         store.add_folder("C:\\code").unwrap();

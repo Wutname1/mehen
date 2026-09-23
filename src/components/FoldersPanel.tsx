@@ -1,4 +1,4 @@
-import { Asterisk, ChevronRight, FileX, Folder, FolderMinus, FolderPlus, Loader2, Plus, Search, X } from 'lucide-react'
+import { Asterisk, BellRing, ChevronRight, FileX, Folder, FolderMinus, FolderPlus, Loader2, Plus, Search, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from '../api'
 import { isWithin, relativePath, samePath } from '../derive'
@@ -14,6 +14,13 @@ interface Group {
   projects: DiscoveredProject[]
   ignoredCount: number
 }
+
+const SCHEDULES = [
+  { hours: 0, label: 'Off' },
+  { hours: 6, label: 'Every 6 hours' },
+  { hours: 12, label: 'Every 12 hours' },
+  { hours: 24, label: 'Once a day' },
+]
 
 const KIND_ICON: Record<IgnoreKind, typeof Folder> = { folder: FolderMinus, project: FileX, pattern: Asterisk }
 const KIND_LABEL: Record<IgnoreKind, string> = { folder: 'Folder', project: 'Project', pattern: 'Name pattern' }
@@ -198,6 +205,35 @@ export function FoldersPanel({
                   </li>
                 ))}
               </ul>
+            </section>
+
+            <section>
+              <h3 className="mb-2 text-[11.5px] font-medium uppercase tracking-wider text-dim">Check automatically</h3>
+              <div className="flex items-center gap-2">
+                <BellRing size={14} className="text-gold" />
+                <select
+                  value={settings.backgroundHours}
+                  onChange={(e) =>
+                    api
+                      .setBackgroundHours(Number(e.target.value))
+                      .then(onSettings)
+                      .catch((err) => setError(String(err)))
+                  }
+                  aria-label="Background check schedule"
+                  className="h-8 flex-1 rounded-lg border border-line bg-panel px-2 text-[12.5px]"
+                >
+                  {SCHEDULES.map((s) => (
+                    <option key={s.hours} value={s.hours}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <p className="mt-1.5 text-[11.5px] leading-relaxed text-dim">
+                {settings.backgroundHours > 0
+                  ? 'Mehen keeps running in the tray when you close the window, checks on this schedule, and notifies you about new vulnerabilities.'
+                  : 'Turn on to have Mehen check in the background from the tray and notify you about new vulnerabilities.'}
+              </p>
             </section>
 
             <section>

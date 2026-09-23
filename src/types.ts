@@ -102,6 +102,8 @@ export interface IgnoreRule {
 export interface Settings {
   folders: string[]
   rules: IgnoreRule[]
+  /** Hours between background checks; 0 means off. */
+  backgroundHours: number
 }
 
 export interface DiscoveredProject {

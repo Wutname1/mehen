@@ -14,8 +14,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mehen-core = { path = "../crates/mehen-core" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tauri-plugin-notification = "2.4.0"
+tokio = { version = "1.53.1", features = ["time"] }

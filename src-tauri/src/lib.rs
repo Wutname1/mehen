@@ -1,13 +1,26 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mehen_core::store::StoreStats;
 use mehen_core::update::{self, Change, UpdateEvent, UpdateOutcome, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
+
+/// Setting key: hours between background checks; 0 or missing means off.
+const BACKGROUND_HOURS: &str = "background_hours";
+/// How often the background loop wakes to see whether a check is due.
+const BACKGROUND_TICK: Duration = Duration::from_secs(10 * 60);
 
 struct AppState {
     store: Store,
+    /// Set while a check runs, so background and manual checks never overlap.
+    checking: AtomicBool,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -19,16 +32,139 @@ fn err(e: impl std::fmt::Display) -> String {
 struct Settings {
     folders: Vec<String>,
     rules: Vec<IgnoreRule>,
+    background_hours: u32,
 }
 
 impl AppState {
     fn settings(&self) -> Settings {
-        Settings { folders: self.store.folders(), rules: self.store.ignore_rules() }
+        Settings { folders: self.store.folders(), rules: self.store.ignore_rules(), background_hours: self.background_hours() }
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.store.folders().into_iter().map(PathBuf::from).collect()
     }
+
+    fn background_hours(&self) -> u32 {
+        self.store.setting(BACKGROUND_HOURS).and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// Scans the watched folders (minus ignored ones) and checks every package.
+async fn check_now(app: &AppHandle, refresh: bool) -> Result<Inventory, String> {
+    let state = app.state::<AppState>();
+    let emit = |p: Progress| {
+        let _ = app.emit("mehen://progress", p);
+    };
+    emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
+    let roots = state.roots();
+    if roots.is_empty() {
+        return Err("Add a folder to watch first".into());
+    }
+    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
+    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
+    let options = if refresh { CheckOptions::refresh() } else { CheckOptions::default() };
+    Ok(mehen_core::check(inventory, &state.store, options, emit).await)
+}
+
+/// Runs a check unless one is already going.
+async fn guarded_check(app: &AppHandle, refresh: bool) -> Result<Inventory, String> {
+    let state = app.state::<AppState>();
+    if state.checking.swap(true, Ordering::SeqCst) {
+        return Err("A check is already running".into());
+    }
+    let result = check_now(app, refresh).await;
+    state.checking.store(false, Ordering::SeqCst);
+    result
+}
+
+/// A check started from the tray or the background loop: shows the result in
+/// the window and raises a notification for vulnerabilities that are new
+/// since the previous result.
+async fn check_and_notify(app: &AppHandle) {
+    let before: HashSet<String> = app.state::<AppState>().store.last_inventory().map(|i| i.vulnerabilities.into_iter().map(|v| v.id).collect()).unwrap_or_default();
+    let Ok(inventory) = guarded_check(app, false).await else { return };
+    let _ = app.emit("mehen://inventory", &inventory);
+
+    let new: Vec<_> = inventory.vulnerabilities.iter().filter(|v| !before.contains(&v.id)).collect();
+    if new.is_empty() {
+        return;
+    }
+    let affected = |id: &str| -> Vec<String> {
+        let mut names: Vec<String> =
+            inventory.projects.iter().filter(|p| p.dependencies.iter().any(|d| d.vulns.iter().any(|v| v == id))).map(|p| p.name.clone()).collect();
+        names.dedup();
+        names
+    };
+    let title = if new.len() == 1 { "1 new vulnerability".to_string() } else { format!("{} new vulnerabilities", new.len()) };
+    let body = new
+        .iter()
+        .take(3)
+        .map(|v| {
+            let projects = affected(&v.id);
+            let severity = v.severity.as_deref().map(|s| format!("{s}: ")).unwrap_or_default();
+            format!("{severity}{} ({})", v.summary.chars().take(70).collect::<String>(), projects.first().cloned().unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = app.notification().builder().title(format!("Mehen: {title}")).body(body).show();
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Wakes every few minutes and runs a check when the last one is older than
+/// the chosen interval. Uses the cache, so most runs make few network calls.
+fn start_background_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let (hours, last) = {
+                let state = app.state::<AppState>();
+                (state.background_hours(), state.store.last_inventory().and_then(|i| i.checked_at).unwrap_or(0))
+            };
+            let has_folders = !app.state::<AppState>().store.folders().is_empty();
+            if hours > 0 && has_folders && now_secs().saturating_sub(last) >= u64::from(hours) * 3600 {
+                check_and_notify(&app).await;
+            }
+            tokio::time::sleep(BACKGROUND_TICK).await;
+        }
+    });
+}
+
+fn show_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Open Mehen", true, None::<&str>)?;
+    let check = MenuItem::with_id(app, "check", "Check now", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &check, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main").tooltip("Mehen").menu(&menu).show_menu_on_left_click(false);
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.on_menu_event(|app, event| match event.id.as_ref() {
+        "open" => show_window(app),
+        "check" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move { check_and_notify(&app).await });
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    })
+    .on_tray_icon_event(|tray, event| {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+            show_window(tray.app_handle());
+        }
+    })
+    .build(app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -45,6 +181,13 @@ fn add_folder(state: State<'_, AppState>, path: String) -> Result<Settings, Stri
 #[tauri::command]
 fn remove_folder(state: State<'_, AppState>, path: String) -> Result<Settings, String> {
     state.store.remove_folder(&path).map_err(err)?;
+    Ok(state.settings())
+}
+
+/// Hours between background checks; 0 turns them off.
+#[tauri::command]
+fn set_background_hours(state: State<'_, AppState>, hours: u32) -> Result<Settings, String> {
+    state.store.set_setting(BACKGROUND_HOURS, &hours.to_string()).map_err(err)?;
     Ok(state.settings())
 }
 
@@ -91,22 +234,10 @@ fn last_inventory(state: State<'_, AppState>) -> Option<Inventory> {
     state.store.last_inventory()
 }
 
-/// Scans the watched folders (minus ignored ones), then checks every package.
 /// With `refresh`, cached registry and vulnerability answers are ignored.
 #[tauri::command]
-async fn scan_and_check(app: AppHandle, state: State<'_, AppState>, refresh: bool) -> Result<Inventory, String> {
-    let emit = |p: Progress| {
-        let _ = app.emit("mehen://progress", p);
-    };
-    emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
-    let roots = state.roots();
-    if roots.is_empty() {
-        return Err("Add a folder to watch first".into());
-    }
-    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
-    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
-    let options = if refresh { CheckOptions::refresh() } else { CheckOptions::default() };
-    Ok(mehen_core::check(inventory, &state.store, options, emit).await)
+async fn scan_and_check(app: AppHandle, refresh: bool) -> Result<Inventory, String> {
+    guarded_check(&app, refresh).await
 }
 
 /// Works out exactly what an update would change, without writing anything.
@@ -130,7 +261,6 @@ struct ApplyResult {
 #[tauri::command]
 async fn apply_update(
     app: AppHandle,
-    state: State<'_, AppState>,
     plan: UpdatePlan,
     verify: bool,
     rescan: Option<bool>,
@@ -143,13 +273,7 @@ async fn apply_update(
     if !outcome.ok || rescan == Some(false) {
         return Ok(ApplyResult { outcome, inventory: None });
     }
-    let roots = state.roots();
-    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
-    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
-    let emit = |p: Progress| {
-        let _ = app.emit("mehen://progress", p);
-    };
-    let inventory = mehen_core::check(inventory, &state.store, CheckOptions::default(), emit).await;
+    let inventory = check_now(&app, false).await?;
     Ok(ApplyResult { outcome, inventory: Some(inventory) })
 }
 
@@ -185,16 +309,29 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("mehen.db");
             let store = Store::open(&db).map_err(|e| e.to_string())?;
-            app.manage(AppState { store });
+            app.manage(AppState { store, checking: AtomicBool::new(false) });
+            build_tray(app)?;
+            start_background_loop(app.handle().clone());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // With background checks on, closing the window keeps Mehen in the tray.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.app_handle().state::<AppState>().background_hours() > 0 {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             settings,
             add_folder,
             remove_folder,
+            set_background_hours,
             add_ignore,
             remove_ignore,
             discover,

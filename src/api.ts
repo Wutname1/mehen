@@ -28,6 +28,17 @@ export async function removeFolder(path: string): Promise<Settings> {
   return invoke<Settings>('remove_folder', { path })
 }
 
+export async function setBackgroundHours(hours: number): Promise<Settings> {
+  if (!inTauri) return mock.setBackgroundHours(hours)
+  return invoke<Settings>('set_background_hours', { hours })
+}
+
+/** Results from checks started by the tray or the background schedule. */
+export async function onInventory(handler: (inv: Inventory) => void): Promise<UnlistenFn> {
+  if (!inTauri) return () => {}
+  return listen<Inventory>('mehen://inventory', (e) => handler(e.payload))
+}
+
 export async function addIgnore(kind: IgnoreKind, value: string, note?: string): Promise<IgnoreResult> {
   if (!inTauri) return mock.addIgnore(kind, value)
   return invoke<IgnoreResult>('add_ignore', { kind, value, note: note ?? null })
@@ -117,7 +128,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [] }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0 }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -153,6 +164,7 @@ const mock = (() => {
 
   return {
     settings: async () => state,
+    setBackgroundHours: async (hours: number) => (state = { ...state, backgroundHours: hours }),
     addFolder: async (path: string) => (state = { ...state, folders: [...new Set([...state.folders, path])] }),
     removeFolder: async (path: string) => (state = { ...state, folders: state.folders.filter((f) => f !== path) }),
     addIgnore: async (kind: IgnoreKind, value: string): Promise<IgnoreResult> => {

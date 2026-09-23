@@ -99,6 +99,16 @@ export default function App() {
   }, [notice])
 
   useEffect(() => {
+    const unlisten = api.onInventory((inv) => {
+      setInventory(inv)
+      refreshStats()
+    })
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [refreshStats])
+
+  useEffect(() => {
     const unlisten = api.onProgress(setProgress)
     return () => {
       unlisten.then((fn) => fn())

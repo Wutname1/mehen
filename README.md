@@ -57,6 +57,11 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
 - **Rollback**: the manifest and lockfile are saved first. If any step fails they are restored byte for byte. If the files changed since you reviewed the update, nothing is written.
 - **Optional git commit** of exactly the files the update touched (default message `chore(deps): update X to Y`, editable), on the current branch. Other staged work is left alone, hooks run, nothing is pushed. Not offered when those files already had uncommitted edits.
 
+### Watch
+
+- **Check automatically** every 6 or 12 hours or once a day (Folders panel). Mehen then lives in the tray: closing the window hides it, and the tray menu has Open, Check now and Quit
+- Background checks run from the cache, and a Windows notification names any vulnerability that is new since the previous result
+
 ### Cache
 
 Every network answer is kept in a local SQLite database so repeat checks only ask for what is stale:
@@ -70,7 +75,7 @@ Every network answer is kept in a local SQLite database so repeat checks only as
 
 A warm check of ~170 projects and ~740 packages takes about 4 seconds. **Refresh all** ignores the cache. A registry that keeps answering "too many requests" is skipped for the rest of the run instead of stalling it.
 
-The database lives at `%APPDATA%\dev.mehen.app\mehen.db` and also holds your watched folders, ignore rules and the last 30 results.
+The database lives at `%APPDATA%\dev.mehen.app\mehen.db` and also holds your watched folders, ignore rules, settings and the last 30 results.
 
 ## How it's built
 
@@ -129,7 +134,6 @@ cargo run -p mehen-core --example survey -- C:\code --json public/dev-inventory.
 
 - Optional branch per update
 - Private NuGet feeds and authenticated registries
-- Tray icon with nightly background checks and notifications for new advisories
 - Release notes and breaking-change summaries between your version and the target
 - VS Code extension on the same engine
 
