@@ -9,6 +9,7 @@ use std::time::Instant;
 use ignore::WalkBuilder;
 use regex::Regex;
 
+use crate::ignore::IgnoreSet;
 use crate::lockfiles::LockfileCache;
 use crate::model::{DepKind, Dependency, Ecosystem, Inventory, Project, Status};
 use crate::version::{Version, from_spec};
@@ -21,12 +22,34 @@ const SKIP_DIRS: &[&str] = &[
 static USES_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?m)^[\s-]*uses:\s*["']?([^"'\s#]+)["']?[ \t]*(?:#[ \t]*(\S+))?"#).unwrap());
 
-pub fn scan(root: &Path) -> Inventory {
-    let start = Instant::now();
-    let skipped = Arc::new(Mutex::new(Vec::new()));
-    let skipped_in_filter = Arc::clone(&skipped);
+/// Folders nested inside another watched folder would be walked twice.
+fn distinct_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let existing: Vec<&PathBuf> = roots.iter().filter(|r| r.is_dir()).collect();
+    existing
+        .iter()
+        .filter(|r| !existing.iter().any(|other| other != *r && r.starts_with(other)))
+        .map(|r| (*r).clone())
+        .collect()
+}
 
-    let walker = WalkBuilder::new(root)
+pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
+    let start = Instant::now();
+    let roots = distinct_roots(roots);
+    let skipped = Arc::new(Mutex::new(Vec::new()));
+    let ignored = Arc::new(Mutex::new(Vec::new()));
+
+    let mut scanner = Scanner { roots: roots.clone(), ..Default::default() };
+    let mut workflows: BTreeMap<PathBuf, Vec<(Dependency, PathBuf)>> = BTreeMap::new();
+    let Some((first, rest)) = roots.split_first() else {
+        return scanner.finish(roots, Vec::new(), Vec::new(), start);
+    };
+
+    let mut builder = WalkBuilder::new(first);
+    for root in rest {
+        builder.add(root);
+    }
+    let (skipped_in_filter, ignored_in_filter, rules) = (Arc::clone(&skipped), Arc::clone(&ignored), ignore.clone());
+    let walker = builder
         .hidden(false)
         .follow_links(false)
         .filter_entry(move |entry| {
@@ -37,6 +60,10 @@ pub fn scan(root: &Path) -> Inventory {
             if SKIP_DIRS.iter().any(|d| d.eq_ignore_ascii_case(&name)) {
                 return false;
             }
+            if entry.depth() > 0 && rules.matching_rule(entry.path()).is_some() {
+                ignored_in_filter.lock().unwrap().push(entry.path().display().to_string());
+                return false;
+            }
             if entry.depth() > 0 && is_linked_worktree(entry.path()) {
                 skipped_in_filter.lock().unwrap().push(entry.path().display().to_string());
                 return false;
@@ -45,9 +72,6 @@ pub fn scan(root: &Path) -> Inventory {
         })
         .build();
 
-    let mut scanner = Scanner { root: root.to_path_buf(), ..Default::default() };
-    let mut workflows: BTreeMap<PathBuf, Vec<(Dependency, PathBuf)>> = BTreeMap::new();
-
     for entry in walker.flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -55,6 +79,10 @@ pub fn scan(root: &Path) -> Inventory {
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if is_manifest(&file_name, &ext) && ignore.matching_rule(path).is_some() {
+            ignored.lock().unwrap().push(path.display().to_string());
+            continue;
+        }
 
         let result = match file_name.as_ref() {
             "package.json" => scanner.package_json(path),
@@ -77,23 +105,40 @@ pub fn scan(root: &Path) -> Inventory {
     }
 
     for (dir, deps) in workflows {
-        scanner.push_workflow_project(&dir, deps);
+        if ignore.matching_rule(&dir.join(".github")).is_none() {
+            scanner.push_workflow_project(&dir, deps);
+        }
     }
 
-    scanner.projects.sort_by(|a, b| a.dir.to_lowercase().cmp(&b.dir.to_lowercase()).then(a.name.cmp(&b.name)));
     let skipped_worktrees = std::mem::take(&mut *skipped.lock().unwrap());
+    let ignored = std::mem::take(&mut *ignored.lock().unwrap());
+    scanner.finish(roots, skipped_worktrees, ignored, start)
+}
 
-    Inventory {
-        root: root.display().to_string(),
-        projects: scanner.projects,
-        vulnerabilities: Vec::new(),
-        skipped_worktrees,
-        warnings: scanner.warnings,
-        scan_ms: start.elapsed().as_millis() as u64,
-        check_ms: None,
-        checked_at: None,
-        check_stats: None,
-    }
+/// Every project under the roots, ignored or not, each marked with the rule
+/// that hides it. Makes no network calls, so it is cheap to run before a check.
+pub fn discover(roots: &[PathBuf], rules: &[crate::ignore::IgnoreRule]) -> Vec<crate::model::DiscoveredProject> {
+    let everything = scan(roots, &IgnoreSet::default());
+    let set = IgnoreSet::new(rules, roots);
+    everything
+        .projects
+        .into_iter()
+        .map(|p| crate::model::DiscoveredProject {
+            ignored_by: set.matching_rule(Path::new(&p.manifest)).or_else(|| set.matching_rule(Path::new(&p.dir))),
+            dependency_count: p.dependencies.len(),
+            id: p.id,
+            name: p.name,
+            ecosystem: p.ecosystem,
+            dir: p.dir,
+            manifest: p.manifest,
+            repo: p.repo,
+        })
+        .collect()
+}
+
+fn is_manifest(file_name: &str, ext: &str) -> bool {
+    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props")
+        || matches!(ext, "csproj" | "fsproj" | "vbproj" | "yml" | "yaml")
 }
 
 /// A linked worktree has a `.git` file pointing into another repo's `worktrees/`
@@ -167,7 +212,7 @@ fn read_text(path: &Path) -> anyhow::Result<String> {
 
 #[derive(Default)]
 struct Scanner {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     projects: Vec<Project>,
     warnings: Vec<String>,
     cargo_locks: HashMap<PathBuf, HashMap<String, Vec<String>>>,
@@ -175,6 +220,27 @@ struct Scanner {
 }
 
 impl Scanner {
+    fn finish(mut self, roots: Vec<PathBuf>, skipped_worktrees: Vec<String>, ignored: Vec<String>, start: Instant) -> Inventory {
+        self.projects.sort_by(|a, b| a.dir.to_lowercase().cmp(&b.dir.to_lowercase()).then(a.name.cmp(&b.name)));
+        Inventory {
+            roots: roots.iter().map(|r| r.display().to_string()).collect(),
+            projects: self.projects,
+            vulnerabilities: Vec::new(),
+            skipped_worktrees,
+            ignored,
+            warnings: self.warnings,
+            scan_ms: start.elapsed().as_millis() as u64,
+            check_ms: None,
+            checked_at: None,
+            check_stats: None,
+        }
+    }
+
+    /// The watched folder containing `dir`; lockfile searches stop there.
+    fn root_of(&self, dir: &Path) -> PathBuf {
+        self.roots.iter().find(|r| dir.starts_with(r)).cloned().unwrap_or_else(|| dir.to_path_buf())
+    }
+
     fn push(&mut self, manifest: &Path, name: String, ecosystem: Ecosystem, frameworks: Vec<String>, dependencies: Vec<Dependency>) {
         if dependencies.is_empty() {
             return;
@@ -263,14 +329,15 @@ impl Scanner {
     }
 
     fn npm_installed(&mut self, dir: &Path, name: &str) -> Option<(String, &'static str)> {
-        let from_node_modules = dir.ancestors().take_while(|d| d.starts_with(&self.root)).find_map(|d| {
+        let root = self.root_of(dir);
+        let from_node_modules = dir.ancestors().take_while(|d| d.starts_with(&root)).find_map(|d| {
             let manifest = d.join("node_modules").join(name).join("package.json");
             let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(manifest).ok()?).ok()?;
             json["version"].as_str().map(str::to_string)
         });
         match from_node_modules {
             Some(v) => Some((v, "node_modules")),
-            None => self.npm_locks.npm_version(&self.root, dir, name),
+            None => self.npm_locks.npm_version(&root, dir, name),
         }
     }
 
@@ -344,7 +411,8 @@ impl Scanner {
     }
 
     fn cargo_locked(&mut self, dir: &Path, name: &str, spec: &str) -> Option<String> {
-        let lock_path = dir.ancestors().take_while(|d| d.starts_with(&self.root)).map(|d| d.join("Cargo.lock")).find(|p| p.is_file())?;
+        let root = self.root_of(dir);
+        let lock_path = dir.ancestors().take_while(|d| d.starts_with(&root)).map(|d| d.join("Cargo.lock")).find(|p| p.is_file())?;
         let lock = self.cargo_locks.entry(lock_path.clone()).or_insert_with(|| read_cargo_lock(&lock_path));
         let versions = lock.get(name)?;
         let wanted = from_spec(spec).and_then(|s| Version::parse(&s));
@@ -471,6 +539,34 @@ fn read_cargo_lock(path: &Path) -> HashMap<String, Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ignore::{IgnoreKind, IgnoreRule};
+
+    #[test]
+    fn ignore_rules_skip_folders_projects_and_patterns() {
+        let root = std::env::temp_dir().join("mehen-test-ignore");
+        let _ = fs::remove_dir_all(&root);
+        let pkg = r#"{ "name": "x", "dependencies": { "left-pad": "^1.3.0" } }"#;
+        for dir in ["keep", "keep/sub", "skip-repo", "temp/copy", "one-off"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("package.json"), pkg).unwrap();
+        }
+        let rule = |id, kind, value: &str| IgnoreRule { id, kind, value: value.into(), note: None };
+        let rules = [
+            rule(1, IgnoreKind::Folder, &root.join("skip-repo").display().to_string()),
+            rule(2, IgnoreKind::Pattern, "temp"),
+            rule(3, IgnoreKind::Project, &root.join("one-off").join("package.json").display().to_string()),
+        ];
+        let roots = [root.clone()];
+        let inventory = scan(&roots, &IgnoreSet::new(&rules, &roots));
+        let mut dirs: Vec<String> = inventory.projects.iter().map(|p| dir_name(Path::new(&p.dir))).collect();
+        dirs.sort();
+        assert_eq!(dirs, ["keep", "sub"]);
+        assert_eq!(inventory.ignored.len(), 3, "{:?}", inventory.ignored);
+
+        let found = discover(&roots, &rules);
+        assert_eq!(found.len(), 5);
+        assert_eq!(found.iter().filter(|p| p.ignored_by.is_some()).count(), 3);
+    }
 
     #[test]
     fn workflow_uses_lines() {

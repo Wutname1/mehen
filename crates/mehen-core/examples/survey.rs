@@ -16,7 +16,7 @@ async fn main() {
     let db = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into())).join("Mehen").join("mehen-dev.db");
     let store = Store::open(&db).expect("open store");
 
-    let inventory = scan(std::path::Path::new(&root));
+    let inventory = scan(&[PathBuf::from(&root)], &Default::default());
     println!("scan: {} projects in {} ms", inventory.projects.len(), inventory.scan_ms);
     let inventory = check(inventory, &store, options, |_| {}).await;
 

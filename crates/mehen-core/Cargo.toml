@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 futures = "0.3.34"
+globset = "0.4.20"
 ignore = "0.4.33"
 log = "0.4.34"
 regex = "1.13.1"

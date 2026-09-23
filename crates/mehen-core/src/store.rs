@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::ignore::{IgnoreKind, IgnoreRule};
 use crate::model::{Ecosystem, Inventory, Vulnerability};
 use crate::registry::PackageInfo;
 
@@ -16,7 +17,7 @@ pub const PACKAGE_TTL: Duration = Duration::from_secs(6 * 3600);
 pub const NOT_FOUND_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const OSV_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const ADVISORY_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
-const SCANS_KEPT_PER_ROOT: i64 = 20;
+const SCANS_KEPT: i64 = 30;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -96,6 +97,23 @@ impl Store {
                 );
                 CREATE INDEX scan_root ON scan (root, finished_at);
                 PRAGMA user_version = 1;",
+            )?;
+        }
+        if version < 2 {
+            conn.execute_batch(
+                "CREATE TABLE folder (
+                    path TEXT PRIMARY KEY,
+                    added_at INTEGER NOT NULL
+                );
+                CREATE TABLE ignore_rule (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    note TEXT,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE (kind, value)
+                );
+                PRAGMA user_version = 2;",
             )?;
         }
         Ok(Self { conn: Mutex::new(conn) })
@@ -192,22 +210,77 @@ impl Store {
     pub fn save_inventory(&self, inventory: &Inventory) -> anyhow::Result<()> {
         let json = serde_json::to_string(inventory)?;
         let conn = self.conn.lock().unwrap();
-        conn.execute("INSERT INTO scan (root, finished_at, inventory_json) VALUES (?1, ?2, ?3)", params![inventory.root, now(), json])?;
-        conn.execute(
-            "DELETE FROM scan WHERE root = ?1 AND id NOT IN (SELECT id FROM scan WHERE root = ?1 ORDER BY finished_at DESC, id DESC LIMIT ?2)",
-            params![inventory.root, SCANS_KEPT_PER_ROOT],
-        )?;
+        conn.execute("INSERT INTO scan (root, finished_at, inventory_json) VALUES (?1, ?2, ?3)", params![inventory.roots.join(";"), now(), json])?;
+        conn.execute("DELETE FROM scan WHERE id NOT IN (SELECT id FROM scan ORDER BY finished_at DESC, id DESC LIMIT ?1)", params![SCANS_KEPT])?;
         Ok(())
     }
 
-    pub fn last_inventory(&self, root: &str) -> Option<Inventory> {
+    /// Replaces the newest saved scan, for edits like ignoring a project that
+    /// should not count as a new scan.
+    pub fn replace_last_inventory(&self, inventory: &Inventory) -> anyhow::Result<()> {
+        let json = serde_json::to_string(inventory)?;
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute("UPDATE scan SET inventory_json = ?1 WHERE id = (SELECT MAX(id) FROM scan)", params![json])?;
+        drop(conn);
+        if updated == 0 {
+            self.save_inventory(inventory)?;
+        }
+        Ok(())
+    }
+
+    pub fn last_inventory(&self) -> Option<Inventory> {
         let conn = self.conn.lock().unwrap();
         let json: String = conn
-            .query_row("SELECT inventory_json FROM scan WHERE root = ?1 ORDER BY finished_at DESC, id DESC LIMIT 1", params![root], |r| r.get(0))
+            .query_row("SELECT inventory_json FROM scan ORDER BY finished_at DESC, id DESC LIMIT 1", [], |r| r.get(0))
             .optional()
             .ok()
             .flatten()?;
         serde_json::from_str(&json).ok()
+    }
+
+    pub fn folders(&self) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT path FROM folder ORDER BY added_at, path") else { return Vec::new() };
+        stmt.query_map([], |r| r.get(0)).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    }
+
+    pub fn add_folder(&self, path: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("INSERT OR IGNORE INTO folder (path, added_at) VALUES (?1, ?2)", params![path, now()])?;
+        Ok(())
+    }
+
+    pub fn remove_folder(&self, path: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM folder WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    pub fn ignore_rules(&self) -> Vec<IgnoreRule> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT id, kind, value, note FROM ignore_rule ORDER BY created_at, id") else { return Vec::new() };
+        stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)))
+            .map(|rows| {
+                rows.flatten()
+                    .filter_map(|(id, kind, value, note)| Some(IgnoreRule { id, kind: IgnoreKind::parse(&kind)?, value, note }))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add_ignore_rule(&self, kind: IgnoreKind, value: &str, note: Option<&str>) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO ignore_rule (kind, value, note, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![kind.as_str(), value.trim(), note, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_ignore_rule(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM ignore_rule WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     /// Forgets cached lookups so the next check asks every source again.
@@ -240,6 +313,15 @@ mod tests {
 
         store.put_package_missing(Ecosystem::Npm, "no-such-pkg", "not found");
         assert!(store.package(Ecosystem::Npm, "no-such-pkg", PACKAGE_TTL).unwrap().is_err());
+
+        store.add_folder("C:\\code").unwrap();
+        store.add_folder("C:\\code").unwrap();
+        assert_eq!(store.folders(), vec!["C:\\code".to_string()]);
+        store.add_ignore_rule(IgnoreKind::Pattern, "_spikes", None).unwrap();
+        let rules = store.ignore_rules();
+        assert_eq!(rules.len(), 1);
+        store.remove_ignore_rule(rules[0].id).unwrap();
+        assert!(store.ignore_rules().is_empty());
 
         store.put_osv_hits(&[(Ecosystem::Npm, "left-pad".into(), "1.0.0".into(), vec!["GHSA-1".into()])]);
         assert_eq!(store.osv_hits(Ecosystem::Npm, "left-pad", "1.0.0", OSV_TTL), Some(vec!["GHSA-1".to_string()]));

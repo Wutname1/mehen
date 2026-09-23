@@ -1,7 +1,8 @@
-import { Database, FolderSearch, Layers, Package, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
+import { Database, EyeOff, FolderSearch, Layers, Package, RefreshCw, Search, ShieldAlert, TriangleAlert, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from './api'
 import { Logo, cx } from './components/bits'
+import { FoldersPanel } from './components/FoldersPanel'
 import { PackagesView } from './components/PackagesView'
 import { ProjectsView } from './components/ProjectsView'
 import { VulnsView } from './components/VulnsView'
@@ -16,28 +17,22 @@ import {
   vulnUsages,
   type PackageGroup,
 } from './derive'
-import type { Dependency, Ecosystem, Inventory, Progress, StoreStats } from './types'
+import type { Dependency, Ecosystem, IgnoreKind, Inventory, Progress, Settings, StoreStats } from './types'
 
 type Tab = 'packages' | 'projects' | 'vulns'
 type Focus = 'all' | 'problems' | 'drift'
 
-const ROOT_KEY = 'mehen.root'
-const DEFAULT_ROOT = 'C:\\code'
+const SUGGESTED_ROOT = 'C:\\code'
 
-function loadRoot(): string {
-  try {
-    return localStorage.getItem(ROOT_KEY) || DEFAULT_ROOT
-  } catch {
-    return DEFAULT_ROOT
-  }
+export interface IgnoreRequest {
+  kind: Extract<IgnoreKind, 'folder' | 'project'>
+  value: string
+  label: string
 }
 
-function saveRoot(root: string) {
-  try {
-    localStorage.setItem(ROOT_KEY, root)
-  } catch {
-    // Storage can be unavailable; the folder just will not be remembered.
-  }
+interface Notice {
+  text: string
+  undo?: () => void
 }
 
 const STATUS_WEIGHT: Record<string, number> = { major: 3, minor: 2, patch: 1 }
@@ -62,7 +57,9 @@ function timeAgo(unixSeconds: number | null | undefined): string {
 }
 
 export default function App() {
-  const [root, setRoot] = useState(loadRoot)
+  const [settings, setSettings] = useState<Settings | null>(null)
+  const [panelOpen, setPanelOpen] = useState(false)
+  const [notice, setNotice] = useState<Notice | null>(null)
   const [inventory, setInventory] = useState<Inventory | null>(null)
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
@@ -81,17 +78,25 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
-    api
-      .lastInventory(root)
-      .then((inv) => !cancelled && setInventory(inv))
+    Promise.all([api.settings(), api.lastInventory()])
+      .then(([s, inv]) => {
+        if (cancelled) return
+        setSettings(s)
+        setInventory(inv)
+      })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false))
     refreshStats()
     return () => {
       cancelled = true
     }
-  }, [root, refreshStats])
+  }, [refreshStats])
+
+  useEffect(() => {
+    if (!notice) return
+    const t = window.setTimeout(() => setNotice(null), 8000)
+    return () => window.clearTimeout(t)
+  }, [notice])
 
   useEffect(() => {
     const unlisten = api.onProgress(setProgress)
@@ -105,7 +110,7 @@ export default function App() {
     setError(null)
     setProgress({ phase: 'Finding projects', done: 0, total: 0 })
     try {
-      setInventory(await api.scanAndCheck(root, refresh))
+      setInventory(await api.scanAndCheck(refresh))
       refreshStats()
     } catch (e) {
       setError(String(e))
@@ -115,13 +120,45 @@ export default function App() {
     }
   }
 
-  const chooseFolder = async () => {
-    const picked = await api.pickFolder(root)
-    if (picked) {
-      saveRoot(picked)
-      setRoot(picked)
+  const watchFolder = async (path: string | null) => {
+    if (!path) return
+    try {
+      setSettings(await api.addFolder(path))
+      await run(false)
+    } catch (e) {
+      setError(String(e))
     }
   }
+
+  const ignore = async ({ kind, value, label }: IgnoreRequest) => {
+    try {
+      const result = await api.addIgnore(kind, value)
+      setSettings(result.settings)
+      if (result.inventory) setInventory(result.inventory)
+      const rule = result.settings.rules.find((r) => r.kind === kind && r.value.toLowerCase() === value.toLowerCase())
+      setNotice({
+        text: `Ignoring ${label}. It will be skipped from now on.`,
+        undo: rule
+          ? async () => {
+              setNotice(null)
+              setSettings(await api.removeIgnore(rule.id))
+              await run(false)
+            }
+          : undefined,
+      })
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const closePanel = (changed: boolean) => {
+    setPanelOpen(false)
+    if (changed) run(false)
+  }
+
+  const roots = inventory?.roots ?? settings?.folders ?? []
+  const folderLabel = !settings || settings.folders.length === 0 ? 'Choose folders' : settings.folders.length === 1 ? settings.folders[0] : `${settings.folders.length} folders`
+  const ruleCount = settings?.rules.length ?? 0
 
   const allGroups = useMemo(() => (inventory ? groupPackages(inventory) : []), [inventory])
   const summary = useMemo(() => (inventory ? summarize(inventory, allGroups) : null), [inventory, allGroups])
@@ -181,13 +218,19 @@ export default function App() {
         </div>
         <button
           type="button"
-          onClick={chooseFolder}
+          onClick={() => setPanelOpen(true)}
           disabled={running}
           className="flex min-w-0 max-w-[420px] items-center gap-2 rounded-lg border border-line-strong bg-raised px-2.5 py-1.5 text-left transition-colors hover:border-dim disabled:opacity-60"
-          title="Choose the folder to scan"
+          title="Choose folders to watch and what to ignore"
         >
           <FolderSearch size={15} className="shrink-0 text-gold" />
-          <span className="truncate font-mono text-[12px]">{root}</span>
+          <span className="truncate font-mono text-[12px]">{folderLabel}</span>
+          {ruleCount > 0 && (
+            <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-dim">
+              <EyeOff size={12} />
+              {ruleCount}
+            </span>
+          )}
         </button>
         <div className="flex-1" />
         {inventory && !running && (
@@ -230,7 +273,14 @@ export default function App() {
       )}
 
       {!inventory ? (
-        <Welcome loading={loading} running={running} root={root} onRun={() => run(false)} />
+        <Welcome
+          loading={loading}
+          running={running}
+          folders={settings?.folders ?? []}
+          onRun={() => run(false)}
+          onWatch={watchFolder}
+          onChoose={async () => watchFolder(await api.pickFolder())}
+        />
       ) : (
         <>
           {summary && (
@@ -341,9 +391,9 @@ export default function App() {
           </nav>
 
           <main className="min-h-0 flex-1 overflow-auto">
-            {tab === 'packages' && <PackagesView groups={groups} root={inventory.root} />}
-            {tab === 'projects' && <ProjectsView projects={projects} root={inventory.root} depVisible={depVisible} />}
-            {tab === 'vulns' && <VulnsView vulns={vulns} total={inventory.vulnerabilities.length} usages={usagesByVuln} root={inventory.root} />}
+            {tab === 'packages' && <PackagesView groups={groups} roots={roots} onIgnore={ignore} />}
+            {tab === 'projects' && <ProjectsView projects={projects} roots={roots} depVisible={depVisible} onIgnore={ignore} />}
+            {tab === 'vulns' && <VulnsView vulns={vulns} total={inventory.vulnerabilities.length} usages={usagesByVuln} roots={roots} />}
           </main>
 
           <footer className="flex items-center gap-4 border-t border-line bg-panel px-4 py-1.5 text-[11.5px] text-dim">
@@ -352,6 +402,13 @@ export default function App() {
               {inventory.checkMs != null && `, checked in ${(inventory.checkMs / 1000).toFixed(1)}s`}
             </span>
             {cs && cs.throttled.length > 0 && <span className="text-amber">{cs.throttled.join(', ')} is rate limiting; some packages were not checked</span>}
+            {ruleCount > 0 && (
+              <button type="button" onClick={() => setPanelOpen(true)} className="inline-flex items-center gap-1 hover:text-muted">
+                <EyeOff size={12} />
+                {ruleCount} ignore rule{ruleCount === 1 ? '' : 's'}
+                {inventory.ignored.length > 0 && ` · ${inventory.ignored.length} skipped`}
+              </button>
+            )}
             {inventory.warnings.length > 0 && (
               <span className="text-amber" title={inventory.warnings.join('\n')}>
                 {inventory.warnings.length} file{inventory.warnings.length === 1 ? '' : 's'} could not be read
@@ -365,6 +422,22 @@ export default function App() {
             )}
           </footer>
         </>
+      )}
+
+      {panelOpen && settings && <FoldersPanel settings={settings} onSettings={setSettings} onClose={closePanel} />}
+
+      {notice && (
+        <div role="status" className="fixed bottom-10 left-1/2 z-30 flex -translate-x-1/2 items-center gap-3 rounded-xl border border-line-strong bg-raised px-4 py-2.5 text-[12.5px] shadow-2xl">
+          <span>{notice.text}</span>
+          {notice.undo && (
+            <button type="button" onClick={notice.undo} className="font-medium text-gold hover:underline">
+              Undo
+            </button>
+          )}
+          <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss" className="text-dim hover:text-ink">
+            <X size={13} />
+          </button>
+        </div>
       )}
     </div>
   )
@@ -425,24 +498,45 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
   )
 }
 
-function Welcome({ loading, running, root, onRun }: { loading: boolean; running: boolean; root: string; onRun: () => void }) {
+function Welcome({
+  loading,
+  running,
+  folders,
+  onRun,
+  onWatch,
+  onChoose,
+}: {
+  loading: boolean
+  running: boolean
+  folders: string[]
+  onRun: () => void
+  onWatch: (path: string) => void
+  onChoose: () => void
+}) {
   if (loading) return <div className="flex flex-1 items-center justify-center text-dim">Loading…</div>
+  const primary = 'rounded-lg bg-gold px-4 py-2 font-semibold text-[#1d1506] hover:brightness-110 disabled:opacity-60'
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
       <Logo size={72} />
       <h1 className="text-[22px] font-semibold tracking-tight">Every project, guarded every night</h1>
       <p className="max-w-lg text-muted">
-        Mehen finds every npm, Cargo, NuGet and GitHub Actions project under <span className="font-mono text-ink">{root}</span>, checks each
-        package for newer versions and known vulnerabilities, and shows where your projects have drifted apart.
+        Mehen finds every npm, Cargo, NuGet and GitHub Actions project in the folders you choose, checks each package for newer versions and
+        known vulnerabilities, and shows where your projects have drifted apart.
       </p>
-      <button
-        type="button"
-        onClick={onRun}
-        disabled={running}
-        className="rounded-lg bg-gold px-4 py-2 font-semibold text-[#1d1506] hover:brightness-110 disabled:opacity-60"
-      >
-        {running ? 'Checking…' : 'Scan this folder'}
-      </button>
+      {folders.length > 0 ? (
+        <button type="button" onClick={onRun} disabled={running} className={primary}>
+          {running ? 'Checking…' : `Check ${folders.length === 1 ? folders[0] : `${folders.length} folders`}`}
+        </button>
+      ) : (
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => onWatch(SUGGESTED_ROOT)} disabled={running} className={primary}>
+            Watch <span className="font-mono">{SUGGESTED_ROOT}</span>
+          </button>
+          <button type="button" onClick={onChoose} disabled={running} className="rounded-lg border border-line-strong px-4 py-2 text-muted hover:text-ink">
+            Choose a folder…
+          </button>
+        </div>
+      )}
     </div>
   )
 }

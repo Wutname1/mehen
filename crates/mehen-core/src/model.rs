@@ -129,10 +129,14 @@ pub struct FixedIn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
-    pub root: String,
+    /// Watched folders this result covers.
+    pub roots: Vec<String>,
     pub projects: Vec<Project>,
     pub vulnerabilities: Vec<Vulnerability>,
     pub skipped_worktrees: Vec<String>,
+    /// Folders and manifests skipped because of an ignore rule.
+    #[serde(default)]
+    pub ignored: Vec<String>,
     pub warnings: Vec<String>,
     pub scan_ms: u64,
     pub check_ms: Option<u64>,
@@ -164,4 +168,19 @@ pub struct Progress {
     pub phase: String,
     pub done: usize,
     pub total: usize,
+}
+
+/// A project found by a no-network walk, for choosing what to check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredProject {
+    pub id: String,
+    pub name: String,
+    pub ecosystem: Ecosystem,
+    pub dir: String,
+    pub manifest: String,
+    pub repo: Option<String>,
+    pub dependency_count: usize,
+    /// The ignore rule hiding this project, if any.
+    pub ignored_by: Option<i64>,
 }

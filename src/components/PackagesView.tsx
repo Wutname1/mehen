@@ -1,12 +1,13 @@
-import { ChevronRight, Code2, FolderOpen, ShieldAlert } from 'lucide-react'
+import { ChevronRight, Code2, EyeOff, FolderOpen, ShieldAlert } from 'lucide-react'
 import { useState } from 'react'
+import type { IgnoreRequest } from '../App'
 import { openInEditor, reveal } from '../api'
 import { displayVersion, relativePath, type PackageGroup } from '../derive'
 import { EcoBadge, Empty, IconButton, StatusPill, VersionChip, cx } from './bits'
 
 const MAX_CHIPS = 4
 
-export function PackagesView({ groups, root }: { groups: PackageGroup[]; root: string }) {
+export function PackagesView({ groups, roots, onIgnore }: { groups: PackageGroup[]; roots: string[]; onIgnore: (r: IgnoreRequest) => void }) {
   const [open, setOpen] = useState<string | null>(null)
 
   if (groups.length === 0) {
@@ -64,7 +65,7 @@ export function PackagesView({ groups, root }: { groups: PackageGroup[]; root: s
                 )}
               </div>
             </button>
-            {expanded && <UsageList group={g} root={root} />}
+            {expanded && <UsageList group={g} roots={roots} onIgnore={onIgnore} />}
           </div>
         )
       })}
@@ -72,7 +73,7 @@ export function PackagesView({ groups, root }: { groups: PackageGroup[]; root: s
   )
 }
 
-function UsageList({ group, root }: { group: PackageGroup; root: string }) {
+function UsageList({ group, roots, onIgnore }: { group: PackageGroup; roots: string[]; onIgnore: (r: IgnoreRequest) => void }) {
   const usages = [...group.usages].sort((a, b) => a.project.dir.localeCompare(b.project.dir))
   return (
     <div className="pb-3 pl-[46px] pr-5">
@@ -85,7 +86,7 @@ function UsageList({ group, root }: { group: PackageGroup; root: string }) {
             <div className="min-w-0">
               <div className="truncate text-ink">{project.name}</div>
               <div className="truncate text-[11px] text-dim" title={project.dir}>
-                {relativePath(root, project.dir)}
+                {relativePath(roots, project.dir)}
               </div>
             </div>
             <div className="truncate font-mono text-[11.5px] text-dim" title="As written in the manifest">
@@ -113,6 +114,9 @@ function UsageList({ group, root }: { group: PackageGroup; root: string }) {
               </IconButton>
               <IconButton title="Open project in VS Code" onClick={() => openInEditor(project.repo ?? project.dir)}>
                 <Code2 size={14} />
+              </IconButton>
+              <IconButton title="Ignore this project from now on" onClick={() => onIgnore({ kind: 'project', value: project.manifest, label: project.name })}>
+                <EyeOff size={14} />
               </IconButton>
             </div>
           </div>

@@ -1,5 +1,6 @@
-import { Code2, FolderOpen, ShieldAlert } from 'lucide-react'
+import { Code2, EyeOff, FolderMinus, FolderOpen, ShieldAlert } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import type { IgnoreRequest } from '../App'
 import { openInEditor, reveal } from '../api'
 import { displayVersion, isOutdated, relativePath, worstStatus } from '../derive'
 import type { Dependency, Project } from '../types'
@@ -7,7 +8,17 @@ import { EcoBadge, Empty, IconButton, StatusPill, cx } from './bits'
 
 const STATUS_ORDER = ['major', 'minor', 'patch', 'unknown', 'unpinned', 'pending', 'up-to-date', 'local']
 
-export function ProjectsView({ projects, root, depVisible }: { projects: Project[]; root: string; depVisible: (d: Dependency) => boolean }) {
+export function ProjectsView({
+  projects,
+  roots,
+  depVisible,
+  onIgnore,
+}: {
+  projects: Project[]
+  roots: string[]
+  depVisible: (d: Dependency) => boolean
+  onIgnore: (r: IgnoreRequest) => void
+}) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const selected = projects.find((p) => p.id === selectedId) ?? projects[0]
 
@@ -50,18 +61,28 @@ export function ProjectsView({ projects, root, depVisible }: { projects: Project
               </div>
               <div className="mt-0.5 flex items-center gap-2">
                 <EcoBadge ecosystem={p.ecosystem} />
-                <span className="truncate text-[11px] text-dim">{relativePath(root, p.dir)}</span>
+                <span className="truncate text-[11px] text-dim">{relativePath(roots, p.dir)}</span>
               </div>
             </button>
           )
         })}
       </nav>
-      {selected && <ProjectDetail project={selected} root={root} depVisible={depVisible} />}
+      {selected && <ProjectDetail project={selected} roots={roots} depVisible={depVisible} onIgnore={onIgnore} />}
     </div>
   )
 }
 
-function ProjectDetail({ project, root, depVisible }: { project: Project; root: string; depVisible: (d: Dependency) => boolean }) {
+function ProjectDetail({
+  project,
+  roots,
+  depVisible,
+  onIgnore,
+}: {
+  project: Project
+  roots: string[]
+  depVisible: (d: Dependency) => boolean
+  onIgnore: (r: IgnoreRequest) => void
+}) {
   const deps = useMemo(
     () =>
       project.dependencies
@@ -78,7 +99,7 @@ function ProjectDetail({ project, root, depVisible }: { project: Project; root: 
             <EcoBadge ecosystem={project.ecosystem} />
           </div>
           <div className="mt-1 truncate text-[12px] text-dim" title={project.manifest}>
-            {relativePath(root, project.manifest)}
+            {relativePath(roots, project.manifest)}
           </div>
           {project.frameworks.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1">
@@ -96,6 +117,17 @@ function ProjectDetail({ project, root, depVisible }: { project: Project; root: 
         <IconButton title="Open project in VS Code" onClick={() => openInEditor(project.repo ?? project.dir)}>
           <Code2 size={15} />
         </IconButton>
+        <IconButton title="Ignore this project from now on" onClick={() => onIgnore({ kind: 'project', value: project.manifest, label: project.name })}>
+          <EyeOff size={15} />
+        </IconButton>
+        {project.repo && (
+          <IconButton
+            title="Ignore this whole repo from now on"
+            onClick={() => onIgnore({ kind: 'folder', value: project.repo!, label: relativePath(roots, project.repo!) })}
+          >
+            <FolderMinus size={15} />
+          </IconButton>
+        )}
       </header>
       <div className="flex-1 overflow-auto">
         {deps.length === 0 ? (

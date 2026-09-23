@@ -3,6 +3,7 @@
 //! desktop app today, a VS Code extension later) only call `scan` and `check`.
 
 pub mod check;
+pub mod ignore;
 pub mod lockfiles;
 pub mod model;
 pub mod osv;
@@ -13,5 +14,6 @@ pub mod version;
 
 pub use check::{CheckOptions, check};
 pub use model::*;
-pub use scan::scan;
+pub use ignore::{IgnoreKind, IgnoreRule, IgnoreSet};
+pub use scan::{discover, scan};
 pub use store::Store;

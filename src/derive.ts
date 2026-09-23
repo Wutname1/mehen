@@ -154,8 +154,23 @@ export function vulnById(inventory: Inventory): Map<string, Vulnerability> {
   return new Map(inventory.vulnerabilities.map((v) => [v.id, v]))
 }
 
-/** Path shown relative to the scanned folder. */
-export function relativePath(root: string, path: string): string {
-  const r = root.replace(/[\\/]+$/, '')
-  return path.toLowerCase().startsWith(r.toLowerCase()) ? path.slice(r.length).replace(/^[\\/]/, '') || '.' : path
+/** Path shown relative to whichever watched folder contains it. */
+export function relativePath(roots: string[], path: string): string {
+  const root = roots.map((r) => r.replace(/[\\/]+$/, '')).find((r) => isWithin(path, r))
+  if (!root) return path
+  const rel = path.slice(root.length).replace(/^[\\/]/, '') || '.'
+  return roots.length > 1 ? `${root.split(/[\\/]/).pop()}\\${rel}` : rel
+}
+
+const normalizePath = (p: string) => p.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
+
+/** True when `path` is `folder` or inside it (case-insensitive, either slash). */
+export function isWithin(path: string, folder: string): boolean {
+  const p = normalizePath(path)
+  const f = normalizePath(folder)
+  return p === f || p.startsWith(`${f}\\`)
+}
+
+export function samePath(a: string, b: string): boolean {
+  return normalizePath(a) === normalizePath(b)
 }

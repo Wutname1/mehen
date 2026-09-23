@@ -58,10 +58,11 @@ export interface CheckStats {
 }
 
 export interface Inventory {
-  root: string
+  roots: string[]
   projects: Project[]
   vulnerabilities: Vulnerability[]
   skippedWorktrees: string[]
+  ignored: string[]
   warnings: string[]
   scanMs: number
   checkMs: number | null
@@ -80,4 +81,29 @@ export interface StoreStats {
   osvQueries: number
   advisories: number
   scans: number
+}
+
+export type IgnoreKind = 'folder' | 'project' | 'pattern'
+
+export interface IgnoreRule {
+  id: number
+  kind: IgnoreKind
+  value: string
+  note: string | null
+}
+
+export interface Settings {
+  folders: string[]
+  rules: IgnoreRule[]
+}
+
+export interface DiscoveredProject {
+  id: string
+  name: string
+  ecosystem: Ecosystem
+  dir: string
+  manifest: string
+  repo: string | null
+  dependencyCount: number
+  ignoredBy: number | null
 }

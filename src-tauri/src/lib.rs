@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use mehen_core::store::StoreStats;
-use mehen_core::{CheckOptions, Inventory, Progress, Store};
+use mehen_core::{CheckOptions, DiscoveredProject, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 struct AppState {
@@ -12,22 +13,97 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// The last saved result for a folder, so the app opens with data instead of a spinner.
-#[tauri::command]
-fn last_inventory(state: State<'_, AppState>, root: String) -> Option<Inventory> {
-    state.store.last_inventory(&root)
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+    folders: Vec<String>,
+    rules: Vec<IgnoreRule>,
 }
 
-/// Scans the folder, then checks every package. With `refresh`, cached
-/// registry and vulnerability answers are ignored.
+impl AppState {
+    fn settings(&self) -> Settings {
+        Settings { folders: self.store.folders(), rules: self.store.ignore_rules() }
+    }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        self.store.folders().into_iter().map(PathBuf::from).collect()
+    }
+}
+
 #[tauri::command]
-async fn scan_and_check(app: AppHandle, state: State<'_, AppState>, root: String, refresh: bool) -> Result<Inventory, String> {
+fn settings(state: State<'_, AppState>) -> Settings {
+    state.settings()
+}
+
+#[tauri::command]
+fn add_folder(state: State<'_, AppState>, path: String) -> Result<Settings, String> {
+    state.store.add_folder(&path).map_err(err)?;
+    Ok(state.settings())
+}
+
+#[tauri::command]
+fn remove_folder(state: State<'_, AppState>, path: String) -> Result<Settings, String> {
+    state.store.remove_folder(&path).map_err(err)?;
+    Ok(state.settings())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IgnoreResult {
+    settings: Settings,
+    /// The last saved result with the newly ignored projects removed.
+    inventory: Option<Inventory>,
+}
+
+/// Adds a rule and applies it to the saved result straight away, so ignoring
+/// something after a check does not need a new check.
+#[tauri::command]
+fn add_ignore(state: State<'_, AppState>, kind: IgnoreKind, value: String, note: Option<String>) -> Result<IgnoreResult, String> {
+    state.store.add_ignore_rule(kind, &value, note.as_deref()).map_err(err)?;
+    let inventory = state.store.last_inventory().map(|mut inv| {
+        IgnoreSet::new(&state.store.ignore_rules(), &state.roots()).apply(&mut inv);
+        inv
+    });
+    if let Some(inv) = &inventory {
+        state.store.replace_last_inventory(inv).map_err(err)?;
+    }
+    Ok(IgnoreResult { settings: state.settings(), inventory })
+}
+
+#[tauri::command]
+fn remove_ignore(state: State<'_, AppState>, id: i64) -> Result<Settings, String> {
+    state.store.remove_ignore_rule(id).map_err(err)?;
+    Ok(state.settings())
+}
+
+/// Lists every project in the watched folders without touching the network,
+/// marking the ones current rules would skip.
+#[tauri::command]
+async fn discover(state: State<'_, AppState>) -> Result<Vec<DiscoveredProject>, String> {
+    let (roots, rules) = (state.roots(), state.store.ignore_rules());
+    tauri::async_runtime::spawn_blocking(move || mehen_core::discover(&roots, &rules)).await.map_err(err)
+}
+
+/// The last saved result, so the app opens with data instead of a spinner.
+#[tauri::command]
+fn last_inventory(state: State<'_, AppState>) -> Option<Inventory> {
+    state.store.last_inventory()
+}
+
+/// Scans the watched folders (minus ignored ones), then checks every package.
+/// With `refresh`, cached registry and vulnerability answers are ignored.
+#[tauri::command]
+async fn scan_and_check(app: AppHandle, state: State<'_, AppState>, refresh: bool) -> Result<Inventory, String> {
     let emit = |p: Progress| {
         let _ = app.emit("mehen://progress", p);
     };
     emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
-    let path = PathBuf::from(&root);
-    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&path)).await.map_err(err)?;
+    let roots = state.roots();
+    if roots.is_empty() {
+        return Err("Add a folder to watch first".into());
+    }
+    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
+    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
     let options = if refresh { CheckOptions::refresh() } else { CheckOptions::default() };
     Ok(mehen_core::check(inventory, &state.store, options, emit).await)
 }
@@ -70,7 +146,19 @@ pub fn run() {
             app.manage(AppState { store });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![last_inventory, scan_and_check, store_stats, clear_cache, open_in_editor])
+        .invoke_handler(tauri::generate_handler![
+            settings,
+            add_folder,
+            remove_folder,
+            add_ignore,
+            remove_ignore,
+            discover,
+            last_inventory,
+            scan_and_check,
+            store_stats,
+            clear_cache,
+            open_in_editor
+        ])
         .run(tauri::generate_context!())
         .expect("error while running Mehen");
 }

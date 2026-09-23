@@ -4,7 +4,7 @@ import { displayVersion, relativePath, type Usage } from '../derive'
 import type { Vulnerability } from '../types'
 import { EcoBadge, Empty, SeverityPill } from './bits'
 
-export function VulnsView({ vulns, total, usages, root }: { vulns: Vulnerability[]; total: number; usages: Map<string, Usage[]>; root: string }) {
+export function VulnsView({ vulns, total, usages, roots }: { vulns: Vulnerability[]; total: number; usages: Map<string, Usage[]>; roots: string[] }) {
   if (vulns.length === 0) {
     return total > 0 ? (
       <Empty title="Nothing matches">None of the {total} vulnerabilities match the current search or filters.</Empty>
@@ -62,7 +62,7 @@ export function VulnsView({ vulns, total, usages, root }: { vulns: Vulnerability
                           {displayVersion(d)}
                         </span>
                         <span className="truncate text-muted" title={project.dir}>
-                          {project.name} <span className="text-dim">· {relativePath(root, project.dir)}</span>
+                          {project.name} <span className="text-dim">· {relativePath(roots, project.dir)}</span>
                         </span>
                       </li>
                     ))}
