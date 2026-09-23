@@ -1,0 +1,69 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/geist';
+@import '@fontsource/geist-mono/400.css';
+
+/* Egyptian palette: night sky, sun gold, faience turquoise, lapis, carnelian. */
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'Cascadia Code', monospace;
+
+  --color-bg: #100f0d;
+  --color-panel: #17150f;
+  --color-raised: #1f1c15;
+  --color-hover: #26221a;
+  --color-line: #2e2920;
+  --color-line-strong: #3d3729;
+  --color-ink: #efe8d8;
+  --color-muted: #a89e88;
+  --color-dim: #6f675a;
+
+  --color-gold: #e8ab36;
+  --color-gold-soft: #3a2d12;
+  --color-turq: #45c2a6;
+  --color-turq-soft: #14332c;
+  --color-lapis: #6f9ae8;
+  --color-lapis-soft: #18243d;
+  --color-amber: #e3b54f;
+  --color-amber-soft: #352a12;
+  --color-sand: #c3b28a;
+  --color-sand-soft: #2a261b;
+  --color-carnelian: #e0613f;
+  --color-carnelian-soft: #3a1a12;
+  --color-critical: #ff4f5e;
+  --color-critical-soft: #3d1218;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'tnum' 1;
+}
+
+::selection {
+  background: var(--color-gold-soft);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--color-gold);
+  outline-offset: 1px;
+}

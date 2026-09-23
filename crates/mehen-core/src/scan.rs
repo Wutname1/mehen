@@ -91,6 +91,7 @@ pub fn scan(root: &Path) -> Inventory {
         warnings: scanner.warnings,
         scan_ms: start.elapsed().as_millis() as u64,
         check_ms: None,
+        checked_at: None,
         check_stats: None,
     }
 }

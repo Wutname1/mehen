@@ -136,6 +136,9 @@ pub struct Inventory {
     pub warnings: Vec<String>,
     pub scan_ms: u64,
     pub check_ms: Option<u64>,
+    /// Unix seconds when the check finished.
+    #[serde(default)]
+    pub checked_at: Option<u64>,
     #[serde(default)]
     pub check_stats: Option<CheckStats>,
 }

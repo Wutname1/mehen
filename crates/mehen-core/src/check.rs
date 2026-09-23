@@ -119,6 +119,7 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
 
     inventory.check_ms = Some(start.elapsed().as_millis() as u64);
     inventory.check_stats = Some(stats);
+    inventory.checked_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
     if let Err(e) = store.save_inventory(&inventory) {
         inventory.warnings.push(format!("Could not save scan: {e}"));
     }
