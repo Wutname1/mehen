@@ -67,9 +67,9 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
   return invoke<UpdatePlan>('plan_update', { projectId, changes })
 }
 
-export async function applyUpdate(plan: UpdatePlan, verify: boolean): Promise<ApplyResult> {
+export async function applyUpdate(plan: UpdatePlan, verify: boolean, rescan = true): Promise<ApplyResult> {
   if (!inTauri) return mock.applyUpdate(plan, verify)
-  return invoke<ApplyResult>('apply_update', { plan, verify })
+  return invoke<ApplyResult>('apply_update', { plan, verify, rescan })
 }
 
 export async function onUpdateEvent(handler: (e: UpdateEvent) => void): Promise<UnlistenFn> {

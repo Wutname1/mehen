@@ -125,14 +125,15 @@ struct ApplyResult {
     inventory: Option<Inventory>,
 }
 
-/// Applies a reviewed plan, then re-checks so the results show the new versions.
+/// Applies a reviewed plan, then (with `rescan`) re-checks so the results show
+/// the new versions. Batch updates pass `rescan: false` and check once at the end.
 #[tauri::command]
-async fn apply_update(app: AppHandle, state: State<'_, AppState>, plan: UpdatePlan, verify: bool) -> Result<ApplyResult, String> {
+async fn apply_update(app: AppHandle, state: State<'_, AppState>, plan: UpdatePlan, verify: bool, rescan: Option<bool>) -> Result<ApplyResult, String> {
     let outcome = update::apply(&plan, verify, |e: UpdateEvent| {
         let _ = app.emit("mehen://update", e);
     })
     .await;
-    if !outcome.ok {
+    if !outcome.ok || rescan == Some(false) {
         return Ok(ApplyResult { outcome, inventory: None });
     }
     let roots = state.roots();

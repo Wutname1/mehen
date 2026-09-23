@@ -133,8 +133,12 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         snapshots: Vec::new(),
         warnings: Vec::new(),
     };
+    // One edit covers every entry with the same name and spelling (e.g. the
+    // package listed in both dependencies and devDependencies).
+    let mut seen = std::collections::HashSet::new();
     let deps: Vec<(&Dependency, &Change)> = changes
         .iter()
+        .filter(|c| seen.insert((c.name.clone(), c.from.clone())))
         .map(|c| {
             project
                 .dependencies

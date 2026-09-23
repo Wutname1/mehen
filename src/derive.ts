@@ -103,6 +103,27 @@ export function compareVersions(a: string, b: string): number {
   return 0
 }
 
+/**
+ * True when `current` is older than `target`, compared only as precisely as
+ * `current` is written: a floating `v7` is not behind `v7.0.1`.
+ */
+export function isBehind(current: string, target: string): boolean {
+  const parse = (v: string) => v.replace(/^v/i, '').split('-')[0].split('.').map((p) => Number.parseInt(p, 10))
+  const c = parse(current)
+  const t = parse(target)
+  if (c.some(Number.isNaN) || t.some(Number.isNaN)) return false
+  for (let i = 0; i < c.length; i++) {
+    const d = c[i] - (t[i] ?? 0)
+    if (d !== 0) return d < 0
+  }
+  return false
+}
+
+/** A usage that can be moved to another version by the updater. */
+export function canRetarget(dep: Dependency): boolean {
+  return dep.status !== 'local' && dep.status !== 'unpinned' && dep.status !== 'unknown' && !!dep.current
+}
+
 export interface Summary {
   projects: number
   packages: number
