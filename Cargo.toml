@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/mehen-core"]
+resolver = "2"
