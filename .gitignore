@@ -6,3 +6,7 @@ dist/
 src-tauri/gen/
 public/dev-inventory.json
 .impeccable/
+# The README stays, so the bundler's resources/**/* glob always matches
+# something in a dev build.
+src-tauri/resources/*
+!src-tauri/resources/README.md

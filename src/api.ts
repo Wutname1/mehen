@@ -1,9 +1,10 @@
+import { getVersion } from '@tauri-apps/api/app'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, StoreStats, UpdatePlan } from './types'
+import type { AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -144,6 +145,48 @@ export async function setNotify(notify: boolean): Promise<Settings> {
   return invoke<Settings>('set_notify', { notify })
 }
 
+export async function setAppUpdateCheck(check: boolean): Promise<Settings> {
+  if (!inTauri) return mock.setAppUpdateCheck(check)
+  return invoke<Settings>('set_app_update_check', { check })
+}
+
+/** The running version of Mehen. */
+export async function appVersion(): Promise<string> {
+  if (!inTauri) return '0.1.0'
+  return getVersion()
+}
+
+/** The newer Mehen version on offer, or null when up to date. */
+export async function checkAppUpdate(): Promise<string | null> {
+  if (!inTauri) return mock.appUpdate.version
+  return invoke<string | null>('check_self_update')
+}
+
+/** Downloads the newer version without installing it. Resolves to its version, or null if there is none. */
+export async function downloadAppUpdate(): Promise<string | null> {
+  if (!inTauri) return mock.appUpdate.download()
+  return invoke<string | null>('download_self_update')
+}
+
+/** Installs the downloaded version. Mehen closes and reopens, so this only returns on failure. */
+export async function installAppUpdate(): Promise<void> {
+  if (inTauri) await invoke('install_self_update')
+}
+
+/** Notes for every release after `current` up to `target`, newest first. */
+export async function appReleaseNotes(current: string, target: string): Promise<ReleaseNotes[]> {
+  if (!inTauri) return mock.appUpdate.notes
+  return invoke<ReleaseNotes[]>('self_update_notes', { current, target })
+}
+
+export async function onAppUpdateProgress(handler: (p: AppUpdateProgress) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    mock.appUpdate.listeners.add(handler)
+    return () => mock.appUpdate.listeners.delete(handler)
+  }
+  return listen<AppUpdateProgress>('self-update://progress', (e) => handler(e.payload))
+}
+
 const mockCheckCommands: CheckCommands = {}
 
 /** Commits updates that were applied without committing, one commit per repository. */
@@ -217,7 +260,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true, appUpdateCheck: true }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -270,6 +313,30 @@ const mock = (() => {
     setBackgroundHours: async (hours: number) => (state = { ...state, backgroundHours: hours }),
     setUpdateParallel: async (parallel: number) => (state = { ...state, updateParallel: Math.min(8, Math.max(0, parallel)) }),
     setNotify: async (notify: boolean) => (state = { ...state, notify }),
+    setAppUpdateCheck: async (appUpdateCheck: boolean) => (state = { ...state, appUpdateCheck }),
+    appUpdate: {
+      version: '0.2.0',
+      listeners: new Set<(p: AppUpdateProgress) => void>(),
+      async download() {
+        const total = 6_400_000
+        for (let downloaded = 0; downloaded <= total; downloaded += 800_000) {
+          this.listeners.forEach((l) => l({ downloaded, total }))
+          await new Promise((r) => setTimeout(r, 180))
+        }
+        return this.version
+      },
+      notes: [
+        {
+          version: '0.2.0',
+          releasedAt: '2026-09-24T12:00:00Z',
+          items: [
+            { section: 'feature', text: 'Mehen updates itself, and shows what changed before you restart', tags: [] },
+            { section: 'fix', text: 'Checks no longer stop when a project folder is renamed', tags: [] },
+            { section: 'change', text: 'The project list opens faster with many folders', tags: [] },
+          ],
+        },
+      ] as ReleaseNotes[],
+    },
     addFolder: async (path: string) => (state = { ...state, folders: [...new Set([...state.folders, path])] }),
     removeFolder: async (path: string) => (state = { ...state, folders: state.folders.filter((f) => f !== path) }),
     addIgnore: async (kind: IgnoreKind, value: string): Promise<IgnoreResult> => {

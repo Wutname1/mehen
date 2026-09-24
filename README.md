@@ -130,6 +130,28 @@ cargo run -p mehen-core --example survey -- C:\code --json public/dev-inventory.
 | `bulk_preview` | Plans moving one package to one version across every project behind it |
 | `apply_smoke` | Applies a real update to a throwaway npm project in the temp folder, once passing and once failing, to prove rollback |
 
+## Releasing
+
+Push a version tag (`git tag 0.2.0 && git push origin 0.2.0`). `.github/workflows/release.yml` then:
+
+1. Refuses a tag that is not ahead of the latest release.
+2. Builds the Windows installer and the update-cover helper, signs the installer for the updater, and attaches it to a draft GitHub release, plus a fixed-name `Mehen-Setup.exe`.
+3. Turns commit subjects since the previous tag into release notes (`new:`, `fixes:`, `improved:` prefixes), stores them on gitwyrm.com under the product `Mehen`, and uses the same notes for the release page.
+4. Publishes the release, checks every updater download link, and only then writes `https://cdn.gitwyrm.com/mehen/updates/stable.json`, the manifest Mehen checks for new versions.
+
+What lives where:
+
+| Address | What it is |
+|---|---|
+| `cdn.gitwyrm.com/mehen/Mehen-Setup.exe` | The small setup program behind the download button. Rebuilt by the manual `Build Setup` workflow only when `src-tauri/bootstrapper` changes. |
+| `cdn.gitwyrm.com/mehen/installers/latest/Mehen-Setup.exe` | Where the setup program downloads the real installer. A Cloudflare redirect rule sends it to the latest GitHub release. |
+| `cdn.gitwyrm.com/mehen/updates/stable.json` | The update manifest. Its download links point at the GitHub release. |
+| `github.com/Wutname1/mehen/releases` | Every installer, kept per version. |
+
+Repository secrets the workflows need: `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the updater key; its public half is in `tauri.conf.json`), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, and `CHANGELOG_API_KEY`.
+
+A local `npm run tauri build` needs `TAURI_SIGNING_PRIVATE_KEY` set too, because the bundle includes updater signatures.
+
 ## Roadmap
 
 - Optional branch per update

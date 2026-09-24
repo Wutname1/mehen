@@ -4,6 +4,7 @@ import * as api from '../api'
 import { ECOSYSTEM_LABEL, POLICY_LABEL, isWithin, relativePath, samePath, type Repo } from '../derive'
 import type { Prefs } from '../prefs'
 import type { CheckCommands, CheckConfig, DiscoveredProject, Ecosystem, Hold, IgnoreKind, IgnoreRule, Inventory, Settings, VersionPolicies, VersionPolicy } from '../types'
+import type { AppUpdate } from './AppUpdate'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { SectionTitle, Select, SettingRow, Switch, TextInput } from './controls'
@@ -119,6 +120,8 @@ function CommandEditor({ scope, initial, onSaved, placeholder }: { scope: string
 }
 
 export function SettingsDialog({
+  appUpdate,
+  onAppUpdate,
   tab: initialTab = 'general',
   repo,
   settings,
@@ -137,6 +140,9 @@ export function SettingsDialog({
   onRemoveFolder,
   onClose,
 }: {
+  appUpdate: AppUpdate
+  /** Opens the dialog that shows what changed and installs the new version. */
+  onAppUpdate: () => void
   tab?: SettingsTab
   /** Settings for one project: only its checks. */
   repo?: Repo
@@ -319,6 +325,31 @@ export function SettingsDialog({
                       </option>
                     ))}
                   </Select>
+                </SettingRow>
+                <SectionTitle>Mehen</SectionTitle>
+                <SettingRow title={appUpdate.current ? `Mehen ${appUpdate.current}` : 'Mehen'} help={appUpdateStatus(appUpdate)}>
+                  {appUpdate.status === 'available' || appUpdate.status === 'downloading' || appUpdate.status === 'ready' ? (
+                    <Button variant="primary" onClick={onAppUpdate}>
+                      See what's new
+                    </Button>
+                  ) : (
+                    <Button onClick={appUpdate.check} disabled={appUpdate.status === 'checking' || appUpdate.status === 'installing'}>
+                      <RefreshCw size={14} className={cx(appUpdate.status === 'checking' && 'animate-spin')} />
+                      Check for a new version
+                    </Button>
+                  )}
+                </SettingRow>
+                <SettingRow title="Look for new versions of Mehen" help="Checks when Mehen opens and every two hours. Nothing installs until you choose to restart.">
+                  <Switch
+                    checked={settings.appUpdateCheck}
+                    onChange={(v) =>
+                      api
+                        .setAppUpdateCheck(v)
+                        .then(onSettings)
+                        .catch((err) => setError(String(err)))
+                    }
+                    label="Look for new versions of Mehen"
+                  />
                 </SettingRow>
               </>
             )}
@@ -599,4 +630,24 @@ function KeptList({ holds, nameOf, onRelease }: { holds: Hold[]; nameOf: (folder
       )}
     </>
   )
+}
+
+function appUpdateStatus(update: AppUpdate): string {
+  switch (update.status) {
+    case 'checking':
+      return 'Looking for a new version...'
+    case 'current':
+      return 'You have the latest version.'
+    case 'available':
+      return `Mehen ${update.version} is available.`
+    case 'downloading':
+      return `Downloading Mehen ${update.version}...`
+    case 'ready':
+    case 'installing':
+      return `Mehen ${update.version} is downloaded and installs when you restart.`
+    case 'error':
+      return `The last check did not work: ${update.error}`
+    default:
+      return 'Mehen updates itself from its GitHub releases.'
+  }
 }

@@ -1,0 +1,46 @@
+name: Build Setup
+
+# The small setup program behind the website's download button. Its name and
+# address never change between versions, so it only needs rebuilding when
+# src-tauri/bootstrapper changes, not for every release.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri/bootstrapper -> target
+
+      - name: Build setup program
+        run: cargo build --release --manifest-path src-tauri/bootstrapper/Cargo.toml
+
+      # One unchanging file keeps its download reputation with Windows across
+      # every release that ships behind it.
+      - name: Upload to CDN
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          pip install --quiet awscli
+          aws s3 cp src-tauri/bootstrapper/target/release/mehen-setup.exe \
+            "s3://gitwyrm-cdn/mehen/Mehen-Setup.exe" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --cache-control "no-cache, no-store"
+
+      - name: Keep a copy on the run
+        uses: actions/upload-artifact@v7
+        with:
+          name: Mehen-Setup
+          path: src-tauri/bootstrapper/target/release/mehen-setup.exe

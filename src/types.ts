@@ -127,6 +127,26 @@ export interface Settings {
   updateParallelAuto: number
   /** Notify about new vulnerabilities found by background checks. */
   notify: boolean
+  /** Check for new versions of Mehen itself. */
+  appUpdateCheck: boolean
+}
+
+/** One line of a Mehen release's notes. `section` is feature, fix, change, docs, or breaking. */
+export interface ReleaseNoteItem {
+  section: string
+  text: string
+  tags: string[]
+}
+
+export interface ReleaseNotes {
+  version: string
+  releasedAt: string | null
+  items: ReleaseNoteItem[]
+}
+
+export interface AppUpdateProgress {
+  downloaded: number
+  total: number | null
 }
 
 export interface DiscoveredProject {

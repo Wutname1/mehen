@@ -13,6 +13,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+mod self_update;
+
 /// Setting key: hours between background checks; 0 or missing means off.
 const BACKGROUND_HOURS: &str = "background_hours";
 /// Setting key: how many update steps may run at once across repositories.
@@ -26,6 +28,8 @@ const CHECK_COMMANDS: &str = "check_commands";
 const VERSION_POLICY: &str = "version_policy";
 /// Setting key: `false` turns off notifications about new vulnerabilities.
 const NOTIFY: &str = "notify_vulnerabilities";
+/// Setting key: `false` stops Mehen checking for new versions of itself.
+const APP_UPDATE_CHECK: &str = "app_update_check";
 /// How often the background loop wakes to see whether a check is due.
 const BACKGROUND_TICK: Duration = Duration::from_secs(10 * 60);
 
@@ -50,6 +54,7 @@ struct Settings {
     /// What automatic resolves to on this computer.
     update_parallel_auto: usize,
     notify: bool,
+    app_update_check: bool,
 }
 
 /// The user's own build and test commands for one scope, and where to run them.
@@ -71,6 +76,7 @@ impl AppState {
             update_parallel: self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse().ok()).unwrap_or(0),
             update_parallel_auto: batch::auto_parallel(),
             notify: self.notify(),
+            app_update_check: self.store.setting(APP_UPDATE_CHECK).is_none_or(|v| v != "false"),
         }
     }
 
@@ -298,6 +304,12 @@ fn set_notify(state: State<'_, AppState>, notify: bool) -> Result<Settings, Stri
     Ok(state.settings())
 }
 
+#[tauri::command]
+fn set_app_update_check(state: State<'_, AppState>, check: bool) -> Result<Settings, String> {
+    state.store.set_setting(APP_UPDATE_CHECK, if check { "true" } else { "false" }).map_err(err)?;
+    Ok(state.settings())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IgnoreResult {
@@ -522,6 +534,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(self_update::Pending::default())
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("mehen.db");
             let store = Store::open(&db).map_err(|e| e.to_string())?;
@@ -546,6 +560,7 @@ pub fn run() {
             set_background_hours,
             set_update_parallel,
             set_notify,
+            set_app_update_check,
             add_ignore,
             remove_ignore,
             discover,
@@ -564,7 +579,11 @@ pub fn run() {
             set_version_policy,
             store_stats,
             clear_cache,
-            open_in_editor
+            open_in_editor,
+            self_update::check_self_update,
+            self_update::download_self_update,
+            self_update::install_self_update,
+            self_update::self_update_notes
         ])
         .run(tauri::generate_context!())
         .expect("error while running Mehen");

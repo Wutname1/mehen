@@ -1,0 +1,293 @@
+name: Release
+
+# Push a version tag (1.2.3) to ship it. The build, the GitHub release, the
+# website changelog, and the update manifest Mehen checks all come from this.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  # Runs before any build work so a bad tag fails in seconds, and never
+  # publishes a release the updater would refuse to offer.
+  check-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Reject a tag that is not ahead of the latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+
+          # Drafts are excluded: a draft has not shipped and may be re-cut.
+          published=$(gh release list --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft | not) | .tagName')
+          latest=$(printf '%s\n' "$published" | grep -v '^$' | sort -V | tail -n1 || true)
+
+          if [ -z "$latest" ]; then
+            echo "No published release yet; accepting $tag."
+            exit 0
+          fi
+
+          if printf '%s\n' "$published" | grep -qxF "$tag"; then
+            echo "::error::$tag is already published. Bump the version."
+            exit 1
+          fi
+
+          older=$(printf '%s\n%s\n' "$tag" "$latest" | sort -V | head -n1)
+          if [ "$older" = "$tag" ]; then
+            echo "::error::$tag is behind the latest published release $latest. Copies on $latest would never be offered this build."
+            exit 1
+          fi
+
+          echo "OK: $tag is ahead of $latest."
+
+  release:
+    needs: check-version
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Asset filenames and the version Mehen reports come from these files, not
+      # from the tag.
+      - name: Sync version to tag
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          Write-Host "Setting version to $version"
+
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $conf.version = $version
+          $conf | ConvertTo-Json -Depth 100 | Set-Content src-tauri/tauri.conf.json
+
+          # Only the first version= line, which is the [package] one.
+          $cargo = Get-Content src-tauri/Cargo.toml
+          $done = $false
+          $cargo = $cargo | ForEach-Object {
+            if (-not $done -and $_ -match '^version\s*=') {
+              $done = $true
+              "version = `"$version`""
+            } else {
+              $_
+            }
+          }
+          $cargo | Set-Content src-tauri/Cargo.toml
+
+          # Cargo.lock records the package's own version too, and a stale one
+          # fails any --locked build. Rewritten in place because `cargo update`
+          # needs the registry index, which is not fetched yet.
+          $lock = Get-Content Cargo.lock -Raw
+          $pattern = '(?m)^(name = "mehen"\r?\nversion = )"[^"]*"'
+          if ($lock -notmatch $pattern) { throw "mehen package entry not found in Cargo.lock" }
+          $lock = [regex]::Replace($lock, $pattern, "`$1`"$version`"")
+          Set-Content Cargo.lock -Value $lock -NoNewline
+
+          npm version $version --no-git-tag-version --allow-same-version
+
+      # After the version sync on purpose: rust-cache hashes Cargo.toml and
+      # Cargo.lock into its key when it restores, so restoring first would save
+      # under a key no later run can reproduce.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri/bootstrapper -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # The setup program, bundled into the app as well. Run with --updating it
+      # draws the "Updating Mehen" window over the gap between the old app
+      # exiting and the new one starting. Built here rather than downloaded when
+      # an update runs, because that is exactly when a download is least
+      # welcome. See spawn_update_cover in src-tauri/src/self_update.rs.
+      - name: Build the update cover helper
+        shell: bash
+        run: |
+          cargo build --release --manifest-path src-tauri/bootstrapper/Cargo.toml
+          mkdir -p src-tauri/resources
+          cp src-tauri/bootstrapper/target/release/mehen-setup.exe src-tauri/resources/mehen-setup.exe
+
+      - name: Build and release (installer + updater manifest)
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Mehen ${{ github.ref_name }}"
+          # Placeholder only. The publish job replaces it with the generated
+          # changelog before the release goes public.
+          releaseBody: "Release notes are generated when this release is published."
+          # Published by the publish job once everything is attached and checked.
+          releaseDraft: true
+
+      # Fixed-name copy, so /releases/latest/download/Mehen-Setup.exe always
+      # serves the current version. The setup program downloads it through the
+      # CDN's installers/latest path, which a Cloudflare redirect sends here.
+      # /releases/latest ignores drafts, so it only moves when publish runs.
+      - name: Attach fixed-name installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          nsis=$(find target/release/bundle/nsis -name "*-setup.exe" -type f | head -1)
+          if [ -z "$nsis" ]; then
+            echo "::error::No NSIS installer found under target/release/bundle/nsis"
+            exit 1
+          fi
+          cp "$nsis" Mehen-Setup.exe
+          gh release upload "${{ github.ref_name }}" Mehen-Setup.exe --clobber
+          echo "Attached $nsis as Mehen-Setup.exe"
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # Full history and tags: the changelog range is prev-tag..this-tag.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "Assets on $TAG:"
+          echo "$assets" | sed 's/^/  /'
+
+          # latest.json is what the updater reads, and Mehen-Setup.exe is what
+          # fresh installs download. Publishing without either breaks one of them.
+          missing=0
+          for required in latest.json x64-setup.exe; do
+            if ! echo "$assets" | grep -q -- "$required"; then
+              echo "::error::Missing required asset matching '$required'"
+              missing=1
+            fi
+          done
+          if ! echo "$assets" | grep -qxF Mehen-Setup.exe; then
+            echo "::error::Missing fixed-name asset 'Mehen-Setup.exe'"
+            missing=1
+          fi
+          [ "$missing" -eq 0 ]
+
+      # tauri-action points the manifest at api.github.com asset URLs, which
+      # serve JSON metadata rather than the installer. Rewritten before the
+      # release goes live; checked after, since a draft's download links 404.
+      - name: Point updater manifest at public download URLs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          chmod +x .github/scripts/*.sh
+          .github/scripts/resolve-updater-urls.sh rewrite "${{ github.ref_name }}"
+
+      # Stored on gitwyrm.com under the product "Mehen". Mehen's update dialog
+      # reads these notes back from there. Without CHANGELOG_API_KEY the upload
+      # is skipped and only the release body below is written.
+      - name: Publish changelog to gitwyrm.com
+        env:
+          CHANGELOG_API_KEY: ${{ secrets.CHANGELOG_API_KEY }}
+          CHANGELOG_API_URL: https://gitwyrm.com/api/v1/changelogs
+          PRODUCT: Mehen
+          RELEASE_VERSION: ${{ github.ref_name }}
+          DOWNLOAD_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/Mehen-Setup.exe
+        run: |
+          chmod +x .github/scripts/*.sh
+          .github/scripts/upload-changelog.sh
+
+      - name: Build release body
+        env:
+          PRODUCT: Mehen
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/*.sh
+          .github/scripts/render-changelog.sh CHANGELOG.md >/dev/null
+
+          {
+            if [ -s CHANGELOG.md ]; then
+              cat CHANGELOG.md
+            else
+              echo "Maintenance release - no user-facing changes."
+              echo
+            fi
+            cat <<'EOF'
+          ---
+
+          ## Download
+
+          **Most people want [Mehen-Setup.exe](https://cdn.gitwyrm.com/mehen/Mehen-Setup.exe)** - it always
+          installs the newest version, and Mehen keeps itself up to date after that.
+
+          The installers attached below are pinned to this specific version.
+          EOF
+          } > RELEASE_BODY.md
+
+          cat RELEASE_BODY.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --notes-file RELEASE_BODY.md --draft=false --latest
+          echo "Published $TAG"
+
+      # If any manifest URL does not serve a plausible installer, the release
+      # goes back to draft. A missing release is better than one that breaks
+      # every copy that updates to it.
+      - name: Verify updater manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          chmod +x .github/scripts/*.sh
+          if ! .github/scripts/resolve-updater-urls.sh verify "$TAG"; then
+            echo "::error::Reverting $TAG to draft; its updater manifest is unusable."
+            gh release edit "$TAG" --draft=true
+            exit 1
+          fi
+
+      # The manifest every copy of Mehen polls. Written last, once the release
+      # is live and verified, so nothing is offered that might be pulled back.
+      - name: Publish update manifest to the CDN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          pip install --quiet awscli
+          chmod +x .github/scripts/*.sh
+          .github/scripts/publish-cdn-manifest.sh "${{ github.ref_name }}"

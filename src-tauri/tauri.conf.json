@@ -25,9 +25,26 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQyREQ1M0QzNzEyMjI0NTcKUldSWEpDSngwMVBkMGdzSmZwYlZTK0VtSStRL3pSVWdKT25ML3VjL1pmampBL04xcmozSzVjUFoK",
+      "endpoints": ["https://cdn.gitwyrm.com/mehen/updates/stable.json"],
+      "windows": {
+        "installMode": "quiet"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+    "createUpdaterArtifacts": true,
+    "resources": ["resources/**/*"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
   }
 }

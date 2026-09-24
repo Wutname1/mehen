@@ -2,6 +2,7 @@ import { Moon, Search, Settings2, Sun, TriangleAlert, Undo2, X } from 'lucide-re
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { AdvisoryDialog } from './components/AdvisoryDialog'
+import { AppUpdateButton, AppUpdateDialog, useAppUpdate } from './components/AppUpdate'
 import { Logo, cx } from './components/bits'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
 import { HeldBackDialog } from './components/HeldBack'
@@ -33,12 +34,14 @@ type Dialog =
   | { kind: 'update'; start: 'confirm' | 'preview'; targets: UpdateTarget[] }
   | { kind: 'advisory'; row: QueueRow }
   | { kind: 'held-back'; packageKey: string | null }
+  | { kind: 'app-update' }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export default function App() {
   const { prefs, update: setPrefs, theme } = usePrefs()
   const [settings, setSettings] = useState<Settings | null>(null)
+  const appUpdate = useAppUpdate(settings?.appUpdateCheck ?? false)
   const [dialog, setDialog] = useState<Dialog | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [inventory, setInventory] = useState<Inventory | null>(null)
@@ -453,6 +456,7 @@ export default function App() {
           )}
         </label>
         <div className="flex gap-1.5">
+          <AppUpdateButton update={appUpdate} onOpen={() => setDialog({ kind: 'app-update' })} />
           <button
             type="button"
             onClick={() => setPrefs({ theme: theme === 'dark' ? 'light' : 'dark' })}
@@ -577,8 +581,12 @@ export default function App() {
         </div>
       )}
 
+      {dialog?.kind === 'app-update' && <AppUpdateDialog update={appUpdate} onClose={() => setDialog(null)} />}
+
       {dialog?.kind === 'settings' && settings && (
         <SettingsDialog
+          appUpdate={appUpdate}
+          onAppUpdate={() => setDialog({ kind: 'app-update' })}
           tab={dialog.tab}
           repo={dialog.repo}
           settings={settings}
