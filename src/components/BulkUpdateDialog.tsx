@@ -1,7 +1,7 @@
 import { ArrowRight, Check, ChevronRight, CircleAlert, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import * as api from '../api'
-import { commitMessageFor, relativePath } from '../derive'
+import { relativePath } from '../derive'
 import type { Change, Ecosystem, Inventory, Project, UpdateOutcome, UpdatePlan } from '../types'
 import { EcoBadge, cx } from './bits'
 
@@ -50,7 +50,6 @@ export function BulkUpdateDialog({
   const [open, setOpen] = useState<string | null>(null)
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
   const [applyTotal, setApplyTotal] = useState(0)
-  const current = useRef<number | null>(null)
 
   const patch = (i: number, update: Partial<Row>) => setRows((prev) => prev.map((r, j) => (j === i ? { ...r, ...update } : r)))
 
@@ -74,8 +73,12 @@ export function BulkUpdateDialog({
   }, [targets])
 
   useEffect(() => {
-    const unlisten = api.onUpdateEvent((e) => {
-      if (current.current !== null && e.state === 'running') patch(current.current, { step: e.label })
+    const unlisten = api.onBatchEvent((e) => {
+      const live = e.state === 'running' || e.state === 'waiting' || e.state === 'committing'
+      if (!live) return
+      setRows((prev) =>
+        prev.map((r) => (e.projects.includes(r.target.project.id) && (r.state === 'waiting' || r.state === 'running') ? { ...r, state: e.state === 'waiting' ? 'waiting' : 'running', step: e.label ?? undefined } : r)),
+      )
     })
     return () => {
       unlisten.then((fn) => fn())
@@ -90,28 +93,20 @@ export function BulkUpdateDialog({
     const ready = rows.map((r, i) => [r, i] as const).filter(([r]) => r.state === 'ready')
     setApplyTotal(ready.length)
     setRows((prev) => prev.map((r) => (r.state === 'ready' ? { ...r, state: 'waiting' } : r)))
-    let anyOk = false
-    for (const [row, i] of ready) {
-      current.current = i
-      patch(i, { state: 'running' })
-      try {
-        const plan = row.plan!
-        const message = commit && !plan.commitBlocked ? commitMessageFor(plan.changes) : null
-        const result = await api.applyUpdate(plan, verify, false, message)
-        anyOk ||= result.outcome.ok
-        patch(i, { state: result.outcome.ok ? 'ok' : 'failed', outcome: result.outcome, step: undefined })
-      } catch (e) {
-        patch(i, { state: 'failed', outcome: { ok: false, rolledBack: false, error: String(e), steps: [], committed: null, commitError: null }, step: undefined })
-      }
-    }
-    current.current = null
-    if (anyOk) {
-      setPhase('refreshing')
-      try {
-        setRefreshed(await api.scanAndCheck(false))
-      } catch {
-        // The update itself succeeded; the next manual check will catch up.
-      }
+    try {
+      const result = await api.applyBatch(ready.map(([r]) => r.plan!), verify, commit)
+      setRows((prev) =>
+        prev.map((r) => {
+          const job = result.outcomes.find((o) => o.projects.includes(r.target.project.id))
+          if (!job) return r
+          const outcome: UpdateOutcome = { ok: job.ok, rolledBack: job.rolledBack, error: job.error, steps: job.steps, committed: job.committed, commitError: job.commitError ?? job.commitSkipped }
+          return { ...r, state: job.ok ? 'ok' : 'failed', outcome, step: undefined }
+        }),
+      )
+      if (result.inventory) setRefreshed(result.inventory)
+    } catch (e) {
+      const outcome: UpdateOutcome = { ok: false, rolledBack: false, error: String(e), steps: [], committed: null, commitError: null }
+      setRows((prev) => prev.map((r) => (r.state === 'waiting' || r.state === 'running' ? { ...r, state: 'failed', outcome, step: undefined } : r)))
     }
     setPhase('done')
   }
@@ -120,7 +115,7 @@ export function BulkUpdateDialog({
   const unplannable = rows.filter((r) => r.state === 'unplannable')
   const done = rows.filter((r) => r.state === 'ok').length
   const failed = rows.filter((r) => r.state === 'failed').length
-  const hasVerify = rows.some((r) => r.plan?.steps.some((s) => s.kind === 'verify'))
+  const hasVerify = rows.some((r) => r.plan?.steps.some((s) => s.kind !== 'install'))
   const warnings = [...new Set(rows.flatMap((r) => (r.state === 'unplannable' ? [] : (r.plan?.warnings ?? []))))]
 
   return (
@@ -171,6 +166,8 @@ export function BulkUpdateDialog({
                       <span className="text-amber">{row.error?.split('\n')[0]}</span>
                     ) : row.state === 'running' ? (
                       <span className="text-gold">{row.step ?? 'Writing changes…'}</span>
+                    ) : row.state === 'waiting' && phase === 'applying' ? (
+                      <span className="text-dim">{row.step ?? 'Queued'}</span>
                     ) : row.state === 'failed' ? (
                       <span className="text-carnelian">{row.outcome?.rolledBack ? 'Failed, restored' : 'Failed'}</span>
                     ) : row.state === 'ok' && (row.outcome?.committed || row.outcome?.commitError) ? (
@@ -254,11 +251,11 @@ export function BulkUpdateDialog({
             {phase === 'review' && (
               <span>
                 {ready} project{ready === 1 ? '' : 's'} ready
-                {unplannable.length > 0 && `, ${unplannable.length} can't be changed automatically`}. Each project is applied on its own; one failing
+                {unplannable.length > 0 && `, ${unplannable.length} can't be changed automatically`}. Repositories update side by side; one failing
                 doesn't stop the rest.
               </span>
             )}
-            {phase === 'applying' && `Updating ${Math.min(done + failed + 1, applyTotal)} of ${applyTotal}…`}
+            {phase === 'applying' && `Updating ${applyTotal} project${applyTotal === 1 ? '' : 's'}…`}
             {phase === 'refreshing' && (
               <span className="inline-flex items-center gap-2">
                 <Loader2 size={13} className="animate-spin" /> Refreshing results…
@@ -273,7 +270,7 @@ export function BulkUpdateDialog({
           {phase === 'review' && rows.some((r) => r.plan?.repo) && (
             <label
               className="flex items-center gap-2 text-muted"
-              title="Commits each project's manifest and lockfile on its current branch. Projects with uncommitted changes in those files are left uncommitted."
+              title="Commits each repository's changed files on its current branch as “Updated N Dependencies”. Repositories with uncommitted changes in those files are left uncommitted."
             >
               <input type="checkbox" checked={commit} onChange={(e) => setCommit(e.target.checked)} className="size-3.5 accent-[var(--color-gold)]" />
               Commit each
@@ -285,7 +282,7 @@ export function BulkUpdateDialog({
           {phase === 'review' && hasVerify && (
             <label className="flex items-center gap-2 text-muted">
               <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} className="size-3.5 accent-[var(--color-gold)]" />
-              Check builds
+              Build and test
             </label>
           )}
           {phase === 'review' ? (

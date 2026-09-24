@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mehen_core::batch::{self, BatchEvent, BatchOptions, JobOutcome};
 use mehen_core::store::StoreStats;
 use mehen_core::update::{self, Change, UpdateEvent, UpdateOutcome, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
@@ -14,6 +15,8 @@ use tauri_plugin_notification::NotificationExt;
 
 /// Setting key: hours between background checks; 0 or missing means off.
 const BACKGROUND_HOURS: &str = "background_hours";
+/// Setting key: how many update steps may run at once across repositories.
+const UPDATE_PARALLEL: &str = "update_parallel";
 /// How often the background loop wakes to see whether a check is due.
 const BACKGROUND_TICK: Duration = Duration::from_secs(10 * 60);
 
@@ -33,15 +36,20 @@ struct Settings {
     folders: Vec<String>,
     rules: Vec<IgnoreRule>,
     background_hours: u32,
+    update_parallel: usize,
 }
 
 impl AppState {
     fn settings(&self) -> Settings {
-        Settings { folders: self.store.folders(), rules: self.store.ignore_rules(), background_hours: self.background_hours() }
+        Settings { folders: self.store.folders(), rules: self.store.ignore_rules(), background_hours: self.background_hours(), update_parallel: self.update_parallel() }
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.store.folders().into_iter().map(PathBuf::from).collect()
+    }
+
+    fn update_parallel(&self) -> usize {
+        self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse().ok()).unwrap_or(batch::DEFAULT_PARALLEL).clamp(1, 8)
     }
 
     fn background_hours(&self) -> u32 {
@@ -191,6 +199,13 @@ fn set_background_hours(state: State<'_, AppState>, hours: u32) -> Result<Settin
     Ok(state.settings())
 }
 
+/// How many update steps may run at once; 1 runs one at a time.
+#[tauri::command]
+fn set_update_parallel(state: State<'_, AppState>, parallel: usize) -> Result<Settings, String> {
+    state.store.set_setting(UPDATE_PARALLEL, &parallel.clamp(1, 8).to_string()).map_err(err)?;
+    Ok(state.settings())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IgnoreResult {
@@ -277,6 +292,29 @@ async fn apply_update(
     Ok(ApplyResult { outcome, inventory: Some(inventory) })
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchResult {
+    outcomes: Vec<JobOutcome>,
+    /// A fresh check when anything was updated (served from the cache).
+    inventory: Option<Inventory>,
+}
+
+/// Applies reviewed plans for many projects: one job per repository, running
+/// side by side except where two need the same tool. Progress arrives as
+/// `mehen://batch` events; results are re-checked once at the end.
+#[tauri::command]
+async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commit: bool) -> Result<BatchResult, String> {
+    let parallel = app.state::<AppState>().update_parallel();
+    let options = BatchOptions { checks, commit, parallel };
+    let outcomes = batch::run(plans, options, |step| async move { update::run_step(&step).await }, |e: BatchEvent| {
+        let _ = app.emit("mehen://batch", e);
+    })
+    .await;
+    let inventory = if outcomes.iter().any(|o| o.ok) { Some(check_now(&app, false).await?) } else { None };
+    Ok(BatchResult { outcomes, inventory })
+}
+
 #[tauri::command]
 fn store_stats(state: State<'_, AppState>) -> Result<StoreStats, String> {
     state.store.stats().map_err(err)
@@ -332,6 +370,7 @@ pub fn run() {
             add_folder,
             remove_folder,
             set_background_hours,
+            set_update_parallel,
             add_ignore,
             remove_ignore,
             discover,
@@ -339,6 +378,7 @@ pub fn run() {
             scan_and_check,
             plan_update,
             apply_update,
+            apply_batch,
             store_stats,
             clear_cache,
             open_in_editor

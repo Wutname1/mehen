@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { Change, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, StoreStats, UpdateEvent, UpdateOutcome, UpdatePlan } from './types'
+import type { BatchEvent, BatchResult, Change, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdateEvent, UpdateOutcome, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -26,6 +26,11 @@ export async function addFolder(path: string): Promise<Settings> {
 export async function removeFolder(path: string): Promise<Settings> {
   if (!inTauri) return mock.removeFolder(path)
   return invoke<Settings>('remove_folder', { path })
+}
+
+export async function setUpdateParallel(parallel: number): Promise<Settings> {
+  if (!inTauri) return mock.setUpdateParallel(parallel)
+  return invoke<Settings>('set_update_parallel', { parallel })
 }
 
 export async function setBackgroundHours(hours: number): Promise<Settings> {
@@ -95,6 +100,28 @@ export async function onUpdateEvent(handler: (e: UpdateEvent) => void): Promise<
 
 let mockUpdateListener: ((e: UpdateEvent) => void) | null = null
 
+/**
+ * Updates many projects at once: one job per repository, side by side except
+ * where two need the same tool. `checks` runs builds and tests; `commit`
+ * commits each repository that succeeds.
+ */
+export async function applyBatch(plans: UpdatePlan[], checks: boolean, commit: boolean): Promise<BatchResult> {
+  if (!inTauri) return mock.applyBatch(plans, checks, commit)
+  return invoke<BatchResult>('apply_batch', { plans, checks, commit })
+}
+
+export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    mockBatchListeners.add(handler)
+    return () => {
+      mockBatchListeners.delete(handler)
+    }
+  }
+  return listen<BatchEvent>('mehen://batch', (e) => handler(e.payload))
+}
+
+const mockBatchListeners = new Set<(e: BatchEvent) => void>()
+
 export async function storeStats(): Promise<StoreStats | null> {
   if (!inTauri) return null
   return invoke<StoreStats>('store_stats')
@@ -128,7 +155,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0 }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 2 }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -165,6 +192,7 @@ const mock = (() => {
   return {
     settings: async () => state,
     setBackgroundHours: async (hours: number) => (state = { ...state, backgroundHours: hours }),
+    setUpdateParallel: async (parallel: number) => (state = { ...state, updateParallel: Math.min(8, Math.max(1, parallel)) }),
     addFolder: async (path: string) => (state = { ...state, folders: [...new Set([...state.folders, path])] }),
     removeFolder: async (path: string) => (state = { ...state, folders: state.folders.filter((f) => f !== path) }),
     addIgnore: async (kind: IgnoreKind, value: string): Promise<IgnoreResult> => {
@@ -204,6 +232,7 @@ const mock = (() => {
         steps: [
           { kind: 'install', label: 'npm install', program: 'npm', args: ['install'], cwd: project.dir },
           { kind: 'verify', label: 'npm run build', program: 'npm', args: ['run', 'build'], cwd: project.dir },
+          { kind: 'test', label: 'npm run test', program: 'npm', args: ['run', 'test'], cwd: project.dir },
         ],
         snapshots: [],
         warnings: [],
@@ -213,7 +242,7 @@ const mock = (() => {
     },
     applyUpdate: async (plan: UpdatePlan, verify: boolean, commitMessage: string | null): Promise<ApplyResult> => {
       const steps = plan.steps.filter((s) => verify || s.kind === 'install')
-      const results = []
+      const results: StepResult[] = []
       for (const [index, step] of steps.entries()) {
         mockUpdateListener?.({ index, label: step.label, state: 'running' })
         await new Promise((r) => setTimeout(r, 700))
@@ -229,6 +258,37 @@ const mock = (() => {
         outcome: { ok: true, rolledBack: false, error: null, steps: results, committed: commitMessage ? 'abc1234' : null, commitError: null },
         inventory: await filtered(),
       }
+    },
+    // Mirrors the Rust runner: one job per repository, one step per tool at a time.
+    applyBatch: async (plans: UpdatePlan[], checks: boolean, commit: boolean): Promise<BatchResult> => {
+      const emit = (e: BatchEvent) => mockBatchListeners.forEach((l) => l(e))
+      const jobs = new Map<string, UpdatePlan[]>()
+      for (const p of plans) {
+        const key = p.repo ?? p.projectId.replace(/[\\/][^\\/]*$/, '')
+        jobs.set(key, [...(jobs.get(key) ?? []), p])
+      }
+      const lanes = new Map<string, Promise<void>>()
+      const runJob = async ([job, list]: [string, UpdatePlan[]]): Promise<JobOutcome> => {
+        const projects = list.map((p) => p.projectId)
+        const results: StepResult[] = []
+        for (const step of list.flatMap((p) => p.steps).filter((s) => checks || s.kind === 'install')) {
+          const previous = lanes.get(step.program) ?? Promise.resolve()
+          let release = () => {}
+          lanes.set(step.program, previous.then(() => new Promise<void>((r) => (release = r))))
+          emit({ job, projects, state: 'waiting', label: `Waiting for ${step.program}`, lane: step.program })
+          await previous
+          emit({ job, projects, state: 'running', label: step.label, lane: step.program })
+          await new Promise((r) => setTimeout(r, 700))
+          release()
+          results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 700 })
+        }
+        emit({ job, projects, state: 'done', label: null, lane: null })
+        const repo = list[0].repo
+        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null }
+      }
+      for (const [job, list] of jobs) emit({ job, projects: list.map((p) => p.projectId), state: 'queued', label: null, lane: null })
+      const outcomes = await Promise.all([...jobs].map(runJob))
+      return { outcomes, inventory: await filtered() }
     },
   }
 })()

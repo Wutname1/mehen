@@ -58,6 +58,15 @@ pub enum StepKind {
     Install,
     /// Proves the project still builds. Optional.
     Verify,
+    /// Runs the project's tests. Optional, together with `Verify`.
+    Test,
+}
+
+impl StepKind {
+    /// Build and test steps are the "checks" a user can switch off.
+    pub fn is_check(self) -> bool {
+        matches!(self, StepKind::Verify | StepKind::Test)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +180,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
     match project.ecosystem {
         Ecosystem::Npm => plan_npm(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Cargo => plan_cargo(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
-        Ecosystem::Nuget => plan_nuget(&mut plan, &manifest, &dir, &deps)?,
+        Ecosystem::Nuget => plan_nuget(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
     for edit in &mut plan.edits {
@@ -185,7 +194,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
 }
 
 /// Every file an update writes: the edits plus lockfiles the steps rewrite.
-fn touched_paths(plan: &UpdatePlan) -> Vec<String> {
+pub(crate) fn touched_paths(plan: &UpdatePlan) -> Vec<String> {
     let mut paths: Vec<String> = plan.edits.iter().map(|e| e.path.clone()).chain(plan.snapshots.iter().cloned()).collect();
     paths.dedup();
     paths
@@ -218,15 +227,26 @@ fn dirty_files(repo: &Path, paths: &[String]) -> Option<String> {
 /// Other staged changes are left alone; hooks run as usual; nothing is pushed.
 fn commit(plan: &UpdatePlan, message: &str) -> Result<String, String> {
     let repo = PathBuf::from(plan.repo.as_ref().ok_or("not inside a git repository")?);
-    let paths: Vec<String> = touched_paths(plan).into_iter().filter(|p| Path::new(p).exists()).collect();
+    commit_paths(&repo, &touched_paths(plan), &[message])
+}
+
+/// Commits `paths` (those that still exist) with one `-m` per message part:
+/// the first is the subject, the rest become the body. Returns the short hash.
+pub(crate) fn commit_paths(repo: &Path, paths: &[String], messages: &[&str]) -> Result<String, String> {
+    let paths: Vec<&String> = paths.iter().filter(|p| Path::new(p).exists()).collect();
     let run = |cmd: &mut std::process::Command| -> Result<String, String> {
         let out = cmd.output().map_err(|e| format!("could not run git: {e}"))?;
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         if out.status.success() { Ok(text) } else { Err(tail(&text)) }
     };
-    run(git(&repo).args(["add", "--"]).args(&paths))?;
-    run(git(&repo).args(["commit", "-m", message, "--"]).args(&paths))?;
-    run(git(&repo).args(["rev-parse", "--short", "HEAD"])).map(|h| h.trim().to_string())
+    run(git(repo).args(["add", "--"]).args(&paths))?;
+    let mut commit = git(repo);
+    commit.arg("commit");
+    for m in messages.iter().filter(|m| !m.trim().is_empty()) {
+        commit.args(["-m", m]);
+    }
+    run(commit.arg("--").args(&paths))?;
+    run(git(repo).args(["rev-parse", "--short", "HEAD"])).map(|h| h.trim().to_string())
 }
 
 fn unified_diff(path: &str, before: &str, after: &str, base: &Path) -> String {
@@ -291,7 +311,10 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
             written_after: new_spec,
         });
     }
-    let scripts_build = serde_json::from_str::<serde_json::Value>(&before).ok().is_some_and(|j| j["scripts"]["build"].is_string());
+    let json = serde_json::from_str::<serde_json::Value>(&before).ok();
+    let scripts_build = json.as_ref().is_some_and(|j| j["scripts"]["build"].is_string());
+    // `npm init` writes a test script that only fails; that is no test suite.
+    let scripts_test = json.as_ref().and_then(|j| j["scripts"]["test"].as_str()).is_some_and(|s| !s.contains("no test specified"));
     push_edit(plan, manifest, before, text);
 
     match npm_manager(dir, repo) {
@@ -304,6 +327,9 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
             push_step(plan, StepKind::Install, &format!("{pm} install"), pm, &args, &lock_dir);
             if scripts_build {
                 push_step(plan, StepKind::Verify, &format!("{pm} run build"), pm, &["run", "build"], dir);
+            }
+            if scripts_test {
+                push_step(plan, StepKind::Test, &format!("{pm} run test"), pm, &["run", "test"], dir);
             }
         }
         None => plan.warnings.push("No lockfile found, so no install will run. Run your package manager's install yourself.".into()),
@@ -426,6 +452,7 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     push_step(plan, StepKind::Install, "cargo update (only the selected crates)", "cargo", &args, dir);
     push_step(plan, StepKind::Verify, "cargo check", "cargo", &["check", "--quiet"], dir);
+    push_step(plan, StepKind::Test, "cargo test", "cargo", &["test", "--quiet"], dir);
     Ok(())
 }
 
@@ -443,7 +470,7 @@ fn nuget_patterns(name: &str, old: &str) -> anyhow::Result<Vec<Regex>> {
     ])
 }
 
-fn plan_nuget(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+fn plan_nuget(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Path>, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
     let before = read(manifest)?;
     let mut text = before.clone();
     let is_packages_config = manifest.file_name().is_some_and(|n| n == "packages.config");
@@ -498,7 +525,38 @@ fn plan_nuget(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Depe
     let project_arg = manifest.display().to_string();
     push_step(plan, StepKind::Install, "dotnet restore", "dotnet", &["restore", &project_arg], dir);
     push_step(plan, StepKind::Verify, "dotnet build", "dotnet", &["build", &project_arg, "--no-restore", "-v", "q"], dir);
+    // Tests usually live in sibling projects, so run the solution's tests.
+    if let Some(solution) = solution_file(dir, repo) {
+        let name = solution.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let parent = solution.parent().unwrap_or(dir).to_path_buf();
+        push_step(plan, StepKind::Test, &format!("dotnet test {name}"), "dotnet", &["test", &solution.display().to_string(), "-v", "q"], &parent);
+    }
     Ok(())
+}
+
+/// The nearest `.sln` or `.slnx` from `dir` up to the repository root.
+fn solution_file(dir: &Path, repo: Option<&Path>) -> Option<PathBuf> {
+    for d in dir.ancestors() {
+        if repo.is_some_and(|r| !d.starts_with(r)) {
+            break;
+        }
+        let mut found: Vec<PathBuf> = std::fs::read_dir(d)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sln") || e.eq_ignore_ascii_case("slnx")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        if let Some(first) = found.into_iter().next() {
+            return Some(first);
+        }
+        if repo.is_none() {
+            break;
+        }
+    }
+    None
 }
 
 fn project_files(dir: &Path) -> Vec<PathBuf> {
@@ -591,12 +649,17 @@ fn plan_actions(plan: &mut UpdatePlan, dir: &Path, deps: &[(&Dependency, &Change
 
 // ---------------------------------------------------------------- apply
 
-struct Snapshot {
+pub(crate) struct Snapshot {
     path: PathBuf,
     contents: Option<Vec<u8>>,
 }
 
-fn restore(snapshots: &[Snapshot]) -> Result<(), String> {
+/// Reads each file as it is now, so it can be put back exactly.
+pub(crate) fn snapshot(paths: &[String]) -> Vec<Snapshot> {
+    paths.iter().map(|p| Snapshot { contents: std::fs::read(p).ok(), path: PathBuf::from(p) }).collect()
+}
+
+pub(crate) fn restore(snapshots: &[Snapshot]) -> Result<(), String> {
     let mut failures = Vec::new();
     for s in snapshots {
         let result = match &s.contents {
@@ -611,12 +674,13 @@ fn restore(snapshots: &[Snapshot]) -> Result<(), String> {
     if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
 }
 
-fn tail(output: &str) -> String {
+pub(crate) fn tail(output: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     lines[lines.len().saturating_sub(OUTPUT_TAIL_LINES)..].join("\n")
 }
 
-async fn run_step(step: &Step) -> (bool, String) {
+/// Runs one step and returns whether it succeeded plus the end of its output.
+pub async fn run_step(step: &Step) -> (bool, String) {
     let mut cmd = if cfg!(windows) {
         // npm, pnpm, yarn and bun are .cmd shims on Windows.
         let mut c = tokio::process::Command::new("cmd");
@@ -628,6 +692,10 @@ async fn run_step(step: &Step) -> (bool, String) {
         c
     };
     cmd.current_dir(&step.cwd).kill_on_drop(true).stdin(std::process::Stdio::null());
+    if step.kind == StepKind::Test {
+        // Test runners that watch for changes by default run once under CI.
+        cmd.env("CI", "true");
+    }
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
@@ -685,7 +753,7 @@ pub async fn apply(plan: &UpdatePlan, run_verify: bool, commit_message: Option<&
     }
 
     for (index, step) in plan.steps.iter().enumerate() {
-        if step.kind == StepKind::Verify && !run_verify {
+        if step.kind.is_check() && !run_verify {
             continue;
         }
         on_event(UpdateEvent { index, label: step.label.clone(), state: "running".into() });

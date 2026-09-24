@@ -70,7 +70,7 @@ export function UpdateDialog({
 
   const apply = async () => {
     if (!plan) return
-    setStepStates([...plan.steps.map((s): StepState => (s.kind === 'verify' && !verify ? 'skipped' : 'waiting')), commit ? 'waiting' : 'skipped'])
+    setStepStates([...plan.steps.map((s): StepState => (s.kind !== 'install' && !verify ? 'skipped' : 'waiting')), commit ? 'waiting' : 'skipped'])
     setPhase({ name: 'applying' })
     try {
       const result = await api.applyUpdate(plan, verify, true, commit && !plan.commitBlocked ? message : null)
@@ -81,7 +81,7 @@ export function UpdateDialog({
     }
   }
 
-  const hasVerify = plan?.steps.some((s) => s.kind === 'verify') ?? false
+  const hasVerify = plan?.steps.some((s) => s.kind !== 'install') ?? false
   const restoredFiles = plan ? plan.edits.length + plan.snapshots.length : 0
 
   return (
@@ -156,7 +156,7 @@ export function UpdateDialog({
                   <h3 className="mb-2 text-[11.5px] font-medium uppercase tracking-wider text-dim">Then Mehen runs</h3>
                   <ol className="flex flex-col gap-1">
                     {plan.steps.map((s, i) => {
-                      const state = stepStates[i] ?? (s.kind === 'verify' && !verify ? 'skipped' : 'waiting')
+                      const state = stepStates[i] ?? (s.kind !== 'install' && !verify ? 'skipped' : 'waiting')
                       return (
                         <li key={i} className={cx('flex items-center gap-2.5 rounded-lg border border-line px-3 py-2', state === 'skipped' && 'opacity-45')}>
                           <StepIcon state={phase.name === 'review' ? 'waiting' : state} />
@@ -164,7 +164,7 @@ export function UpdateDialog({
                             {s.program} {s.args.join(' ')}
                           </span>
                           <span className="ml-auto shrink-0 text-[11px] text-dim">
-                            {s.kind === 'install' ? 'updates the lockfile' : 'checks the build'} · {relativePath(roots, s.cwd)}
+                            {s.kind === 'install' ? 'updates the lockfile' : s.kind === 'test' ? 'runs the tests' : 'checks the build'} · {relativePath(roots, s.cwd)}
                           </span>
                         </li>
                       )
@@ -173,7 +173,7 @@ export function UpdateDialog({
                   {hasVerify && phase.name === 'review' && (
                     <label className="mt-2 flex items-center gap-2 text-[12.5px] text-muted">
                       <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} className="size-3.5 accent-[var(--color-gold)]" />
-                      Check the build after installing (recommended; slower)
+                      Build and test after installing (recommended; slower)
                     </label>
                   )}
                 </section>

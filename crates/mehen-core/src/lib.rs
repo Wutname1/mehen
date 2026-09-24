@@ -2,6 +2,7 @@
 //! and checks them for updates and known vulnerabilities. Front ends (the
 //! desktop app today, a VS Code extension later) only call `scan` and `check`.
 
+pub mod batch;
 pub mod check;
 pub mod compat;
 pub mod ignore;

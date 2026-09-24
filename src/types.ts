@@ -104,6 +104,8 @@ export interface Settings {
   rules: IgnoreRule[]
   /** Hours between background checks; 0 means off. */
   backgroundHours: number
+  /** Update steps that may run at once across repositories; 1 runs one at a time. */
+  updateParallel: number
 }
 
 export interface DiscoveredProject {
@@ -138,7 +140,7 @@ export interface FileEdit {
   diff: string
 }
 
-export type StepKind = 'install' | 'verify'
+export type StepKind = 'install' | 'verify' | 'test'
 
 export interface Step {
   kind: StepKind
@@ -183,4 +185,37 @@ export interface UpdateEvent {
   index: number
   label: string
   state: 'running' | 'ok' | 'failed' | 'rolled-back'
+}
+
+export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'done' | 'failed' | 'rolled-back'
+
+/** Progress for one repository's share of a batch update. */
+export interface BatchEvent {
+  job: string
+  /** Project ids (manifest paths) in this job. */
+  projects: string[]
+  state: JobState
+  label: string | null
+  /** The tool the step uses: npm, cargo, dotnet... */
+  lane: string | null
+}
+
+export interface JobOutcome {
+  job: string
+  name: string
+  repo: string | null
+  projects: string[]
+  ok: boolean
+  rolledBack: boolean
+  error: string | null
+  steps: StepResult[]
+  committed: string | null
+  commitError: string | null
+  /** Why no commit was attempted although one was asked for. */
+  commitSkipped: string | null
+}
+
+export interface BatchResult {
+  outcomes: JobOutcome[]
+  inventory: Inventory | null
 }
