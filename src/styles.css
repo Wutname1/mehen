@@ -293,6 +293,23 @@ html[data-palette='faience'][data-theme='dark'] {
 
 html {
   color-scheme: light;
+  --brand-npm: #cb3837;
+  --brand-rust: #ce422b;
+  --brand-nuget: #004880;
+  --brand-github: #181717;
+  --brand-javascript: #e8c600;
+  --brand-dotnet: #512bd4;
+}
+
+/* The rail is dark in both themes. */
+html[data-theme='dark'],
+.on-rail {
+  --brand-npm: #e5534b;
+  --brand-rust: #e4865b;
+  --brand-nuget: #5aa7e8;
+  --brand-github: #f0f6fc;
+  --brand-javascript: #f7df1e;
+  --brand-dotnet: #9780e5;
 }
 
 html[data-theme='dark'] {

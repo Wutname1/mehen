@@ -5,12 +5,12 @@ import { ECOSYSTEMS, ECOSYSTEM_LABEL, folderName, isWithin, samePath, type Repo 
 import type { DiscoveredProject, Ecosystem, IgnoreRule, Settings } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
+import { EcoIcon } from './EcoIcon'
 import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 import { Checkbox } from './Queue'
 import { TextInput } from './controls'
 import { RepoAvatar } from './RepoAvatar'
 
-const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: 'Nu', 'github-actions': 'GA' }
 
 /** A repository as found on disk, excluded or not. */
 interface Entry {
@@ -307,11 +307,9 @@ export function ManageProjects({
                         <span role="cell" className={cx('truncate pr-2 text-[12px] font-semibold', tone)} title={label}>
                           {label}
                         </span>
-                        <span role="cell" className="flex gap-[3px]" aria-label={e.ecosystems.map((x) => ECOSYSTEM_LABEL[x]).join(', ')}>
+                        <span role="cell" className="flex items-center gap-1.5 text-muted" aria-label={e.ecosystems.map((x) => ECOSYSTEM_LABEL[x]).join(', ')}>
                           {e.ecosystems.map((x) => (
-                            <i key={x} title={ECOSYSTEM_LABEL[x]} className="inline-grid h-4 min-w-5 place-items-center rounded-[2px] border border-line-strong bg-paper px-[3px] font-mono text-[10.5px] leading-none font-bold not-italic text-ink">
-                              {ECO_SHORT[x]}
-                            </i>
+                            <EcoIcon key={x} ecosystem={x} size={14} />
                           ))}
                         </span>
                         <span role="cell">

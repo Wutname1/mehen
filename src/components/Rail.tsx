@@ -1,12 +1,10 @@
 import { ArrowDownAZ, ArrowDownWideNarrow, ArrowDownZA, Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, type Repo } from '../derive'
-import type { Ecosystem } from '../types'
 import { cx } from './bits'
+import { EcoIcon } from './EcoIcon'
 import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 import { RepoAvatar } from './RepoAvatar'
-
-const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: 'Nu', 'github-actions': 'GA' }
 
 export type RailSort = 'az' | 'za' | 'updates'
 
@@ -274,11 +272,9 @@ export function Rail({
                     <RepoAvatar name={repo.name} icon={icons[repo.key.toLowerCase()]} tone="rail" />
                     <span className="flex min-w-0 flex-col gap-1">
                       <b className="truncate text-[12.5px] font-semibold">{repo.name}</b>
-                      <span className="flex gap-[3px]" aria-hidden>
+                      <span className="flex items-center gap-1.5 text-rail-ink-2" aria-hidden>
                         {repo.ecosystems.map((e) => (
-                          <i key={e} title={ECOSYSTEM_LABEL[e]} className="inline-grid h-4 min-w-5 place-items-center rounded-[2px] border border-rail-border bg-chip-bg px-[3px] font-mono text-[10.5px] leading-none font-bold not-italic text-rail-ink-2">
-                            {ECO_SHORT[e]}
-                          </i>
+                          <EcoIcon key={e} ecosystem={e} size={14} />
                         ))}
                       </span>
                     </span>

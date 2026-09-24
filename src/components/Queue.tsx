@@ -3,6 +3,7 @@ import { useLayoutEffect, useRef, useState, type InputHTMLAttributes, type Keybo
 import { ECOSYSTEM_LABEL, ECOSYSTEMS, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, repoKey, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
 import type { Ecosystem, Hold } from '../types'
 import { cx } from './bits'
+import { EcoIcon, ProjectTypeIcon } from './EcoIcon'
 import { Menu, MenuCheck, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 
 export type RiskFilter = 'any' | 'attention' | 'security'
@@ -188,7 +189,7 @@ export function Queue({
                   </MenuCheck>
                   <MenuSeparator />
                   {(Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).map((t) => (
-                    <MenuCheck key={t} checked={filters.types.has(t)} onSelect={() => onFilters({ ...filters, types: toggle(filters.types, t) })}>
+                    <MenuCheck key={t} checked={filters.types.has(t)} onSelect={() => onFilters({ ...filters, types: toggle(filters.types, t) })} icon={<ProjectTypeIcon type={t} size={15} />}>
                       {PROJECT_TYPE_LABEL[t]}
                     </MenuCheck>
                   ))}
@@ -207,7 +208,7 @@ export function Queue({
                 </MenuCheck>
                 <MenuSeparator />
                 {ECOSYSTEMS.map((e) => (
-                  <MenuCheck key={e} checked={filters.ecosystems.has(e)} onSelect={() => onFilters({ ...filters, ecosystems: toggle(filters.ecosystems, e) })}>
+                  <MenuCheck key={e} checked={filters.ecosystems.has(e)} onSelect={() => onFilters({ ...filters, ecosystems: toggle(filters.ecosystems, e) })} icon={<EcoIcon ecosystem={e} size={15} />}>
                     {ECOSYSTEM_LABEL[e]}
                   </MenuCheck>
                 ))}

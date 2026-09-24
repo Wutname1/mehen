@@ -108,12 +108,15 @@ export function MenuCheck({
   onSelect,
   radio,
   detail,
+  icon,
   children,
 }: {
   checked: boolean
   onSelect: () => void
   radio?: boolean
   detail?: ReactNode
+  /** Shown between the check and the label. */
+  icon?: ReactNode
   children: ReactNode
 }) {
   return (
@@ -133,6 +136,7 @@ export function MenuCheck({
       >
         {checked && <Check size={11} strokeWidth={3} />}
       </span>
+      {icon && <span className="mt-px flex shrink-0 items-center">{icon}</span>}
       <span className="flex min-w-0 flex-col gap-0.5">
         <span className={cx(!!detail && 'font-semibold')}>{children}</span>
         {detail && <span className="text-[12px] leading-snug text-muted">{detail}</span>}
