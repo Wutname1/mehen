@@ -172,6 +172,7 @@ fn from_osv_name(name: &str) -> Option<Ecosystem> {
         "NuGet" => Some(Ecosystem::Nuget),
         "GitHub Actions" => Some(Ecosystem::GithubActions),
         "Go" => Some(Ecosystem::Go),
+        "PyPI" => Some(Ecosystem::Pypi),
         _ => None,
     }
 }

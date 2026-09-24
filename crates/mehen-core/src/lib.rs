@@ -12,6 +12,7 @@ pub mod ignore;
 pub mod lockfiles;
 pub mod model;
 pub mod osv;
+pub mod python;
 pub mod registry;
 pub mod scan;
 pub mod store;

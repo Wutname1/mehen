@@ -74,6 +74,7 @@ pub async fn lookup(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) ->
         Ecosystem::Nuget => nuget(http, name).await,
         Ecosystem::GithubActions => github_tags(http, name).await,
         Ecosystem::Go => go_module(http, name).await,
+        Ecosystem::Pypi => pypi(http, name).await,
     }
 }
 
@@ -112,6 +113,43 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         }
     }
     Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
+}
+
+/// PyPI's JSON document: every release with the Python it needs. Releases
+/// with every file yanked are skipped, and so are pre-, post- and
+/// dev-releases, which are never offered as update targets.
+async fn pypi(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    #[derive(Deserialize)]
+    struct Doc {
+        info: Info,
+        #[serde(default)]
+        releases: std::collections::HashMap<String, Vec<File>>,
+    }
+    #[derive(Deserialize)]
+    struct Info {
+        version: String,
+    }
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        requires_python: Option<String>,
+        #[serde(default)]
+        yanked: bool,
+    }
+    let doc: Doc = get(http, &format!("https://pypi.org/pypi/{}/json", crate::python::normalize(name)), None).await?.json().await?;
+    let mut versions = Vec::new();
+    let mut requirements = Vec::new();
+    for (version, files) in doc.releases {
+        if files.is_empty() || files.iter().all(|f| f.yanked) || crate::python::release(&version).is_none() {
+            continue;
+        }
+        if let Some(range) = files.iter().find_map(|f| f.requires_python.as_deref().map(str::trim).filter(|r| !r.is_empty())) {
+            requirements.push((version.clone(), Requirement::Python { range: range.to_string() }));
+        }
+        versions.push(version);
+    }
+    let latest = Some(doc.info.version).filter(|v| versions.contains(v)).or_else(|| max_version(versions.iter().map(String::as_str)));
+    Ok(PackageInfo { latest, versions, requirements, ..Default::default() })
 }
 
 /// The Go module proxy's list of tagged versions. A module with only

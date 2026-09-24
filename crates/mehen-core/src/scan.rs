@@ -106,6 +106,9 @@ pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
             "package.json" => scanner.package_json(path),
             "Cargo.toml" => scanner.cargo_toml(path),
             "go.mod" => scanner.go_mod(path),
+            "pyproject.toml" => scanner.pyproject(path),
+            "Pipfile" => scanner.pipfile(path),
+            _ if file_name.starts_with("requirements") && ext == "txt" => scanner.requirements_txt(path),
             "packages.config" => scanner.packages_config(path),
             "Directory.Packages.props" => scanner.central_packages(path),
             _ if matches!(ext.as_str(), "csproj" | "fsproj" | "vbproj") => scanner.msbuild_project(path),
@@ -155,8 +158,16 @@ pub fn discover(roots: &[PathBuf], rules: &[crate::ignore::IgnoreRule]) -> Vec<c
         .collect()
 }
 
+/// A package listed twice (say, in two dependency groups with the same
+/// spec) shows once.
+fn dedupe_python(deps: &mut Vec<Dependency>) {
+    let mut seen = std::collections::HashSet::new();
+    deps.retain(|d| seen.insert((crate::python::normalize(&d.name), d.requested.clone())));
+}
+
 fn is_manifest(file_name: &str, ext: &str) -> bool {
-    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod")
+    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod" | "pyproject.toml" | "Pipfile")
+        || file_name.starts_with("requirements") && ext == "txt"
         || matches!(ext, "csproj" | "fsproj" | "vbproj" | "yml" | "yaml")
 }
 
@@ -276,6 +287,7 @@ impl Scanner {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies,
         });
         self.projects.last_mut()
@@ -319,6 +331,7 @@ impl Scanner {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies: merged,
         });
     }
@@ -408,6 +421,140 @@ impl Scanner {
         }
         let name = parsed.module.as_deref().map(crate::golang::module_name).unwrap_or_else(|| dir_name(dir));
         self.push(path, name, Ecosystem::Go, Vec::new(), deps);
+        Ok(())
+    }
+
+    /// A Python dependency, versioned by the lockfile when there is one, else
+    /// by an exact `==` pin (or Poetry's bare version).
+    fn python_dep(name: &str, spec: &str, kind: DepKind, locked: &HashMap<String, String>, lock_name: Option<&str>, source: &str) -> Dependency {
+        let mut dep = Dependency::new(name, Ecosystem::Pypi, kind, spec);
+        let s = spec.trim();
+        let exact = s.strip_prefix("==").unwrap_or(if s.starts_with(|c: char| c.is_ascii_digit()) { s } else { "" }).trim();
+        let pinned = (!exact.is_empty() && !exact.contains(['*', ',']) && crate::python::release(exact).is_some()).then_some(exact);
+        match (locked.get(&crate::python::normalize(name)), pinned) {
+            (Some(v), _) => {
+                dep.installed = Some(v.clone());
+                dep.installed_from = lock_name.map(Into::into);
+            }
+            (None, Some(v)) => {
+                dep.installed = Some(v.to_string());
+                dep.installed_from = Some(source.into());
+            }
+            (None, None) if s.is_empty() || s == "*" => dep.note = Some("no version given".into()),
+            (None, None) => {}
+        }
+        dep
+    }
+
+    fn python_local(name: &str, kind: DepKind, why: &str) -> Dependency {
+        let mut dep = Dependency::new(name, Ecosystem::Pypi, kind, "");
+        dep.status = Status::Local;
+        dep.note = Some(why.into());
+        dep
+    }
+
+    /// The lowest Python in `.python-version`, next to the manifest.
+    fn python_version_file(dir: &Path) -> Option<String> {
+        let text = fs::read_to_string(dir.join(".python-version")).ok()?;
+        crate::python::lowest_python(text.lines().next()?.trim())
+    }
+
+    fn requirements_txt(&mut self, path: &Path) -> anyhow::Result<()> {
+        let dir = path.parent().unwrap_or(path);
+        let file = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        let kind = if file.contains("dev") || file.contains("test") { DepKind::Dev } else { DepKind::Normal };
+        let mut deps = Vec::new();
+        for req in read_text(path)?.lines().filter_map(crate::python::parse_requirement) {
+            deps.push(if req.direct { Self::python_local(&req.name, kind, "installed from a URL or folder") } else { Self::python_dep(&req.name, &req.spec, kind, &HashMap::new(), None, &file) });
+        }
+        let name = if file == "requirements.txt" { dir_name(dir) } else { format!("{} ({file})", dir_name(dir)) };
+        if let Some(project) = self.push(path, name, Ecosystem::Pypi, Vec::new(), deps) {
+            project.python_version = Self::python_version_file(dir);
+        }
+        Ok(())
+    }
+
+    fn pyproject(&mut self, path: &Path) -> anyhow::Result<()> {
+        let table: toml::Table = toml::from_str(&read_text(path)?)?;
+        let dir = path.parent().unwrap_or(path);
+        let (locked, lock_name) = match crate::python::Manager::for_manifest(path) {
+            Some((_, lock)) => (crate::python::read_lock(&lock), lock.file_name().map(|f| f.to_string_lossy().to_string())),
+            None => (HashMap::new(), None),
+        };
+        let project = table.get("project");
+        let tool = table.get("tool");
+        let poetry = tool.and_then(|t| t.get("poetry"));
+        let mut deps: Vec<Dependency> = Vec::new();
+        let add_strings = |value: Option<&toml::Value>, kind: DepKind, deps: &mut Vec<Dependency>| {
+            for req in value.and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()).filter_map(crate::python::parse_requirement) {
+                deps.push(if req.direct { Self::python_local(&req.name, kind, "installed from a URL or folder") } else { Self::python_dep(&req.name, &req.spec, kind, &locked, lock_name.as_deref(), "pyproject.toml") });
+            }
+        };
+        add_strings(project.and_then(|p| p.get("dependencies")), DepKind::Normal, &mut deps);
+        for groups in [project.and_then(|p| p.get("optional-dependencies")), table.get("dependency-groups"), tool.and_then(|t| t.get("pdm")).and_then(|p| p.get("dev-dependencies"))] {
+            for group in groups.and_then(|g| g.as_table()).into_iter().flat_map(|t| t.values()) {
+                add_strings(Some(group), DepKind::Dev, &mut deps);
+            }
+        }
+        let mut tables: Vec<(&toml::Table, DepKind)> = Vec::new();
+        if let Some(p) = poetry {
+            tables.extend(p.get("dependencies").and_then(|d| d.as_table()).map(|t| (t, DepKind::Normal)));
+            tables.extend(p.get("dev-dependencies").and_then(|d| d.as_table()).map(|t| (t, DepKind::Dev)));
+            for group in p.get("group").and_then(|g| g.as_table()).into_iter().flat_map(|t| t.values()) {
+                tables.extend(group.get("dependencies").and_then(|d| d.as_table()).map(|t| (t, DepKind::Dev)));
+            }
+        }
+        for (entries, kind) in tables {
+            for (name, value) in entries.iter().filter(|(k, _)| k.as_str() != "python") {
+                deps.push(Self::python_table_dep(name, value, kind, &locked, lock_name.as_deref(), "pyproject.toml"));
+            }
+        }
+        dedupe_python(&mut deps);
+
+        let name = project.and_then(|p| p.get("name")).or_else(|| poetry.and_then(|p| p.get("name"))).and_then(|n| n.as_str()).map(str::to_string).unwrap_or_else(|| dir_name(dir));
+        let python = project
+            .and_then(|p| p.get("requires-python"))
+            .or_else(|| poetry.and_then(|p| p.get("dependencies")).and_then(|d| d.get("python")))
+            .and_then(|v| v.as_str())
+            .and_then(crate::python::lowest_python)
+            .or_else(|| Self::python_version_file(dir));
+        if let Some(project) = self.push(path, name, Ecosystem::Pypi, Vec::new(), deps) {
+            project.python_version = python;
+        }
+        Ok(())
+    }
+
+    /// A `name = spec` entry, as Poetry and Pipenv write them: a string, or a
+    /// table with `version` (or `path`, `git`, `url` for local and direct ones).
+    fn python_table_dep(name: &str, value: &toml::Value, kind: DepKind, locked: &HashMap<String, String>, lock_name: Option<&str>, source: &str) -> Dependency {
+        let table = value.as_table().or_else(|| value.as_array().and_then(|a| a.first()).and_then(|v| v.as_table()));
+        match (value.as_str(), table) {
+            (Some(spec), _) => Self::python_dep(name, spec, kind, locked, lock_name, source),
+            (None, Some(t)) if ["path", "git", "url", "file", "editable"].iter().any(|k| t.contains_key(*k)) && !t.contains_key("version") => {
+                Self::python_local(name, kind, "installed from a folder, URL or git")
+            }
+            (None, Some(t)) => Self::python_dep(name, t.get("version").and_then(|v| v.as_str()).unwrap_or(""), kind, locked, lock_name, source),
+            (None, None) => Self::python_local(name, kind, "unrecognised entry"),
+        }
+    }
+
+    fn pipfile(&mut self, path: &Path) -> anyhow::Result<()> {
+        let table: toml::Table = toml::from_str(&read_text(path)?)?;
+        let dir = path.parent().unwrap_or(path);
+        let lock = dir.join("Pipfile.lock");
+        let locked = crate::python::read_lock(&lock);
+        let lock_name = lock.is_file().then_some("Pipfile.lock");
+        let mut deps = Vec::new();
+        for (section, kind) in [("packages", DepKind::Normal), ("dev-packages", DepKind::Dev)] {
+            for (name, value) in table.get(section).and_then(|s| s.as_table()).into_iter().flatten() {
+                deps.push(Self::python_table_dep(name, value, kind, &locked, lock_name, "Pipfile"));
+            }
+        }
+        dedupe_python(&mut deps);
+        let python = table.get("requires").and_then(|r| r.get("python_version").or_else(|| r.get("python_full_version"))).and_then(|v| v.as_str()).map(str::to_string);
+        if let Some(project) = self.push(path, format!("{} (Pipfile)", dir_name(dir)), Ecosystem::Pypi, Vec::new(), deps) {
+            project.python_version = python.or_else(|| Self::python_version_file(dir));
+        }
         Ok(())
     }
 
@@ -630,6 +777,35 @@ fn read_cargo_lock(path: &Path) -> HashMap<String, Vec<String>> {
 mod tests {
     use super::*;
     use crate::ignore::{IgnoreKind, IgnoreRule};
+
+    #[test]
+    fn python_projects_read_locks_pins_and_python_version() {
+        let root = std::env::temp_dir().join("mehen-test-python");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"api\"\nrequires-python = \">=3.11\"\ndependencies = [\"httpx>=0.27\", \"Typing_Extensions\", \"shared @ file:///libs/shared\"]\n\n[project.optional-dependencies]\ndocs = [\"mkdocs>=1.5\"]\n",
+        )
+        .unwrap();
+        fs::write(root.join("uv.lock"), "version = 1\n\n[[package]]\nname = \"httpx\"\nversion = \"0.27.2\"\n\n[[package]]\nname = \"typing-extensions\"\nversion = \"4.12.2\"\n").unwrap();
+        fs::write(root.join("requirements-dev.txt"), "pytest==8.0.2\nblack\n").unwrap();
+
+        let inventory = scan(&[root.clone()], &IgnoreSet::default());
+        let api = inventory.projects.iter().find(|p| p.name == "api").expect("pyproject project");
+        assert_eq!(api.ecosystem, Ecosystem::Pypi);
+        assert_eq!(api.python_version.as_deref(), Some("3.11"));
+        let dep = |name: &str| api.dependencies.iter().find(|d| d.name == name).unwrap();
+        assert_eq!((dep("httpx").installed.as_deref(), dep("httpx").installed_from.as_deref()), (Some("0.27.2"), Some("uv.lock")));
+        assert_eq!(dep("Typing_Extensions").installed.as_deref(), Some("4.12.2"), "names match the lockfile after normalizing");
+        assert_eq!(dep("shared").status, Status::Local);
+        assert_eq!(dep("mkdocs").kind, DepKind::Dev);
+
+        let dev = inventory.projects.iter().find(|p| p.name.ends_with("(requirements-dev.txt)")).expect("requirements project");
+        let pytest = dev.dependencies.iter().find(|d| d.name == "pytest").unwrap();
+        assert_eq!((pytest.installed.as_deref(), pytest.kind), (Some("8.0.2"), DepKind::Dev));
+        assert_eq!(dev.dependencies.iter().find(|d| d.name == "black").unwrap().note.as_deref(), Some("no version given"));
+    }
 
     #[test]
     fn ignore_rules_skip_folders_projects_and_patterns() {

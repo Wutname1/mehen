@@ -18,6 +18,8 @@ pub enum Requirement {
     Node { range: String },
     /// npm: `peerDependencies`, packages this version expects the project to already have.
     Peers { peers: Vec<(String, String)> },
+    /// PyPI: the `requires-python` specifier.
+    Python { range: String },
 }
 
 /// What a project can accept. `None`/empty means unknown, which never blocks.
@@ -28,6 +30,8 @@ pub struct ProjectEnv {
     pub node: Option<String>,
     /// npm packages the project has installed, name to version, for peer checks.
     pub installed: std::collections::HashMap<String, String>,
+    /// The lowest Python the project supports.
+    pub python: Option<String>,
 }
 
 /// `Err` carries a short reason for the UI, like "only supports net10.0".
@@ -61,6 +65,10 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
             }
             Ok(())
         }
+        Requirement::Python { range } => match &env.python {
+            Some(have) if !crate::python::satisfies(have, range) => Err(format!("needs Python {}; this project supports {have}", range.trim())),
+            _ => Ok(()),
+        },
         Requirement::Node { range } => {
             let Some(have) = env.node.as_deref().and_then(coerce_node) else { return Ok(()) };
             match nodejs_semver::Range::parse(range) {

@@ -186,6 +186,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         Ecosystem::Cargo => plan_cargo(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Nuget => plan_nuget(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Go => plan_go(&mut plan, &manifest, &dir, &deps)?,
+        Ecosystem::Pypi => plan_python(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
     for edit in &mut plan.edits {
@@ -481,6 +482,156 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
     push_step(plan, StepKind::Install, "cargo update (only the selected crates)", "cargo", &args, dir);
     push_step(plan, StepKind::Verify, "cargo check", "cargo", &["check", "--quiet"], dir);
     push_step(plan, StepKind::Test, "cargo test", "cargo", &["test", "--quiet"], dir);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- Python
+
+/// Rewrites the spec of each matching requirement string in a TOML array
+/// (`[project] dependencies`, optional and dependency groups).
+fn python_array(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+    let Some(array) = item.and_then(|i| i.as_array_mut()) else { return };
+    for value in array.iter_mut() {
+        let Some(text) = value.as_str().map(str::to_string) else { continue };
+        let Some(req) = crate::python::parse_requirement(&text) else { continue };
+        if crate::python::normalize(&req.name) != crate::python::normalize(name) || req.spec != from || req.spec.is_empty() {
+            continue;
+        }
+        let spec = crate::python::rewrite_spec(&req.spec, to);
+        let at = text.find(&req.name).map(|i| i + req.name.len()).unwrap_or(0);
+        let Some(pos) = text[at..].find(&req.spec).map(|i| i + at) else { continue };
+        let rewritten = format!("{}{spec}{}", &text[..pos], &text[pos + req.spec.len()..]);
+        let decor = value.decor().clone();
+        *value = rewritten.into();
+        *value.decor_mut() = decor;
+        found.push((req.spec.clone(), spec));
+    }
+}
+
+/// Same for every array in a table of groups (`optional-dependencies`, `dependency-groups`).
+fn python_groups(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+    let Some(groups) = item.and_then(|i| i.as_table_like_mut()) else { return };
+    for (_, group) in groups.iter_mut() {
+        python_array(Some(group), name, from, to, found);
+    }
+}
+
+/// Rewrites `name = "spec"` or `name = { version = "spec" }` in a Poetry or Pipfile table.
+fn python_table(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+    let Some(table) = item.and_then(|i| i.as_table_like_mut()) else { return };
+    for (key, entry) in table.iter_mut() {
+        if crate::python::normalize(key.get()) != crate::python::normalize(name) {
+            continue;
+        }
+        let slot = if entry.as_str().is_some() { Some(entry) } else { entry.as_table_like_mut().and_then(|t| t.get_mut("version")) };
+        let Some(slot) = slot else { continue };
+        let Some(old) = slot.as_str().map(str::to_string).filter(|s| s == from && !s.trim().is_empty() && s.trim() != "*") else { continue };
+        let spec = crate::python::rewrite_spec(&old, to);
+        if let Some(value) = slot.as_value_mut() {
+            let decor = value.decor().clone();
+            *value = spec.clone().into();
+            *value.decor_mut() = decor;
+            found.push((old, spec));
+        }
+    }
+}
+
+fn python_requirements_txt(text: &str, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for raw in text.split_inclusive('\n') {
+        let matched = crate::python::parse_requirement(raw)
+            .filter(|r| !r.spec.is_empty() && r.spec == from && crate::python::normalize(&r.name) == crate::python::normalize(name))
+            .and_then(|r| {
+                let at = raw.find(&r.name).map(|i| i + r.name.len())?;
+                let pos = raw[at..].find(&r.spec).map(|i| i + at)?;
+                Some((r.spec, pos))
+            });
+        match matched {
+            Some((old, pos)) => {
+                let spec = crate::python::rewrite_spec(&old, to);
+                out.push_str(&raw[..pos]);
+                out.push_str(&spec);
+                out.push_str(&raw[pos + old.len()..]);
+                found.push((old, spec));
+            }
+            None => out.push_str(raw),
+        }
+    }
+    out
+}
+
+/// Tests are run with pytest when the project has them.
+fn python_has_tests(dir: &Path, manifest_text: &str) -> bool {
+    ["tests", "test"].iter().any(|d| dir.join(d).is_dir())
+        || ["pytest.ini", "conftest.py"].iter().any(|f| dir.join(f).is_file())
+        || manifest_text.contains("[tool.pytest")
+}
+
+/// Edits the requirement specs, then relocks with the project's own tool
+/// (uv, Poetry, PDM or Pipenv). A plain requirements file has no lockfile,
+/// so only the file changes.
+fn plan_python(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+    let before = read(manifest)?;
+    let file = manifest.file_name().and_then(|f| f.to_str()).unwrap_or_default().to_string();
+    let mut text = before.clone();
+    for (dep, change) in deps {
+        let mut found = Vec::new();
+        if file == "pyproject.toml" || file == "Pipfile" {
+            let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {file}"))?;
+            if file == "Pipfile" {
+                for section in ["packages", "dev-packages"] {
+                    python_table(doc.get_mut(section), &dep.name, &dep.requested, &change.to, &mut found);
+                }
+            } else {
+                if let Some(project) = doc.get_mut("project") {
+                    python_array(project.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                    python_groups(project.get_mut("optional-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                }
+                python_groups(doc.get_mut("dependency-groups"), &dep.name, &dep.requested, &change.to, &mut found);
+                if let Some(tool) = doc.get_mut("tool") {
+                    if let Some(pdm) = tool.get_mut("pdm") {
+                        python_groups(pdm.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                    }
+                    if let Some(poetry) = tool.get_mut("poetry") {
+                        python_table(poetry.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                        python_table(poetry.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                        if let Some(groups) = poetry.get_mut("group").and_then(|g| g.as_table_like_mut()) {
+                            for (_, group) in groups.iter_mut() {
+                                python_table(group.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                            }
+                        }
+                    }
+                }
+            }
+            text = doc.to_string();
+        } else {
+            text = python_requirements_txt(&text, &dep.name, &dep.requested, &change.to, &mut found);
+        }
+        let (old, new) = found.first().cloned().ok_or_else(|| anyhow!("{}: no versioned entry found in {file}", dep.name))?;
+        plan.changes.push(PlannedChange { name: dep.name.clone(), from: dep.current.clone().unwrap_or(old.clone()), to: change.to.clone(), written_before: old, written_after: new });
+    }
+    push_edit(plan, manifest, before, text.clone());
+
+    let Some((manager, lock)) = crate::python::Manager::for_manifest(manifest) else { return Ok(()) };
+    plan.snapshots.push(lock.display().to_string());
+    let names: Vec<String> = deps.iter().map(|(d, _)| d.name.clone()).collect();
+    let program = manager.program();
+    let mut args: Vec<String> = match manager {
+        crate::python::Manager::Uv => vec!["lock".into()],
+        crate::python::Manager::Poetry => vec!["update".into(), "--lock".into()],
+        crate::python::Manager::Pdm => vec!["update".into(), "--no-sync".into()],
+        crate::python::Manager::Pipenv => vec!["lock".into()],
+    };
+    match manager {
+        crate::python::Manager::Uv => names.iter().for_each(|n| args.extend(["--upgrade-package".to_string(), n.clone()])),
+        crate::python::Manager::Poetry | crate::python::Manager::Pdm => args.extend(names),
+        crate::python::Manager::Pipenv => {}
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    push_step(plan, StepKind::Install, &format!("{program} {}", args[..args.len().min(2)].join(" ")), program, &args, dir);
+    if python_has_tests(dir, &text) {
+        push_step(plan, StepKind::Test, &format!("{program} run pytest"), program, &["run", "pytest", "-q"], dir);
+    }
     Ok(())
 }
 
@@ -871,6 +1022,7 @@ mod tests {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies: deps,
         }
     }
@@ -893,6 +1045,79 @@ mod tests {
         assert!(plan.edits[0].after.contains("\"left-pad\": \"~1.0.0\""));
         assert!(plan.edits[0].after.contains("\r\n"));
         assert_eq!(plan.changes[0].written_after, "^19.1.0");
+    }
+
+    #[test]
+    fn python_requirements_txt_keeps_the_rest_of_the_line() {
+        let dir = temp("py-req");
+        std::fs::write(dir.join("requirements.txt"), "# web\r\nrequests[socks]>=2.28,<3  # http\r\nDjango==4.2.7 ; python_version >= \"3.10\"\r\nflask\r\n-r dev.txt\r\n").unwrap();
+        let deps = vec![dep("requests", Ecosystem::Pypi, ">=2.28,<3", "2.31.0"), dep("django", Ecosystem::Pypi, "==4.2.7", "4.2.7")];
+        let p = project(&dir, "requirements.txt", Ecosystem::Pypi, deps);
+        let changes = [Change { from: None, name: "requests".into(), to: "3.1.0".into() }, Change { from: None, name: "django".into(), to: "5.1.4".into() }];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        let after = &plan.edits[0].after;
+        assert!(after.contains("requests[socks]>=3.1.0,<4  # http\r\n"), "{after}");
+        assert!(after.contains("Django==5.1.4 ; python_version >= \"3.10\"\r\n"), "{after}");
+        assert!(after.contains("flask\r\n-r dev.txt"));
+        assert!(plan.steps.is_empty(), "no lockfile, nothing to run");
+    }
+
+    #[test]
+    fn python_pyproject_with_uv_relocks_and_tests() {
+        let dir = temp("py-uv");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = \"app\"\nrequires-python = \">=3.11\"\ndependencies = [\n  \"httpx>=0.27\",  # client\n  \"pydantic~=2.6\",\n]\n\n[dependency-groups]\ndev = [\"pytest>=8.0\"]\n\n[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("uv.lock"), "version = 1\n").unwrap();
+        let deps = vec![dep("httpx", Ecosystem::Pypi, ">=0.27", "0.27.2"), dep("pytest", Ecosystem::Pypi, ">=8.0", "8.0.2")];
+        let p = project(&dir, "pyproject.toml", Ecosystem::Pypi, deps);
+        let changes = [Change { from: None, name: "httpx".into(), to: "0.28.1".into() }, Change { from: None, name: "pytest".into(), to: "8.3.4".into() }];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        let after = &plan.edits[0].after;
+        assert!(after.contains("  \"httpx>=0.28.1\",  # client\n"), "{after}");
+        assert!(after.contains("  \"pydantic~=2.6\",\n"));
+        assert!(after.contains("dev = [\"pytest>=8.3.4\"]"), "{after}");
+        assert!(plan.snapshots.iter().any(|s| s.ends_with("uv.lock")));
+        let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
+        assert_eq!(steps, ["uv lock --upgrade-package httpx --upgrade-package pytest", "uv run pytest -q"]);
+    }
+
+    #[test]
+    fn python_poetry_and_pipfile_tables() {
+        let dir = temp("py-poetry");
+        std::fs::write(
+            dir.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"svc\"\n\n[tool.poetry.dependencies]\npython = \"^3.10\"\nfastapi = \"^0.110\"\nsqlalchemy = { version = \"^2.0\", extras = [\"asyncio\"] }\n\n[tool.poetry.group.dev.dependencies]\nruff = \"0.4.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("poetry.lock"), "").unwrap();
+        let deps = vec![dep("fastapi", Ecosystem::Pypi, "^0.110", "0.110.3"), dep("sqlalchemy", Ecosystem::Pypi, "^2.0", "2.0.30"), dep("ruff", Ecosystem::Pypi, "0.4.1", "0.4.1")];
+        let p = project(&dir, "pyproject.toml", Ecosystem::Pypi, deps);
+        let changes = [
+            Change { from: None, name: "fastapi".into(), to: "0.115.6".into() },
+            Change { from: None, name: "sqlalchemy".into(), to: "2.0.36".into() },
+            Change { from: None, name: "ruff".into(), to: "0.8.4".into() },
+        ];
+        let poetry = plan(&p, &changes, |_| None).unwrap();
+        let after = &poetry.edits[0].after;
+        assert!(after.contains("fastapi = \"^0.115\""), "{after}");
+        assert!(after.contains("sqlalchemy = { version = \"^2.0\", extras = [\"asyncio\"] }"), "same line still allows it: {after}");
+        assert!(after.contains("ruff = \"0.8.4\""), "{after}");
+        assert!(after.contains("python = \"^3.10\""));
+        assert_eq!(poetry.steps[0].args, ["update", "--lock", "fastapi", "sqlalchemy", "ruff"]);
+
+        let pipenv = temp("py-pipenv");
+        std::fs::write(pipenv.join("Pipfile"), "[packages]\nflask = \"==3.0.0\"\n\n[dev-packages]\npytest = {version = \">=8\"}\n").unwrap();
+        std::fs::write(pipenv.join("Pipfile.lock"), "{}").unwrap();
+        let deps = vec![dep("flask", Ecosystem::Pypi, "==3.0.0", "3.0.0"), dep("pytest", Ecosystem::Pypi, ">=8", "8.0.0")];
+        let p = project(&pipenv, "Pipfile", Ecosystem::Pypi, deps);
+        let changes = [Change { from: None, name: "flask".into(), to: "3.1.0".into() }, Change { from: None, name: "pytest".into(), to: "8.3.4".into() }];
+        let pipfile = plan(&p, &changes, |_| None).unwrap();
+        assert!(pipfile.edits[0].after.contains("flask = \"==3.1.0\""));
+        assert!(pipfile.edits[0].after.contains("pytest = {version = \">=8.3.4\"}"), "{}", pipfile.edits[0].after);
+        assert_eq!(pipfile.steps[0].program, "pipenv");
     }
 
     #[test]

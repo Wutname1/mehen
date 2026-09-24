@@ -8,10 +8,11 @@ pub enum Ecosystem {
     Nuget,
     GithubActions,
     Go,
+    Pypi,
 }
 
 impl Ecosystem {
-    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`).
+    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`, `pypi`).
     pub fn key(self) -> &'static str {
         match self {
             Ecosystem::Npm => "npm",
@@ -19,6 +20,7 @@ impl Ecosystem {
             Ecosystem::Nuget => "nuget",
             Ecosystem::GithubActions => "github-actions",
             Ecosystem::Go => "go",
+            Ecosystem::Pypi => "pypi",
         }
     }
 
@@ -30,6 +32,7 @@ impl Ecosystem {
             Ecosystem::Nuget => "NuGet",
             Ecosystem::GithubActions => "GitHub Actions",
             Ecosystem::Go => "Go",
+            Ecosystem::Pypi => "PyPI",
         }
     }
 }
@@ -147,6 +150,10 @@ pub struct Project {
     /// The `engines.node` range from package.json.
     #[serde(default)]
     pub node_engines: Option<String>,
+    /// The lowest Python the project supports (`requires-python`, Poetry's
+    /// `python`, or `.python-version`).
+    #[serde(default)]
+    pub python_version: Option<String>,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -292,6 +299,7 @@ mod tests {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies: vec![dep],
         }
     }

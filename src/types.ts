@@ -1,6 +1,6 @@
 // Mirrors crates/mehen-core/src/model.rs (serde camelCase / kebab-case).
 
-export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go'
+export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go' | 'pypi'
 export type DepKind = 'normal' | 'dev' | 'build' | 'peer' | 'action'
 export type Status = 'pending' | 'local' | 'unpinned' | 'unknown' | 'up-to-date' | 'patch' | 'minor' | 'major'
 
@@ -39,6 +39,8 @@ export interface Project {
   rustVersion: string | null
   nodeVersion: string | null
   nodeEngines: string | null
+  /** The lowest Python the project supports. */
+  pythonVersion?: string | null
   dependencies: Dependency[]
 }
 

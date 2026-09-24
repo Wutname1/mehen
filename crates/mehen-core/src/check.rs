@@ -138,6 +138,7 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             rust: project.rust_version.clone().or_else(|| toolchain.rust.clone()),
             node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
             installed,
+            python: project.python_version.clone(),
         };
         for dep in &mut project.dependencies {
             let mut own: Vec<Limit> = limits.get(&dep.name).cloned().unwrap_or_default();
@@ -605,6 +606,7 @@ mod tests {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies: vec![dep],
         };
         let mut inventory = Inventory { projects: vec![project], ..Default::default() };
@@ -726,6 +728,7 @@ mod tests {
             rust_version: None,
             node_version: None,
             node_engines: None,
+            python_version: None,
             dependencies: vec![npm_dep("@mui/material", "5.1.2"), npm_dep("react", "18.2.0")],
         };
         let mut infos = HashMap::new();
