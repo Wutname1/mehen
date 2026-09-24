@@ -256,7 +256,7 @@ export default function App() {
     (row: QueueRow) =>
       row.usages.filter((u) => {
         if (repo && !samePath(repoKey(u.project), repo.key)) return false
-        if (!repo && filters.types.size && !projectTypes(repoOf(u)?.ecosystems ?? []).some((t) => filters.types.has(t))) return false
+        if (!repo && filters.types.size && !projectTypes(repoOf(u)?.projects ?? []).some((t) => filters.types.has(t))) return false
         return !filters.ecosystems.size || filters.ecosystems.has(row.ecosystem)
       }),
     [repo, filters.types, filters.ecosystems, repoOf],

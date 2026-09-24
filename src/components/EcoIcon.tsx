@@ -23,7 +23,7 @@ const PATHS: Record<Brand, string> = {
 }
 
 const ECOSYSTEM_BRAND: Record<Ecosystem, Brand> = { npm: 'npm', cargo: 'rust', nuget: 'nuget', 'github-actions': 'github' }
-const PROJECT_TYPE_BRAND: Record<ProjectType, Brand> = { web: 'javascript', rust: 'rust', dotnet: 'dotnet' }
+const PROJECT_TYPE_BRAND: Record<ProjectType, Brand> = { web: 'javascript', rust: 'rust', dotnet: 'dotnet', 'dotnet-framework': 'dotnet' }
 
 function BrandIcon({ brand, label, size = 14, className }: { brand: Brand; label: string; size?: number; className?: string }) {
   return (

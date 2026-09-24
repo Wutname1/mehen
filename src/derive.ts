@@ -342,16 +342,25 @@ export function repos(inventory: Inventory, rows: QueueRow[]): Repo[] {
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
 }
 
-export type ProjectType = 'web' | 'rust' | 'dotnet'
+export type ProjectType = 'web' | 'rust' | 'dotnet' | 'dotnet-framework'
 
-export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', rust: 'Rust', dotnet: '.NET' }
+export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', rust: 'Rust', dotnet: '.NET', 'dotnet-framework': '.NET Framework' }
 
-export function projectTypes(ecosystems: Ecosystem[]): ProjectType[] {
-  const types: ProjectType[] = []
-  if (ecosystems.includes('npm')) types.push('web')
-  if (ecosystems.includes('cargo')) types.push('rust')
-  if (ecosystems.includes('nuget')) types.push('dotnet')
-  return types
+/** `net48`, `net472`, `v4.7.2`: the Windows-only .NET Framework, not modern .NET (`net8.0`, `netstandard2.0`). */
+const isFrameworkTarget = (tfm: string) => /^net\d{2,3}$/i.test(tfm) || /^v[1-4](\.|$)/i.test(tfm)
+
+/** Which kinds of project these are. A NuGet project targeting both lines counts as both. */
+export function projectTypes(projects: Project[]): ProjectType[] {
+  const types = new Set<ProjectType>()
+  for (const p of projects) {
+    if (p.ecosystem === 'npm') types.add('web')
+    if (p.ecosystem === 'cargo') types.add('rust')
+    if (p.ecosystem !== 'nuget') continue
+    // packages.config belongs to .NET Framework projects.
+    if (p.frameworks.length === 0) types.add(/packages\.config$/i.test(p.manifest) ? 'dotnet-framework' : 'dotnet')
+    for (const tfm of p.frameworks) types.add(isFrameworkTarget(tfm) ? 'dotnet-framework' : 'dotnet')
+  }
+  return (Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).filter((t) => types.has(t))
 }
 
 /** The release line a version sits on: `5` for 5.1.2, `0.13` for 0.13.4 (where minors break). */
