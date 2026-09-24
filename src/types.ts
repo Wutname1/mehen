@@ -16,6 +16,8 @@ export interface Dependency {
   approximate: boolean
   latest: string | null
   safeLatest: string | null
+  /** Newest bug-fix release on the same minor line. */
+  patchLatest?: string | null
   /** Newest published version when this project can't use it; `latest` is then the newest it can. */
   newest: string | null
   blockedReason: string | null
@@ -104,8 +106,12 @@ export interface Settings {
   rules: IgnoreRule[]
   /** Hours between background checks; 0 means off. */
   backgroundHours: number
-  /** Update steps that may run at once across repositories; 1 runs one at a time. */
+  /** Update steps that may run at once across repositories; 1 runs one at a time, 0 is automatic. */
   updateParallel: number
+  /** What automatic means on this computer. */
+  updateParallelAuto: number
+  /** Notify about new vulnerabilities found by background checks. */
+  notify: boolean
 }
 
 export interface DiscoveredProject {
@@ -215,5 +221,17 @@ export interface CommitOutcome {
   error: string | null
 }
 
+export interface CheckConfig {
+  commands: string[]
+  /** Folder to run them in, relative to the project. */
+  cwd: string | null
+}
+
 /** Build and test commands by scope: a repository path, or `ecosystem:<name>`. */
-export type CheckCommands = Record<string, string[]>
+export type CheckCommands = Record<string, CheckConfig>
+
+/** How far updates may go: any stable version, same major (minor), or same minor (patch). */
+export type VersionPolicy = 'any' | 'minor' | 'patch'
+
+/** By scope: a repository path, or `*` for every project. */
+export type VersionPolicies = Record<string, VersionPolicy>

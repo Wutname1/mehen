@@ -7,7 +7,7 @@ use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcom
 use mehen_core::store::StoreStats;
 use mehen_core::update::{self, Change, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
@@ -21,6 +21,11 @@ const UPDATE_PARALLEL: &str = "update_parallel";
 /// build and test steps. A scope is a repository path, or `ecosystem:<name>`
 /// for the default of every project of that kind.
 const CHECK_COMMANDS: &str = "check_commands";
+/// Setting key: JSON map of scope (a repository path, or `*` for every
+/// project) to the newest kind of release updates may move to.
+const VERSION_POLICY: &str = "version_policy";
+/// Setting key: `false` turns off notifications about new vulnerabilities.
+const NOTIFY: &str = "notify_vulnerabilities";
 /// How often the background loop wakes to see whether a check is due.
 const BACKGROUND_TICK: Duration = Duration::from_secs(10 * 60);
 
@@ -40,24 +45,67 @@ struct Settings {
     folders: Vec<String>,
     rules: Vec<IgnoreRule>,
     background_hours: u32,
+    /// Steps running at once; 0 means automatic.
     update_parallel: usize,
+    /// What automatic resolves to on this computer.
+    update_parallel_auto: usize,
+    notify: bool,
+}
+
+/// The user's own build and test commands for one scope, and where to run them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckConfig {
+    commands: Vec<String>,
+    /// A folder relative to the repository (or project), or an absolute one.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 impl AppState {
     fn settings(&self) -> Settings {
-        Settings { folders: self.store.folders(), rules: self.store.ignore_rules(), background_hours: self.background_hours(), update_parallel: self.update_parallel() }
+        Settings {
+            folders: self.store.folders(),
+            rules: self.store.ignore_rules(),
+            background_hours: self.background_hours(),
+            update_parallel: self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse().ok()).unwrap_or(0),
+            update_parallel_auto: batch::auto_parallel(),
+            notify: self.notify(),
+        }
     }
 
     fn roots(&self) -> Vec<PathBuf> {
         self.store.folders().into_iter().map(PathBuf::from).collect()
     }
 
+    /// Steps allowed at once, with 0 (automatic) resolved for this computer.
     fn update_parallel(&self) -> usize {
-        self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse().ok()).unwrap_or(batch::DEFAULT_PARALLEL).clamp(1, 8)
+        match self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) {
+            0 => batch::auto_parallel(),
+            n => n.clamp(1, 8),
+        }
     }
 
-    fn check_commands(&self) -> BTreeMap<String, Vec<String>> {
-        self.store.setting(CHECK_COMMANDS).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    fn notify(&self) -> bool {
+        self.store.setting(NOTIFY).is_none_or(|v| v != "false")
+    }
+
+    /// Accepts the older plain list of commands as well as the full config.
+    fn check_commands(&self) -> BTreeMap<String, CheckConfig> {
+        let raw: BTreeMap<String, serde_json::Value> = self.store.setting(CHECK_COMMANDS).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        raw.into_iter()
+            .filter_map(|(scope, value)| {
+                let config = match value {
+                    serde_json::Value::Array(_) => CheckConfig { commands: serde_json::from_value(value).ok()?, cwd: None },
+                    other => serde_json::from_value(other).ok()?,
+                };
+                Some((scope, config))
+            })
+            .collect()
+    }
+
+    fn version_policy(&self) -> BTreeMap<String, String> {
+        self.store.setting(VERSION_POLICY).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
     }
 
     fn background_hours(&self) -> u32 {
@@ -111,6 +159,10 @@ async fn guarded_check(app: &AppHandle, refresh: bool, only: Option<Vec<String>>
 /// the window and raises a notification for vulnerabilities that are new
 /// since the previous result.
 async fn check_and_notify(app: &AppHandle) {
+    if !app.state::<AppState>().notify() {
+        let _ = guarded_check(app, false, None).await.map(|inventory| app.emit("mehen://inventory", &inventory));
+        return;
+    }
     let before: HashSet<String> = app.state::<AppState>().store.last_inventory().map(|i| i.vulnerabilities.into_iter().map(|v| v.id).collect()).unwrap_or_default();
     let Ok(inventory) = guarded_check(app, false, None).await else { return };
     let _ = app.emit("mehen://inventory", &inventory);
@@ -221,10 +273,17 @@ fn set_background_hours(state: State<'_, AppState>, hours: u32) -> Result<Settin
     Ok(state.settings())
 }
 
-/// How many update steps may run at once; 1 runs one at a time.
+/// How many update steps may run at once; 1 runs one at a time, 0 is automatic.
 #[tauri::command]
 fn set_update_parallel(state: State<'_, AppState>, parallel: usize) -> Result<Settings, String> {
-    state.store.set_setting(UPDATE_PARALLEL, &parallel.clamp(1, 8).to_string()).map_err(err)?;
+    state.store.set_setting(UPDATE_PARALLEL, &parallel.min(8).to_string()).map_err(err)?;
+    Ok(state.settings())
+}
+
+/// Turns notifications about new vulnerabilities on or off.
+#[tauri::command]
+fn set_notify(state: State<'_, AppState>, notify: bool) -> Result<Settings, String> {
+    state.store.set_setting(NOTIFY, if notify { "true" } else { "false" }).map_err(err)?;
     Ok(state.settings())
 }
 
@@ -286,29 +345,51 @@ fn plan_update(state: State<'_, AppState>, project_id: String, changes: Vec<Chan
     let mut plan = update::plan(project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))?;
     let commands = state.check_commands();
     let repo = project.repo.clone().unwrap_or_else(|| project.dir.clone());
-    if let Some(list) = commands.iter().find(|(scope, _)| scope.eq_ignore_ascii_case(&repo)).map(|(_, list)| list) {
-        update::use_check_commands(&mut plan, list, &repo);
-    } else if let Some(list) = commands.get(&format!("ecosystem:{}", project.ecosystem.key())) {
-        update::use_check_commands(&mut plan, list, &project.dir);
+    let chosen = match commands.iter().find(|(scope, _)| scope.eq_ignore_ascii_case(&repo)) {
+        Some((_, config)) => Some((config, repo.as_str())),
+        None => commands.get(&format!("ecosystem:{}", project.ecosystem.key())).map(|config| (config, project.dir.as_str())),
+    };
+    if let Some((config, base)) = chosen {
+        let cwd = config.cwd.as_deref().filter(|c| !c.trim().is_empty()).map(|c| PathBuf::from(base).join(c.trim()).display().to_string()).unwrap_or_else(|| base.to_string());
+        update::use_check_commands(&mut plan, &config.commands, &cwd);
     }
     Ok(plan)
 }
 
 /// Build and test commands the user set, by scope.
 #[tauri::command]
-fn check_commands(state: State<'_, AppState>) -> BTreeMap<String, Vec<String>> {
+fn check_commands(state: State<'_, AppState>) -> BTreeMap<String, CheckConfig> {
     state.check_commands()
 }
 
 /// Sets (or with `None`, removes) the commands for a scope.
 #[tauri::command]
-fn set_check_commands(state: State<'_, AppState>, scope: String, commands: Option<Vec<String>>) -> Result<BTreeMap<String, Vec<String>>, String> {
+fn set_check_commands(state: State<'_, AppState>, scope: String, commands: Option<Vec<String>>, cwd: Option<String>) -> Result<BTreeMap<String, CheckConfig>, String> {
     let mut all = state.check_commands();
     all.retain(|k, _| !k.eq_ignore_ascii_case(&scope));
     if let Some(list) = commands {
-        all.insert(scope, list.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect());
+        let commands = list.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+        all.insert(scope, CheckConfig { commands, cwd: cwd.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()) });
     }
     state.store.set_setting(CHECK_COMMANDS, &serde_json::to_string(&all).map_err(err)?).map_err(err)?;
+    Ok(all)
+}
+
+/// How far updates may go, by scope (`*` for every project): `any`, `minor`, or `patch`.
+#[tauri::command]
+fn version_policy(state: State<'_, AppState>) -> BTreeMap<String, String> {
+    state.version_policy()
+}
+
+/// Sets (or with `None`, removes) the policy for a scope.
+#[tauri::command]
+fn set_version_policy(state: State<'_, AppState>, scope: String, policy: Option<String>) -> Result<BTreeMap<String, String>, String> {
+    let mut all = state.version_policy();
+    all.retain(|k, _| !k.eq_ignore_ascii_case(&scope));
+    if let Some(p) = policy.filter(|p| ["any", "minor", "patch"].contains(&p.as_str())) {
+        all.insert(scope, p);
+    }
+    state.store.set_setting(VERSION_POLICY, &serde_json::to_string(&all).map_err(err)?).map_err(err)?;
     Ok(all)
 }
 
@@ -330,9 +411,9 @@ struct BatchResult {
 /// side by side except where two need the same tool. Progress arrives as
 /// `mehen://batch` events; results are re-checked once at the end.
 #[tauri::command]
-async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commit: bool) -> Result<BatchResult, String> {
+async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commit: bool, stop_on_failure: Option<bool>) -> Result<BatchResult, String> {
     let parallel = app.state::<AppState>().update_parallel();
-    let options = BatchOptions { checks, commit, parallel };
+    let options = BatchOptions { checks, commit, parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
     let outcomes = batch::run(plans, options, |step| async move { update::run_step(&step).await }, |e: BatchEvent| {
         let _ = app.emit("mehen://batch", e);
     })
@@ -397,6 +478,7 @@ pub fn run() {
             remove_folder,
             set_background_hours,
             set_update_parallel,
+            set_notify,
             add_ignore,
             remove_ignore,
             discover,
@@ -407,6 +489,8 @@ pub fn run() {
             check_commands,
             set_check_commands,
             commit_update,
+            version_policy,
+            set_version_policy,
             store_stats,
             clear_cache,
             open_in_editor

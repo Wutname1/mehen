@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { BatchEvent, BatchResult, Change, CheckCommands, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdatePlan } from './types'
+import type { BatchEvent, BatchResult, Change, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -81,13 +81,35 @@ export async function checkCommands(): Promise<CheckCommands> {
 }
 
 /** Sets the build and test commands for a scope; `null` goes back to Mehen's own. */
-export async function setCheckCommands(scope: string, commands: string[] | null): Promise<CheckCommands> {
+export async function setCheckCommands(scope: string, commands: string[] | null, cwd: string | null = null): Promise<CheckCommands> {
   if (!inTauri) {
     for (const k of Object.keys(mockCheckCommands)) if (k.toLowerCase() === scope.toLowerCase()) delete mockCheckCommands[k]
-    if (commands) mockCheckCommands[scope] = commands.map((c) => c.trim()).filter(Boolean)
+    if (commands) mockCheckCommands[scope] = { commands: commands.map((c) => c.trim()).filter(Boolean), cwd: cwd?.trim() || null }
     return { ...mockCheckCommands }
   }
-  return invoke<CheckCommands>('set_check_commands', { scope, commands })
+  return invoke<CheckCommands>('set_check_commands', { scope, commands, cwd })
+}
+
+export async function versionPolicy(): Promise<VersionPolicies> {
+  if (!inTauri) return { ...mockPolicies }
+  return invoke<VersionPolicies>('version_policy')
+}
+
+/** Sets how far updates may go for a scope (`*` for every project); `null` removes it. */
+export async function setVersionPolicy(scope: string, policy: VersionPolicy | null): Promise<VersionPolicies> {
+  if (!inTauri) {
+    for (const k of Object.keys(mockPolicies)) if (k.toLowerCase() === scope.toLowerCase()) delete mockPolicies[k]
+    if (policy) mockPolicies[scope] = policy
+    return { ...mockPolicies }
+  }
+  return invoke<VersionPolicies>('set_version_policy', { scope, policy })
+}
+
+const mockPolicies: VersionPolicies = {}
+
+export async function setNotify(notify: boolean): Promise<Settings> {
+  if (!inTauri) return mock.setNotify(notify)
+  return invoke<Settings>('set_notify', { notify })
 }
 
 const mockCheckCommands: CheckCommands = {}
@@ -113,9 +135,9 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
  * where two need the same tool. `checks` runs builds and tests; `commit`
  * commits each repository that succeeds.
  */
-export async function applyBatch(plans: UpdatePlan[], checks: boolean, commit: boolean): Promise<BatchResult> {
+export async function applyBatch(plans: UpdatePlan[], checks: boolean, commit: boolean, stopOnFailure = true): Promise<BatchResult> {
   if (!inTauri) return mock.applyBatch(plans, checks, commit)
-  return invoke<BatchResult>('apply_batch', { plans, checks, commit })
+  return invoke<BatchResult>('apply_batch', { plans, checks, commit, stopOnFailure })
 }
 
 export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {
@@ -163,7 +185,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 2 }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -200,7 +222,8 @@ const mock = (() => {
   return {
     settings: async () => state,
     setBackgroundHours: async (hours: number) => (state = { ...state, backgroundHours: hours }),
-    setUpdateParallel: async (parallel: number) => (state = { ...state, updateParallel: Math.min(8, Math.max(1, parallel)) }),
+    setUpdateParallel: async (parallel: number) => (state = { ...state, updateParallel: Math.min(8, Math.max(0, parallel)) }),
+    setNotify: async (notify: boolean) => (state = { ...state, notify }),
     addFolder: async (path: string) => (state = { ...state, folders: [...new Set([...state.folders, path])] }),
     removeFolder: async (path: string) => (state = { ...state, folders: state.folders.filter((f) => f !== path) }),
     addIgnore: async (kind: IgnoreKind, value: string): Promise<IgnoreResult> => {

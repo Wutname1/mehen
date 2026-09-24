@@ -15,9 +15,12 @@ use tokio::sync::{Mutex, Semaphore};
 
 use crate::update::{self, Step, StepKind, StepResult, UpdatePlan};
 
-/// How many steps may run at once across all repositories.
-// TODO: pick this from the machine (cores, free memory) instead of a fixed default.
-pub const DEFAULT_PARALLEL: usize = 2;
+/// How many steps may run at once when the user leaves it on automatic:
+/// a quarter of the CPU threads, between 1 and 4.
+// TODO: also weigh free memory; a build-heavy repo can swap on small machines.
+pub fn auto_parallel() -> usize {
+    std::thread::available_parallelism().map(|n| n.get() / 4).unwrap_or(2).clamp(1, 4)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BatchOptions {
@@ -27,6 +30,9 @@ pub struct BatchOptions {
     pub commit: bool,
     /// Steps running at once across every repository; at least 1.
     pub parallel: usize,
+    /// Stop a repository at its first failed check. When off, the remaining
+    /// checks still run so every failure shows, then the files are restored.
+    pub stop_on_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -278,6 +284,7 @@ where
         }
     }
 
+    let mut failed_checks: Vec<String> = Vec::new();
     for step in steps {
         let lane = lane(&step);
         let lane_lock = &lanes[&lane];
@@ -300,9 +307,18 @@ where
         let (ok, output) = run_step(step.clone()).await;
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output, ms: started.elapsed().as_millis() as u64 });
         if !ok {
+            if step.kind.is_check() && !options.stop_on_failure {
+                failed_checks.push(step.label.clone());
+                continue;
+            }
             roll_back(&mut outcome, format!("`{}` failed", step.label));
             return outcome;
         }
+    }
+    if !failed_checks.is_empty() {
+        let list = failed_checks.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ");
+        roll_back(&mut outcome, format!("{list} failed"));
+        return outcome;
     }
 
     outcome.ok = true;
@@ -396,7 +412,7 @@ mod tests {
         };
 
         let log = Log::default();
-        let opts = BatchOptions { checks: true, commit: false, parallel: 2 };
+        let opts = BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans(), opts, recorder(&log, ""), |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok));
         let runs = log.borrow();
@@ -434,7 +450,7 @@ mod tests {
         assert_eq!(jobs[0].steps(false).len(), 2, "checks off keeps only installs");
 
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { checks: false, commit: false, parallel: 2 }, recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans, BatchOptions { checks: false, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, ""), |_| {}).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(log.borrow().len(), 2);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "after");
@@ -453,7 +469,7 @@ mod tests {
         ];
         let events = RefCell::new(Vec::new());
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { checks: true, commit: false, parallel: 2 }, recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
+        let outcomes = run(plans, BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
         let bad_outcome = outcomes.iter().find(|o| o.name == "bad").unwrap();
         assert!(!bad_outcome.ok && bad_outcome.rolled_back, "{:?}", bad_outcome.error);
         assert_eq!(std::fs::read_to_string(bad.join("Cargo.toml")).unwrap(), "before");
@@ -476,12 +492,25 @@ mod tests {
         git(&["commit", "-q", "-m", "init"]);
 
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![]), plan(&dir, "app.csproj", Some(&dir), vec![])];
-        let outcomes = run(plans, BatchOptions { checks: true, commit: true, parallel: 2 }, |_| async { (true, String::new()) }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { checks: true, commit: true, parallel: 2, stop_on_failure: true }, |_| async { (true, String::new()) }, |_| {}).await;
         assert!(outcomes[0].committed.is_some(), "{:?}", outcomes[0].commit_error);
         let log = String::from_utf8(git(&["log", "-1", "--format=%s%n%b"]).stdout).unwrap();
         assert!(log.starts_with("Updated 2 Dependencies"), "{log}");
         assert!(log.contains("app.csproj-dep 1.0.0 to 2.0.0") && log.contains("package.json-dep 1.0.0 to 2.0.0"), "{log}");
         let files = String::from_utf8(git(&["show", "--name-only", "--format=", "HEAD"]).stdout).unwrap();
         assert_eq!(files.lines().count(), 2, "{files}");
+    }
+
+    #[tokio::test]
+    async fn keeps_running_checks_when_asked_then_restores() {
+        let dir = temp("keep-going");
+        let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("vitest", StepKind::Verify, &dir), step("npm", StepKind::Test, &dir)])];
+        let log = Log::default();
+        let opts = BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: false };
+        let outcomes = run(plans, opts, recorder(&log, "vitest"), |_| {}).await;
+        assert_eq!(log.borrow().len(), 3, "the test step still ran after the build failed");
+        assert!(!outcomes[0].ok && outcomes[0].rolled_back);
+        assert!(outcomes[0].error.as_deref().is_some_and(|e| e.contains("vitest")), "{:?}", outcomes[0].error);
+        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "before");
     }
 }

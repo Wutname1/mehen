@@ -80,6 +80,9 @@ pub struct Dependency {
     /// Newest version on the current release line, when newer than `current`.
     #[serde(default)]
     pub safe_latest: Option<String>,
+    /// Newest bug-fix release on the same minor line, when one exists.
+    #[serde(default)]
+    pub patch_latest: Option<String>,
     /// The newest published version when this project cannot use it (then
     /// `latest` is the newest it can), with the reason.
     #[serde(default)]
@@ -105,6 +108,7 @@ impl Dependency {
             approximate: false,
             latest: None,
             safe_latest: None,
+            patch_latest: None,
             newest: None,
             blocked_reason: None,
             status: Status::Pending,

@@ -77,6 +77,18 @@ pub fn safe_target(current: &str, versions: &[String]) -> Option<String> {
         .map(|(_, raw)| raw.clone())
 }
 
+/// Newest stable version with the same major and minor as `current`: bug
+/// fixes only. `None` when nothing newer exists on that line.
+pub fn patch_target(current: &str, versions: &[String]) -> Option<String> {
+    let c = Version::parse(current)?;
+    versions
+        .iter()
+        .filter_map(|raw| Version::parse(raw).map(|v| (v, raw)))
+        .filter(|(v, _)| !v.prerelease && v.part(0) == c.part(0) && v.part(1) == c.part(1) && *v > c)
+        .max_by(|a, b| a.0.cmp(&b.0).then(a.0.parts.len().cmp(&b.0.parts.len())))
+        .map(|(_, raw)| raw.clone())
+}
+
 /// Compares only as precisely as `current` was written, so a floating `v7`
 /// tag counts as up to date against `7.0.1`, and `1.2` against `1.2.9`.
 pub fn compare(current: &str, latest: &str) -> Status {
@@ -150,5 +162,12 @@ mod tests {
         assert_eq!(from_spec("1.*").as_deref(), Some("1"));
         assert_eq!(from_spec("workspace:*"), None);
         assert_eq!(from_spec("latest"), None);
+    }
+
+    #[test]
+    fn patch_target_stays_on_the_minor_line() {
+        let versions: Vec<String> = ["1.2.3", "1.2.9", "1.3.0", "2.0.0", "1.2.10-beta.1"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(patch_target("1.2.3", &versions).as_deref(), Some("1.2.9"));
+        assert_eq!(patch_target("1.3.0", &versions), None);
     }
 }

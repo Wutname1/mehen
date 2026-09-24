@@ -12,7 +12,7 @@ import { AddFolderDialog, ExcludeDialog } from './components/SmallDialogs'
 import { UpdateFlow, type UpdateTarget } from './components/UpdateFlow'
 import { RISK_ORDER, folderName, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
 import { usePrefs } from './prefs'
-import type { Change, IgnoreKind, IgnoreRule, Inventory, Progress, Settings } from './types'
+import type { Change, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, VersionPolicies } from './types'
 
 const SUGGESTED_ROOT = 'C:\\code'
 
@@ -56,7 +56,8 @@ export default function App() {
 
   const [repoScope, setRepoScope] = useState<string | null>(null)
   const [query, setQuery] = useState('')
-  const [filters, setFilters] = useState<QueueFilters>({ types: new Set(), ecosystems: new Set(), risk: 'any', riskFirst: true })
+  const [filters, setFilters] = useState<QueueFilters>(() => ({ types: new Set(), ecosystems: new Set(), risk: 'any', riskFirst: prefs.riskFirst }))
+  const [policies, setPolicies] = useState<VersionPolicies>({})
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const searchRef = useRef<HTMLInputElement>(null)
   const scannedOnOpen = useRef(false)
@@ -77,11 +78,12 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([api.settings(), api.lastInventory()])
-      .then(([s, inv]) => {
+    Promise.all([api.settings(), api.lastInventory(), api.versionPolicy()])
+      .then(([s, inv, p]) => {
         if (cancelled) return
         setSettings(s)
         setInventory(inv)
+        setPolicies(p)
         if (prefs.scanOnOpen && s.folders.length && !scannedOnOpen.current) {
           scannedOnOpen.current = true
           run(false)
@@ -207,7 +209,7 @@ export default function App() {
     }
   }
 
-  const rows = useMemo(() => (inventory ? queueRows(inventory) : []), [inventory])
+  const rows = useMemo(() => (inventory ? queueRows(inventory, policies) : []), [inventory, policies])
   const repoList = useMemo(() => (inventory ? groupRepos(inventory, rows) : []), [inventory, rows])
   const repoByKey = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), r])), [repoList])
   const repo = repoScope ? (repoByKey.get(repoScope.toLowerCase()) ?? null) : null
@@ -423,7 +425,10 @@ export default function App() {
             rows={visible}
             repo={repo}
             filters={filters}
-            onFilters={setFilters}
+            onFilters={(f) => {
+              setFilters(f)
+              if (f.riskFirst !== prefs.riskFirst) setPrefs({ riskFirst: f.riskFirst })
+            }}
             selected={selected}
             onToggle={toggleUsages}
             onSelectCompatible={() =>
@@ -465,7 +470,12 @@ export default function App() {
           settings={settings}
           prefs={prefs}
           inventory={inventory}
-          onPrefs={setPrefs}
+          policies={policies}
+          onPolicies={setPolicies}
+          onPrefs={(patch) => {
+            setPrefs(patch)
+            if (patch.riskFirst !== undefined) setFilters((f) => ({ ...f, riskFirst: patch.riskFirst! }))
+          }}
           onSettings={setSettings}
           onInventory={setInventory}
           onAddFolder={() => setDialog({ kind: 'add-folder', back: 'settings' })}
@@ -544,6 +554,7 @@ export default function App() {
           roots={inventory.roots}
           checks={prefs.checks}
           commit={prefs.commit}
+          stopOnFailure={prefs.stopOnFailure}
           onOptions={setPrefs}
           nameOf={nameOf}
           onClose={(refreshed) => {

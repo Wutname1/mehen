@@ -10,9 +10,13 @@ export interface Prefs {
   commit: boolean
   /** Check every project when Mehen opens. */
   scanOnOpen: boolean
+  /** Stop a project at its first failed check instead of running the rest. */
+  stopOnFailure: boolean
+  /** List security fixes and bigger jumps first. */
+  riskFirst: boolean
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: false }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: false, stopOnFailure: true, riskFirst: true }
 const KEY = 'mehen-prefs'
 
 function load(): Prefs {

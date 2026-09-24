@@ -1,4 +1,4 @@
-import type { Dependency, Ecosystem, Inventory, Project, Status, Vulnerability } from './types'
+import type { Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
 
 export const ECOSYSTEMS: Ecosystem[] = ['npm', 'cargo', 'nuget', 'github-actions']
 
@@ -232,23 +232,45 @@ export interface QueueRow {
 
 export const usageKey = (project: Project, dep: Dependency) => `${project.id}|${dep.name}|${dep.requested}`
 
-/** Where a dependency can move to, or null when there is nothing to do. */
-export function updateTarget(dep: Dependency): string | null {
+export const POLICY_LABEL: Record<VersionPolicy, string> = { any: 'Any stable version', minor: 'Minor and patch', patch: 'Bug fixes only' }
+
+/** The policy for a project: its own, else the one for every project, else any. */
+export function policyFor(policies: VersionPolicies, project: Project): VersionPolicy {
+  const key = repoKey(project).toLowerCase()
+  const own = Object.entries(policies).find(([scope]) => scope.toLowerCase() === key)
+  return own?.[1] ?? policies['*'] ?? 'any'
+}
+
+/** Where a dependency can move to under a policy, or null when there is nothing to do. */
+export function updateTarget(dep: Dependency, policy: VersionPolicy = 'any'): string | null {
   if (!canRetarget(dep) || !dep.latest || !isOutdated(dep.status)) return null
-  return dep.latest
+  if (policy === 'any') return dep.latest
+  if (policy === 'minor') return dep.safeLatest ?? (dep.status === 'major' ? null : dep.latest)
+  const patch = dep.patchLatest ?? (dep.status === 'patch' ? dep.latest : null)
+  return patch && dep.current && isBehind(dep.current, patch) ? patch : null
 }
 
-export function riskOf(usages: { dep: Dependency }[]): Risk {
+/** How big the jump from `current` to `target` is. */
+export function bumpOf(current: string, target: string): Exclude<Risk, 'security'> {
+  const parse = (v: string) => v.replace(/^v/i, '').split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0)
+  const [c, t] = [parse(current), parse(target)]
+  if ((t[0] ?? 0) !== (c[0] ?? 0)) return 'major'
+  if ((t[1] ?? 0) !== (c[1] ?? 0)) return 'minor'
+  return 'patch'
+}
+
+export function riskOf(usages: { dep: Dependency; target?: string }[]): Risk {
   if (usages.some((u) => u.dep.vulns.length > 0)) return 'security'
-  const worst = worstStatus(usages.map((u) => u.dep.status))
-  return worst === 'major' || worst === 'minor' ? worst : 'patch'
+  const bumps = usages.map((u) => (u.target && u.dep.current ? bumpOf(u.dep.current, u.target) : u.dep.status === 'major' || u.dep.status === 'minor' ? u.dep.status : 'patch'))
+  return bumps.includes('major') ? 'major' : bumps.includes('minor') ? 'minor' : 'patch'
 }
 
-export function queueRows(inventory: Inventory): QueueRow[] {
+export function queueRows(inventory: Inventory, policies: VersionPolicies = {}): QueueRow[] {
   const rows = new Map<string, QueueRow>()
   for (const project of inventory.projects) {
+    const policy = policyFor(policies, project)
     for (const dep of project.dependencies) {
-      const target = updateTarget(dep)
+      const target = updateTarget(dep, policy)
       if (!target) continue
       const key = `${dep.ecosystem}:${dep.name}`
       const row = rows.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, usages: [], risk: 'patch', vulnIds: [] }

@@ -13,7 +13,7 @@ use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Statu
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Store};
-use crate::version::{Version, compare, from_spec, max_version, safe_target};
+use crate::version::{Version, compare, from_spec, max_version, safe_target, patch_target};
 
 const LOOKUP_CONCURRENCY: usize = 8;
 
@@ -257,6 +257,7 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
     let floating_tag = dep.ecosystem == Ecosystem::GithubActions && Version::parse(&dep.requested).is_some_and(|v| v.parts.len() == 1);
     if !floating_tag {
         dep.safe_latest = dep.current.as_deref().and_then(|c| safe_target(c, &usable_versions)).filter(|s| Some(s) != dep.latest.as_ref());
+        dep.patch_latest = dep.current.as_deref().and_then(|c| patch_target(c, &usable_versions));
     }
 }
 

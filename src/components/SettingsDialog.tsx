@@ -1,19 +1,20 @@
 import { Asterisk, FileX, FolderMinus, FolderPlus, Plus, RefreshCw, Undo2, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import * as api from '../api'
-import { ECOSYSTEM_LABEL, isWithin, relativePath, type Repo } from '../derive'
+import { ECOSYSTEM_LABEL, POLICY_LABEL, isWithin, relativePath, type Repo } from '../derive'
 import type { Prefs } from '../prefs'
-import type { CheckCommands, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, Inventory, Settings } from '../types'
+import type { CheckCommands, CheckConfig, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, Inventory, Settings, VersionPolicies, VersionPolicy } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { SectionTitle, Select, SettingRow, Switch, TextInput } from './controls'
 
-export type SettingsTab = 'general' | 'scanning' | 'updates'
+export type SettingsTab = 'general' | 'scanning' | 'updates' | 'security'
 
 const TABS: Record<SettingsTab, [string, string]> = {
   general: ['General', 'How Mehen looks, starts, and checks in the background.'],
   scanning: ['Scanning', 'The folders Mehen watches and what it skips.'],
-  updates: ['Updates and checks', 'How updates run and what proves they worked.'],
+  updates: ['Updates and checks', 'How far updates go, how they run, and what proves they worked.'],
+  security: ['Security', 'Vulnerability alerts and where advisories come from.'],
 }
 
 const SCHEDULES = [
@@ -38,21 +39,22 @@ export const DEFAULT_CHECKS: Partial<Record<Ecosystem, string>> = {
 
 export const ecosystemScope = (e: Ecosystem) => `ecosystem:${e}`
 
-export function findCommands(all: CheckCommands, scope: string): string[] | null {
+export function findCommands(all: CheckCommands, scope: string): CheckConfig | null {
   const key = Object.keys(all).find((k) => k.toLowerCase() === scope.toLowerCase())
   return key ? all[key] : null
 }
 
-function CommandEditor({ scope, initial, onSaved, placeholder }: { scope: string; initial: string[]; onSaved: (all: CheckCommands) => void; placeholder: string }) {
-  const [draft, setDraft] = useState<string[]>(initial.length ? initial : [''])
+function CommandEditor({ scope, initial, onSaved, placeholder }: { scope: string; initial: CheckConfig; onSaved: (all: CheckCommands) => void; placeholder: string }) {
+  const [draft, setDraft] = useState<string[]>(initial.commands.length ? initial.commands : [''])
+  const [cwd, setCwd] = useState(initial.cwd ?? '')
   const [saving, setSaving] = useState(false)
   const inputs = useRef<(HTMLInputElement | null)[]>([])
-  const dirty = JSON.stringify(draft.map((c) => c.trim()).filter(Boolean)) !== JSON.stringify(initial)
+  const dirty = JSON.stringify(draft.map((c) => c.trim()).filter(Boolean)) !== JSON.stringify(initial.commands) || cwd.trim() !== (initial.cwd ?? '')
 
   const save = async () => {
     setSaving(true)
     try {
-      onSaved(await api.setCheckCommands(scope, draft))
+      onSaved(await api.setCheckCommands(scope, draft, cwd))
     } finally {
       setSaving(false)
     }
@@ -97,7 +99,12 @@ function CommandEditor({ scope, initial, onSaved, placeholder }: { scope: string
           <Plus size={15} />
           Add a check
         </Button>
-        <span className="flex-1 text-[12px] text-muted">Runs from the project folder. Separate arguments with spaces.</span>
+        <span className="flex-1 text-[12px] text-muted">Separate arguments with spaces.</span>
+      </div>
+      <SettingRow title="Working folder" help="Relative to the project, like src/web. Leave empty to run from the project folder.">
+        <TextInput mono value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="." aria-label="Working folder" className="w-[220px]" />
+      </SettingRow>
+      <div className="flex justify-end pt-2">
         <Button variant="primary" onClick={save} disabled={!dirty || saving}>
           Save checks
         </Button>
@@ -112,6 +119,8 @@ export function SettingsDialog({
   settings,
   prefs,
   inventory,
+  policies,
+  onPolicies,
   onPrefs,
   onSettings,
   onInventory,
@@ -126,6 +135,8 @@ export function SettingsDialog({
   settings: Settings
   prefs: Prefs
   inventory: Inventory | null
+  policies: VersionPolicies
+  onPolicies: (p: VersionPolicies) => void
   onPrefs: (patch: Partial<Prefs>) => void
   onSettings: (s: Settings) => void
   onInventory: (inv: Inventory) => void
@@ -135,7 +146,7 @@ export function SettingsDialog({
   /** `rulesChanged` asks for a new check so newly included projects appear. */
   onClose: (rulesChanged: boolean) => void
 }) {
-  const tabs: SettingsTab[] = repo ? ['updates'] : ['general', 'scanning', 'updates']
+  const tabs: SettingsTab[] = repo ? ['updates'] : ['general', 'scanning', 'updates', 'security']
   const [tab, setTab] = useState<SettingsTab>(repo ? 'updates' : initialTab)
   const [commands, setCommands] = useState<CheckCommands | null>(null)
   const [discovered, setDiscovered] = useState<DiscoveredProject[] | null>(null)
@@ -202,6 +213,15 @@ export function SettingsDialog({
 
   const [title, help] = TABS[tab]
   const repoCommands = repo && commands ? findCommands(commands, repo.key) : null
+  const globalPolicy: VersionPolicy = policies['*'] ?? 'any'
+  const repoPolicy = repo ? (Object.entries(policies).find(([k]) => k.toLowerCase() === repo.key.toLowerCase())?.[1] ?? null) : null
+  const setPolicy = async (scope: string, policy: VersionPolicy | null) => {
+    try {
+      onPolicies(await api.setVersionPolicy(scope, policy))
+    } catch (e) {
+      setError(String(e))
+    }
+  }
 
   return (
     <Dialog title={repo ? `${repo.name} settings` : 'Settings'} bare size="settings" onClose={close}>
@@ -385,6 +405,16 @@ export function SettingsDialog({
 
             {tab === 'updates' && !repo && (
               <>
+                <SectionTitle>How far updates go</SectionTitle>
+                <SettingRow title="Allowed versions" help="What Mehen offers for every project. A project's own settings can change it.">
+                  <Select value={globalPolicy} onChange={(e) => setPolicy('*', e.target.value === 'any' ? null : (e.target.value as VersionPolicy))} className="w-[220px]" aria-label="Allowed versions">
+                    {(Object.keys(POLICY_LABEL) as VersionPolicy[]).map((p) => (
+                      <option key={p} value={p}>
+                        {POLICY_LABEL[p]}
+                      </option>
+                    ))}
+                  </Select>
+                </SettingRow>
                 <SectionTitle>Running updates</SectionTitle>
                 <SettingRow title="Run at most" help="Different repositories update side by side. Repositories that need the same tool (npm, cargo, dotnet) always take turns.">
                   <Select
@@ -398,6 +428,7 @@ export function SettingsDialog({
                     className="w-[220px]"
                     aria-label="Updates running at once"
                   >
+                    <option value={0}>Automatic: {settings.updateParallelAuto} at once</option>
                     <option value={1}>1 at a time</option>
                     <option value={2}>2 at once</option>
                     <option value={3}>3 at once</option>
@@ -406,6 +437,9 @@ export function SettingsDialog({
                 </SettingRow>
                 <SettingRow title="Build and test when updating" help="Your usual choice for the update button. A project whose checks fail is put back.">
                   <Switch checked={prefs.checks} onChange={(v) => onPrefs({ checks: v })} label="Build and test when updating" />
+                </SettingRow>
+                <SettingRow title="Stop at the first failed check" help="When off, the remaining checks still run so you see every failure at once. The project is put back either way.">
+                  <Switch checked={prefs.stopOnFailure} onChange={(v) => onPrefs({ stopOnFailure: v })} label="Stop at the first failed check" />
                 </SettingRow>
                 <SettingRow title="Commit each repository" help="Commits only the files Mehen changed, as “Updated N Dependencies”. Never pushes.">
                   <Switch checked={prefs.commit} onChange={(v) => onPrefs({ commit: v })} label="Commit each repository" />
@@ -420,13 +454,23 @@ export function SettingsDialog({
 
             {tab === 'updates' && repo && (
               <>
+                <SettingRow title="Allowed versions" help="How far updates for this project may go.">
+                  <Select value={repoPolicy ?? ''} onChange={(e) => setPolicy(repo.key, (e.target.value || null) as VersionPolicy | null)} className="w-[240px]" aria-label="Allowed versions for this project">
+                    <option value="">Same as all projects ({POLICY_LABEL[globalPolicy].toLowerCase()})</option>
+                    {(Object.keys(POLICY_LABEL) as VersionPolicy[]).map((p) => (
+                      <option key={p} value={p}>
+                        {POLICY_LABEL[p]}
+                      </option>
+                    ))}
+                  </Select>
+                </SettingRow>
                 <SettingRow
                   title={`Use custom checks for ${repo.name}`}
                   help={
                     repoCommands
                       ? 'These replace every build and test step for this project.'
                       : `Mehen runs ${repo.ecosystems
-                          .map((e) => (commands && findCommands(commands, ecosystemScope(e))?.join(', ')) || DEFAULT_CHECKS[e])
+                          .map((e) => (commands && findCommands(commands, ecosystemScope(e))?.commands.join(', ')) || DEFAULT_CHECKS[e])
                           .filter(Boolean)
                           .join('; ') || 'no checks for this project'}.`
                   }
@@ -441,6 +485,35 @@ export function SettingsDialog({
                 {repoCommands && <CommandEditor key={repo.key} scope={repo.key} initial={repoCommands} onSaved={setCommands} placeholder="npm run test:ci" />}
                 <p className="mt-3 text-[12px] text-muted">
                   <b className="text-ink">Which setting wins:</b> this project, then its dependency type, then Mehen's defaults.
+                </p>
+              </>
+            )}
+
+            {tab === 'security' && (
+              <>
+                <SectionTitle>Alerts</SectionTitle>
+                <SettingRow
+                  title="Notify about new vulnerabilities"
+                  help={settings.backgroundHours > 0 ? 'A Windows notification names the affected projects when a background check finds something new.' : 'Notifications come from background checks, which are off. Turn them on under General.'}
+                >
+                  <Switch
+                    checked={settings.notify}
+                    onChange={(v) =>
+                      api
+                        .setNotify(v)
+                        .then(onSettings)
+                        .catch((err) => setError(String(err)))
+                    }
+                    label="Notify about new vulnerabilities"
+                  />
+                </SettingRow>
+                <SettingRow title="Show vulnerable packages first" help="Security fixes, then major, minor, and patch updates. Turn off to list packages by name.">
+                  <Switch checked={prefs.riskFirst} onChange={(v) => onPrefs({ riskFirst: v })} label="Show vulnerable packages first" />
+                </SettingRow>
+                <SectionTitle>Where advisories come from</SectionTitle>
+                <p className="py-1 text-[12.5px] leading-relaxed text-muted">
+                  Mehen asks the open OSV database (osv.dev) about every installed version. OSV gathers GitHub Security Advisories, which cover npm and
+                  NuGet, and the RustSec database for Cargo. Answers are cached locally, and Check everything again skips the cache.
                 </p>
               </>
             )}
@@ -462,7 +535,7 @@ function EcosystemChecks({ ecosystem, commands, onCommands }: { ecosystem: Ecosy
   const [open, setOpen] = useState(false)
   return (
     <div className="border-b border-line">
-      <SettingRow title={ECOSYSTEM_LABEL[ecosystem]} help={current ? current.join(', ') || 'No checks' : `Mehen's defaults: ${DEFAULT_CHECKS[ecosystem]}`}>
+      <SettingRow title={ECOSYSTEM_LABEL[ecosystem]} help={current ? `${current.commands.join(', ') || 'No checks'}${current.cwd ? ` in ${current.cwd}` : ''}` : `Mehen's defaults: ${DEFAULT_CHECKS[ecosystem]}`}>
         <div className="flex gap-1.5">
           {current && (
             <Button variant="ghost" onClick={async () => (onCommands(await api.setCheckCommands(scope, null)), setOpen(false))}>
@@ -474,7 +547,7 @@ function EcosystemChecks({ ecosystem, commands, onCommands }: { ecosystem: Ecosy
           </Button>
         </div>
       </SettingRow>
-      {open && commands && <CommandEditor scope={scope} initial={current ?? []} onSaved={(c) => (onCommands(c), setOpen(false))} placeholder={ecosystem === 'nuget' ? 'dotnet test' : `${ecosystem === 'npm' ? 'npm' : 'cargo'} test`} />}
+      {open && commands && <CommandEditor scope={scope} initial={current ?? { commands: [], cwd: null }} onSaved={(c) => (onCommands(c), setOpen(false))} placeholder={ecosystem === 'nuget' ? 'dotnet test' : `${ecosystem === 'npm' ? 'npm' : 'cargo'} test`} />}
     </div>
   )
 }

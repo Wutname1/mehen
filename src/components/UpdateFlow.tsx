@@ -137,6 +137,7 @@ export function UpdateFlow({
   roots,
   checks,
   commit,
+  stopOnFailure,
   onOptions,
   nameOf,
   onClose,
@@ -146,6 +147,7 @@ export function UpdateFlow({
   roots: string[]
   checks: boolean
   commit: boolean
+  stopOnFailure: boolean
   onOptions: (patch: { checks?: boolean; commit?: boolean }) => void
   nameOf: (key: string) => string
   onClose: (refreshed: Inventory | null) => void
@@ -203,7 +205,7 @@ export function UpdateFlow({
     setStage('running')
     setError(null)
     try {
-      const result = await api.applyBatch(plans, checks, commit)
+      const result = await api.applyBatch(plans, checks, commit, stopOnFailure)
       setOutcomes(result.outcomes)
       if (result.inventory) setRefreshed(result.inventory)
     } catch (e) {
@@ -416,7 +418,7 @@ export function UpdateFlow({
           })}
         </div>
         <p className="mt-3 border-l-2 border-line-strong pl-3 text-[12.5px] leading-relaxed text-muted">
-          {checks ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
+          {checks ? (stopOnFailure ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : "If a check fails, the remaining checks still run so you see every failure, then Mehen puts that project's files back.") : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
           {commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'} Different projects update side by side; projects that need the same tool take turns.
         </p>
       </Dialog>
