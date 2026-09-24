@@ -70,16 +70,34 @@ pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
             }
             true
         })
-        .build();
+        .build_parallel();
 
-    for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy();
+    // Walking is most of a scan and waits on the disk, so it runs on several
+    // threads; the few manifests it finds are read in order afterwards.
+    let found: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    walker.run(|| {
+        let found = &found;
+        Box::new(move |entry| {
+            if let Ok(entry) = entry {
+                if entry.file_type().is_some_and(|t| t.is_file()) {
+                    let file_name = entry.file_name().to_string_lossy();
+                    let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if is_manifest(&file_name, &ext) {
+                        found.lock().unwrap().push(entry.into_path());
+                    }
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    let mut found = found.into_inner().unwrap();
+    found.sort();
+
+    for path in &found {
+        let path = path.as_path();
+        let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-        if is_manifest(&file_name, &ext) && ignore.matching_rule(path).is_some() {
+        if ignore.matching_rule(path).is_some() {
             ignored.lock().unwrap().push(path.display().to_string());
             continue;
         }

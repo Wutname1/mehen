@@ -72,7 +72,7 @@ pub async fn lookup(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) ->
         Ecosystem::Npm => npm(http, name).await,
         Ecosystem::Cargo => crates(http, name).await,
         Ecosystem::Nuget => nuget(http, name).await,
-        Ecosystem::GithubActions => github_tags(name).await,
+        Ecosystem::GithubActions => github_tags(http, name).await,
     }
 }
 
@@ -184,13 +184,15 @@ async fn nuget(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo
 
     let url = format!("https://api.nuget.org/v3/registration5-gz-semver2/{}/index.json", name.to_ascii_lowercase());
     let index: Index = get(http, &url, None).await?.json().await?;
-    let mut leaves = Vec::new();
-    for page in index.items {
+    // Long-lived packages have dozens of pages; they are fetched together.
+    let pages = futures::future::try_join_all(index.items.into_iter().map(|page| async move {
         match page.items {
-            Some(items) => leaves.extend(items),
-            None => leaves.extend(get(http, &page.id, None).await?.json::<PageBody>().await?.items),
+            Some(items) => anyhow::Ok(items),
+            None => Ok(get(http, &page.id, None).await?.json::<PageBody>().await?.items),
         }
-    }
+    }))
+    .await?;
+    let leaves: Vec<Leaf> = pages.into_iter().flatten().collect();
 
     let mut versions = Vec::new();
     let mut requirements = Vec::new();
@@ -206,9 +208,53 @@ async fn nuget(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo
     Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
 }
 
-/// `git ls-remote` does not count against GitHub's 60-requests-an-hour API
-/// limit and returns the commit behind every tag in one call.
-async fn github_tags(name: &str) -> anyhow::Result<PackageInfo> {
+/// Git's own ref listing does not count against GitHub's 60-requests-an-hour
+/// API limit and returns the commit behind every tag in one call. It is read
+/// over the shared HTTP client; `git ls-remote` is the fallback.
+async fn github_tags(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    let refs = match advertised_refs(http, name).await {
+        Ok(refs) => refs,
+        Err(e) if e.to_string().contains("404") => return Err(e),
+        Err(_) => ls_remote(name).await?,
+    };
+    Ok(tags_from_refs(&refs))
+}
+
+/// The ref advertisement from `info/refs`: pkt-lines of `<sha> <ref>`.
+async fn advertised_refs(http: &reqwest::Client, name: &str) -> anyhow::Result<String> {
+    let response = http.get(format!("https://github.com/{name}.git/info/refs?service=git-upload-pack")).send().await?;
+    // GitHub answers 401 for a repository that does not exist.
+    if matches!(response.status().as_u16(), 401 | 404) {
+        return Err(anyhow!("404: repository not found"));
+    }
+    parse_advertisement(&response.error_for_status()?.bytes().await?)
+}
+
+fn parse_advertisement(body: &[u8]) -> anyhow::Result<String> {
+    let mut refs = String::new();
+    let mut rest: &[u8] = body;
+    while rest.len() >= 4 {
+        let len = usize::from_str_radix(std::str::from_utf8(&rest[..4])?, 16)?;
+        if len == 0 {
+            rest = &rest[4..];
+            continue;
+        }
+        anyhow::ensure!(len >= 4 && len <= rest.len(), "malformed ref advertisement");
+        let line = String::from_utf8_lossy(&rest[4..len]);
+        // The first ref carries capabilities after a NUL.
+        let line = line.split('\0').next().unwrap_or("").trim_end();
+        if let Some((sha, reference)) = line.split_once(' ') {
+            if reference.starts_with("refs/") {
+                refs.push_str(&format!("{sha}\t{reference}\n"));
+            }
+        }
+        rest = &rest[len..];
+    }
+    anyhow::ensure!(!refs.is_empty(), "no refs in the advertisement");
+    Ok(refs)
+}
+
+async fn ls_remote(name: &str) -> anyhow::Result<String> {
     let url = format!("https://github.com/{name}.git");
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(["ls-remote", "--tags", &url]).env("GIT_TERMINAL_PROMPT", "0").kill_on_drop(true);
@@ -218,11 +264,14 @@ async fn github_tags(name: &str) -> anyhow::Result<PackageInfo> {
     if !output.status.success() {
         return Err(anyhow!("git ls-remote failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
     }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
-    // Annotated tags list twice: the tag object, then the commit as `tag^{}`.
-    // The peeled line wins because pins point at commits.
+/// `<sha>\t<ref>` lines to tags. Annotated tags list twice: the tag object,
+/// then the commit as `tag^{}`; the peeled line wins because pins point at commits.
+fn tags_from_refs(refs: &str) -> PackageInfo {
     let mut tags: Vec<(String, String)> = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in refs.lines() {
         let Some((sha, reference)) = line.split_once('\t') else { continue };
         let Some(tag) = reference.strip_prefix("refs/tags/") else { continue };
         match tag.strip_suffix("^{}") {
@@ -235,5 +284,41 @@ async fn github_tags(name: &str) -> anyhow::Result<PackageInfo> {
     }
     let latest = max_version(tags.iter().map(|(t, _)| t.as_str()));
     let versions = tags.iter().map(|(t, _)| t.clone()).filter(|t| Version::parse(t).is_some()).collect();
-    Ok(PackageInfo { latest, versions, tags, requirements: Vec::new() })
+    PackageInfo { latest, versions, tags, requirements: Vec::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(line: &str) -> String {
+        format!("{:04x}{line}", line.len() + 4)
+    }
+
+    #[test]
+    fn reads_tags_from_a_ref_advertisement() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let c = "c".repeat(40);
+        let body = [
+            pkt("# service=git-upload-pack\n"),
+            "0000".to_string(),
+            pkt(&format!("{a} HEAD\0multi_ack side-band-64k\n")),
+            pkt(&format!("{a} refs/heads/main\n")),
+            pkt(&format!("{b} refs/tags/v4.1.0\n")),
+            pkt(&format!("{c} refs/tags/v4.1.0^{{}}\n")),
+            pkt(&format!("{a} refs/tags/v3\n")),
+            "0000".to_string(),
+        ]
+        .concat();
+        let info = tags_from_refs(&parse_advertisement(body.as_bytes()).unwrap());
+        assert_eq!(info.tags, vec![("v4.1.0".to_string(), c.clone()), ("v3".to_string(), a.clone())]);
+        assert_eq!(info.latest.as_deref(), Some("v4.1.0"));
+    }
+
+    #[test]
+    fn a_truncated_advertisement_is_an_error() {
+        assert!(parse_advertisement(b"00ffshort").is_err());
+        assert!(parse_advertisement(b"0000").is_err(), "no refs at all");
+    }
 }

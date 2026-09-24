@@ -15,7 +15,7 @@ use crate::registry::{self, PackageInfo};
 use crate::store::{self, Hold, Store};
 use crate::version::{Version, compare, from_spec, max_version, safe_target, patch_target};
 
-const LOOKUP_CONCURRENCY: usize = 8;
+const LOOKUP_CONCURRENCY: usize = 24;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CheckOptions {
@@ -63,6 +63,18 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
         }
     }
 
+    // Vulnerabilities depend only on installed versions, so they are looked up
+    // while the registries answer. Actions pinned to a commit only learn their
+    // version from the tag lookup and are asked about afterwards.
+    let early_keys: BTreeSet<(Ecosystem, String, String)> =
+        all_deps(&mut inventory).filter_map(|dep| osv_version(dep).map(|v| (dep.ecosystem, dep.name.clone(), v))).collect();
+    let early = async {
+        let found = osv_hits(&http, store, options, early_keys).await?;
+        let ids: BTreeSet<String> = found.hits.values().flatten().cloned().collect();
+        let (_, advisories_fetched) = osv::details(&http, store, ids.into_iter().collect()).await;
+        anyhow::Ok((found, advisories_fetched))
+    };
+
     let total = to_fetch.len();
     progress(Progress { phase: "Checking latest versions".into(), done: 0, total });
     // Once a registry is still answering 429 after retries, stop asking it this
@@ -94,16 +106,19 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             }
         })
         .buffer_unordered(LOOKUP_CONCURRENCY);
-    let mut done = 0;
-    while let Some((key, result)) = lookups.next().await {
-        done += 1;
-        stats.packages_fetched += 1;
-        if result.is_err() {
-            stats.packages_failed += 1;
+    let versions = async {
+        let mut done = 0;
+        while let Some((key, result)) = lookups.next().await {
+            done += 1;
+            stats.packages_fetched += 1;
+            if result.is_err() {
+                stats.packages_failed += 1;
+            }
+            infos.insert(key, result);
+            progress(Progress { phase: "Checking latest versions".into(), done, total });
         }
-        infos.insert(key, result);
-        progress(Progress { phase: "Checking latest versions".into(), done, total });
-    }
+    };
+    let ((), early) = futures::join!(versions, early);
     drop(lookups);
     stats.throttled = throttled.into_inner().unwrap().into_iter().map(|e| e.osv_name().to_string()).collect();
 
@@ -137,7 +152,16 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
     }
 
     progress(Progress { phase: "Checking for vulnerabilities".into(), done: 0, total: 1 });
-    match find_vulnerabilities(&http, store, options, &mut inventory, &mut stats).await {
+    let early = match early {
+        Ok((found, advisories_fetched)) => {
+            stats.osv_cached += found.cached;
+            stats.osv_fetched += found.fetched;
+            stats.advisories_fetched += advisories_fetched;
+            found.hits
+        }
+        Err(_) => HashMap::new(),
+    };
+    match find_vulnerabilities(&http, store, options, &mut inventory, &mut stats, early).await {
         Ok(vulns) => inventory.vulnerabilities = vulns,
         Err(e) => inventory.warnings.push(format!("Vulnerability check failed: {e}")),
     }
@@ -167,14 +191,27 @@ fn project_node(pinned: Option<&str>, engines: Option<&str>, installed: Option<&
 }
 
 /// Installed Rust and Node, used when a project does not declare its own.
+#[derive(Clone)]
 struct Toolchain {
     rust: Option<String>,
     node: Option<String>,
 }
 
+/// Installed toolchains rarely change, and asking costs two process starts.
+const TOOLCHAIN_TTL: Duration = Duration::from_secs(10 * 60);
+static TOOLCHAIN: Mutex<Option<(Instant, Toolchain)>> = Mutex::new(None);
+
 impl Toolchain {
     async fn detect() -> Self {
-        Toolchain { rust: version_of("rustc", 1).await, node: version_of("node", 0).await }
+        if let Some((at, known)) = TOOLCHAIN.lock().unwrap().as_ref() {
+            if at.elapsed() < TOOLCHAIN_TTL {
+                return known.clone();
+            }
+        }
+        let (rust, node) = futures::join!(version_of("rustc", 1), version_of("node", 0));
+        let found = Toolchain { rust, node };
+        *TOOLCHAIN.lock().unwrap() = Some((Instant::now(), found.clone()));
+        found
     }
 }
 
@@ -298,7 +335,16 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
         info.versions.iter().any(|v| v.trim_start_matches(['v', 'V']) == c) && check(c).is_err()
     });
     let usable = |v: &str| if env_is_wrong { Ok(()) } else { check(v) };
-    let usable_versions: Vec<String> = info.versions.iter().filter(|v| usable(v).is_ok()).cloned().collect();
+    // Older releases are never a target, and checking thousands of them is
+    // most of a warm check's time.
+    let floor = dep.current.as_deref().and_then(Version::parse);
+    let usable_versions: Vec<String> = info
+        .versions
+        .iter()
+        .filter(|v| floor.as_ref().is_none_or(|f| Version::parse(v).is_none_or(|v| v >= *f)))
+        .filter(|v| usable(v).is_ok())
+        .cloned()
+        .collect();
     dep.latest = info.latest.clone();
     if let Some(newest) = &info.latest {
         if let Err(reason) = usable(newest) {
@@ -331,34 +377,16 @@ async fn find_vulnerabilities(
     options: CheckOptions,
     inventory: &mut Inventory,
     stats: &mut CheckStats,
+    mut hits: HashMap<(Ecosystem, String, String), Vec<String>>,
 ) -> anyhow::Result<Vec<Vulnerability>> {
-    // Only exact-enough versions are worth asking about; `v4` or `1.x` would
-    // either miss everything or match everything.
-    let unique: BTreeSet<(Ecosystem, String, String)> =
-        all_deps(inventory).filter_map(|dep| osv_version(dep).map(|v| (dep.ecosystem, dep.name.clone(), v))).collect();
-
-    let mut hits: HashMap<(Ecosystem, String, String), Vec<String>> = HashMap::new();
-    let mut batch: Vec<Query> = Vec::new();
-    for (ecosystem, name, version) in unique {
-        match store.osv_hits(ecosystem, &name, &version, options.osv_max_age) {
-            Some(ids) => {
-                stats.osv_cached += 1;
-                hits.insert((ecosystem, name, version), ids);
-            }
-            None => batch.push(Query { ecosystem, name, version }),
-        }
-    }
-
-    if !batch.is_empty() {
-        let results = osv::query_batch(http, &batch).await?;
-        stats.osv_fetched += batch.len();
-        let fresh: Vec<(Ecosystem, String, String, Vec<String>)> =
-            batch.into_iter().zip(results).map(|(q, ids)| (q.ecosystem, q.name, q.version, ids)).collect();
-        store.put_osv_hits(&fresh);
-        for (ecosystem, name, version, ids) in fresh {
-            hits.insert((ecosystem, name, version), ids);
-        }
-    }
+    let late: BTreeSet<(Ecosystem, String, String)> = all_deps(inventory)
+        .filter_map(|dep| osv_version(dep).map(|v| (dep.ecosystem, dep.name.clone(), v)))
+        .filter(|key| !hits.contains_key(key))
+        .collect();
+    let found = osv_hits(http, store, options, late).await?;
+    stats.osv_cached += found.cached;
+    stats.osv_fetched += found.fetched;
+    hits.extend(found.hits);
 
     let mut ids: BTreeSet<String> = BTreeSet::new();
     for dep in all_deps(inventory) {
@@ -369,12 +397,46 @@ async fn find_vulnerabilities(
     }
 
     let (mut vulns, fetched) = osv::details(http, store, ids.into_iter().collect()).await;
-    stats.advisories_fetched = fetched;
-    stats.advisories_cached = vulns.len() - fetched;
+    stats.advisories_fetched += fetched;
+    stats.advisories_cached = vulns.len().saturating_sub(stats.advisories_fetched);
     vulns.sort_by(|a, b| severity_rank(&b.severity).cmp(&severity_rank(&a.severity)).then(a.id.cmp(&b.id)));
     Ok(vulns)
 }
 
+struct OsvFound {
+    hits: HashMap<(Ecosystem, String, String), Vec<String>>,
+    cached: usize,
+    fetched: usize,
+}
+
+/// Advisory ids for each package version, from the store when fresh.
+async fn osv_hits(http: &reqwest::Client, store: &Store, options: CheckOptions, keys: BTreeSet<(Ecosystem, String, String)>) -> anyhow::Result<OsvFound> {
+    let mut found = OsvFound { hits: HashMap::new(), cached: 0, fetched: 0 };
+    let mut batch: Vec<Query> = Vec::new();
+    for (ecosystem, name, version) in keys {
+        match store.osv_hits(ecosystem, &name, &version, options.osv_max_age) {
+            Some(ids) => {
+                found.cached += 1;
+                found.hits.insert((ecosystem, name, version), ids);
+            }
+            None => batch.push(Query { ecosystem, name, version }),
+        }
+    }
+    if !batch.is_empty() {
+        let results = osv::query_batch(http, &batch).await?;
+        found.fetched = batch.len();
+        let fresh: Vec<(Ecosystem, String, String, Vec<String>)> =
+            batch.into_iter().zip(results).map(|(q, ids)| (q.ecosystem, q.name, q.version, ids)).collect();
+        store.put_osv_hits(&fresh);
+        for (ecosystem, name, version, ids) in fresh {
+            found.hits.insert((ecosystem, name, version), ids);
+        }
+    }
+    Ok(found)
+}
+
+/// Only exact-enough versions are worth asking about; `v4` or `1.x` would
+/// either miss everything or match everything.
 pub(crate) fn osv_version(dep: &Dependency) -> Option<String> {
     let current = dep.current.as_deref()?;
     let parsed = Version::parse(current)?;
