@@ -10,6 +10,16 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
+    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`).
+    pub fn key(self) -> &'static str {
+        match self {
+            Ecosystem::Npm => "npm",
+            Ecosystem::Cargo => "cargo",
+            Ecosystem::Nuget => "nuget",
+            Ecosystem::GithubActions => "github-actions",
+        }
+    }
+
     /// Ecosystem name as the OSV database spells it.
     pub fn osv_name(self) -> &'static str {
         match self {
@@ -168,6 +178,37 @@ pub struct Inventory {
     pub check_stats: Option<CheckStats>,
 }
 
+/// Lowercase with backslashes, so Windows paths compare reliably.
+fn norm(path: &str) -> String {
+    path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
+/// True when `path` is `folder` or inside it.
+pub fn path_within(path: &str, folder: &str) -> bool {
+    let (p, f) = (norm(path), norm(folder));
+    p == f || p.starts_with(&format!("{f}\\"))
+}
+
+impl Inventory {
+    /// Folds in a check of only `scanned` folders: their projects are replaced,
+    /// everything else stays as it was, and advisories no project uses anymore
+    /// are dropped.
+    pub fn merge_partial(mut self, partial: Inventory, scanned: &[String]) -> Inventory {
+        let inside = |dir: &str| scanned.iter().any(|s| path_within(dir, s));
+        self.projects.retain(|p| !inside(&p.dir));
+        self.projects.extend(partial.projects);
+        self.projects.sort_by_key(|p| p.dir.to_lowercase());
+        let mut seen = std::collections::HashSet::new();
+        let used: std::collections::HashSet<String> = self.projects.iter().flat_map(|p| &p.dependencies).flat_map(|d| d.vulns.iter().cloned()).collect();
+        self.vulnerabilities = partial.vulnerabilities.into_iter().chain(self.vulnerabilities).filter(|v| used.contains(&v.id) && seen.insert(v.id.clone())).collect();
+        self.warnings.retain(|w| !scanned.iter().any(|s| norm(w).contains(&norm(s))));
+        self.warnings.extend(partial.warnings);
+        self.checked_at = partial.checked_at.or(self.checked_at);
+        self.check_stats = partial.check_stats.or(self.check_stats);
+        self
+    }
+}
+
 /// How much of a check came from the local store versus the network.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,4 +245,59 @@ pub struct DiscoveredProject {
     pub dependency_count: usize,
     /// The ignore rule hiding this project, if any.
     pub ignored_by: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(dir: &str, vulns: &[&str]) -> Project {
+        let mut dep = Dependency::new("pkg", Ecosystem::Npm, DepKind::Normal, "1.0.0");
+        dep.vulns = vulns.iter().map(|v| v.to_string()).collect();
+        Project {
+            id: format!("{dir}\\package.json"),
+            name: dir.into(),
+            ecosystem: Ecosystem::Npm,
+            dir: dir.into(),
+            manifest: format!("{dir}\\package.json"),
+            repo: None,
+            frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
+            dependencies: vec![dep],
+        }
+    }
+
+    fn vuln(id: &str) -> Vulnerability {
+        Vulnerability { id: id.into(), aliases: Vec::new(), summary: String::new(), severity: None, url: String::new(), fixed: Vec::new() }
+    }
+
+    fn inventory(projects: Vec<Project>, vulns: Vec<Vulnerability>, at: u64) -> Inventory {
+        Inventory {
+            roots: vec!["C:\\code".into()],
+            projects,
+            vulnerabilities: vulns,
+            skipped_worktrees: Vec::new(),
+            ignored: Vec::new(),
+            warnings: Vec::new(),
+            scan_ms: 0,
+            check_ms: None,
+            checked_at: Some(at),
+            check_stats: None,
+        }
+    }
+
+    #[test]
+    fn partial_check_replaces_only_its_folders() {
+        let old = inventory(vec![project("C:\\code\\a", &["OLD-A"]), project("C:\\code\\b", &["OLD-B"])], vec![vuln("OLD-A"), vuln("OLD-B")], 1);
+        let partial = inventory(vec![project("C:\\Code\\A", &["NEW-A"])], vec![vuln("NEW-A")], 2);
+        let merged = old.merge_partial(partial, &["c:/code/a".into()]);
+        let dirs: Vec<&str> = merged.projects.iter().map(|p| p.dir.as_str()).collect();
+        assert_eq!(dirs, vec!["C:\\Code\\A", "C:\\code\\b"]);
+        let ids: Vec<&str> = merged.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, vec!["NEW-A", "OLD-B"]);
+        assert_eq!(merged.roots, vec!["C:\\code"]);
+        assert_eq!(merged.checked_at, Some(2));
+    }
 }

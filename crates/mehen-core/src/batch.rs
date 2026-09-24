@@ -136,6 +136,38 @@ impl Job {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitOutcome {
+    pub job: String,
+    pub name: String,
+    pub committed: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Commits already-applied plans, one commit per repository, as the batch
+/// runner would have with commit on.
+pub fn commit(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
+    group(plans)
+        .into_iter()
+        .map(|job| {
+            let result = match (job.commit_blocked(), &job.repo) {
+                (Some(reason), _) => Err(reason),
+                (None, None) => Err("not inside a git repository".into()),
+                (None, Some(repo)) => {
+                    let (subject, body) = job.commit_message();
+                    update::commit_paths(repo, &job.touched_paths(), &[&subject, &body])
+                }
+            };
+            let (committed, error) = match result {
+                Ok(hash) => (Some(hash), None),
+                Err(e) => (None, Some(e)),
+            };
+            CommitOutcome { job: job.key, name: job.name, committed, error }
+        })
+        .collect()
+}
+
 /// The step's tool, which decides who it must take turns with.
 pub fn lane(step: &Step) -> String {
     let program = step.program.to_lowercase();
@@ -326,6 +358,7 @@ mod tests {
             warnings: Vec::new(),
             repo: repo.map(|r| r.display().to_string()),
             commit_blocked: None,
+            branch: None,
         }
     }
 

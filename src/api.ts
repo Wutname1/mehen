@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { BatchEvent, BatchResult, Change, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdateEvent, UpdateOutcome, UpdatePlan } from './types'
+import type { BatchEvent, BatchResult, Change, CheckCommands, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -64,18 +64,42 @@ export async function lastInventory(): Promise<Inventory | null> {
   return invoke<Inventory | null>('last_inventory')
 }
 
-export async function scanAndCheck(refresh: boolean): Promise<Inventory> {
+/** Checks every watched folder, or with `only` just those folders and repositories. */
+export async function scanAndCheck(refresh: boolean, only: string[] | null = null): Promise<Inventory> {
   if (!inTauri) {
+    await new Promise((r) => setTimeout(r, only ? 900 : 1500))
     const inv = await mock.inventory()
     if (!inv) throw new Error('No dev inventory available outside the desktop app')
     return inv
   }
-  return invoke<Inventory>('scan_and_check', { refresh })
+  return invoke<Inventory>('scan_and_check', { refresh, only })
 }
 
-export interface ApplyResult {
-  outcome: UpdateOutcome
-  inventory: Inventory | null
+export async function checkCommands(): Promise<CheckCommands> {
+  if (!inTauri) return { ...mockCheckCommands }
+  return invoke<CheckCommands>('check_commands')
+}
+
+/** Sets the build and test commands for a scope; `null` goes back to Mehen's own. */
+export async function setCheckCommands(scope: string, commands: string[] | null): Promise<CheckCommands> {
+  if (!inTauri) {
+    for (const k of Object.keys(mockCheckCommands)) if (k.toLowerCase() === scope.toLowerCase()) delete mockCheckCommands[k]
+    if (commands) mockCheckCommands[scope] = commands.map((c) => c.trim()).filter(Boolean)
+    return { ...mockCheckCommands }
+  }
+  return invoke<CheckCommands>('set_check_commands', { scope, commands })
+}
+
+const mockCheckCommands: CheckCommands = {}
+
+/** Commits updates that were applied without committing, one commit per repository. */
+export async function commitUpdate(plans: UpdatePlan[]): Promise<CommitOutcome[]> {
+  if (!inTauri) {
+    await new Promise((r) => setTimeout(r, 500))
+    const repos = [...new Set(plans.map((p) => p.repo ?? p.projectId))]
+    return repos.map((job, i) => ({ job, name: job.split(/[\\/]/).pop() ?? job, committed: plans.find((p) => (p.repo ?? p.projectId) === job)?.repo ? `${(0xa04d173 + i * 977).toString(16)}` : null, error: null }))
+  }
+  return invoke<CommitOutcome[]>('commit_update', { plans })
 }
 
 export async function planUpdate(projectId: string, changes: Change[]): Promise<UpdatePlan> {
@@ -83,22 +107,6 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
   return invoke<UpdatePlan>('plan_update', { projectId, changes })
 }
 
-export async function applyUpdate(plan: UpdatePlan, verify: boolean, rescan = true, commitMessage: string | null = null): Promise<ApplyResult> {
-  if (!inTauri) return mock.applyUpdate(plan, verify, commitMessage)
-  return invoke<ApplyResult>('apply_update', { plan, verify, rescan, commitMessage })
-}
-
-export async function onUpdateEvent(handler: (e: UpdateEvent) => void): Promise<UnlistenFn> {
-  if (!inTauri) {
-    mockUpdateListener = handler
-    return () => {
-      if (mockUpdateListener === handler) mockUpdateListener = null
-    }
-  }
-  return listen<UpdateEvent>('mehen://update', (e) => handler(e.payload))
-}
-
-let mockUpdateListener: ((e: UpdateEvent) => void) | null = null
 
 /**
  * Updates many projects at once: one job per repository, side by side except
@@ -238,25 +246,7 @@ const mock = (() => {
         warnings: [],
         repo: project.repo,
         commitBlocked: project.repo ? null : 'not inside a git repository',
-      }
-    },
-    applyUpdate: async (plan: UpdatePlan, verify: boolean, commitMessage: string | null): Promise<ApplyResult> => {
-      const steps = plan.steps.filter((s) => verify || s.kind === 'install')
-      const results: StepResult[] = []
-      for (const [index, step] of steps.entries()) {
-        mockUpdateListener?.({ index, label: step.label, state: 'running' })
-        await new Promise((r) => setTimeout(r, 700))
-        mockUpdateListener?.({ index, label: step.label, state: 'ok' })
-        results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 700 })
-      }
-      if (commitMessage) {
-        mockUpdateListener?.({ index: plan.steps.length, label: 'git commit', state: 'running' })
-        await new Promise((r) => setTimeout(r, 300))
-        mockUpdateListener?.({ index: plan.steps.length, label: 'git commit', state: 'ok' })
-      }
-      return {
-        outcome: { ok: true, rolledBack: false, error: null, steps: results, committed: commitMessage ? 'abc1234' : null, commitError: null },
-        inventory: await filtered(),
+        branch: project.repo ? 'main' : null,
       }
     },
     // Mirrors the Rust runner: one job per repository, one step per tool at a time.

@@ -162,6 +162,8 @@ export interface UpdatePlan {
   repo: string | null
   /** Why this update can't be committed, if it can't. */
   commitBlocked: string | null
+  /** The checked-out branch, where a commit would land. */
+  branch: string | null
 }
 
 export interface StepResult {
@@ -172,20 +174,6 @@ export interface StepResult {
   ms: number
 }
 
-export interface UpdateOutcome {
-  ok: boolean
-  rolledBack: boolean
-  error: string | null
-  steps: StepResult[]
-  committed: string | null
-  commitError: string | null
-}
-
-export interface UpdateEvent {
-  index: number
-  label: string
-  state: 'running' | 'ok' | 'failed' | 'rolled-back'
-}
 
 export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'done' | 'failed' | 'rolled-back'
 
@@ -219,3 +207,13 @@ export interface BatchResult {
   outcomes: JobOutcome[]
   inventory: Inventory | null
 }
+
+export interface CommitOutcome {
+  job: string
+  name: string
+  committed: string | null
+  error: string | null
+}
+
+/** Build and test commands by scope: a repository path, or `ecosystem:<name>`. */
+export type CheckCommands = Record<string, string[]>

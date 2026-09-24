@@ -1,57 +1,36 @@
-import { Moon, Search, Sun, TriangleAlert, Undo2, X } from 'lucide-react'
+import { Moon, Search, Settings2, Sun, TriangleAlert, Undo2, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { AdvisoryDialog } from './components/AdvisoryDialog'
 import { Logo, cx } from './components/bits'
-import { BulkUpdateDialog, type BulkTarget } from './components/BulkUpdateDialog'
-import { FoldersPanel } from './components/FoldersPanel'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
+import { ManageProjects } from './components/ManageProjects'
 import { Queue, type QueueFilters, type ScopedRow } from './components/Queue'
 import { Rail, ScanStatus } from './components/Rail'
-import { RISK_ORDER, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
-import type { Change, IgnoreKind, Inventory, Progress, Settings } from './types'
+import { SettingsDialog, type SettingsTab } from './components/SettingsDialog'
+import { AddFolderDialog, ExcludeDialog } from './components/SmallDialogs'
+import { UpdateFlow, type UpdateTarget } from './components/UpdateFlow'
+import { RISK_ORDER, folderName, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
+import { usePrefs } from './prefs'
+import type { Change, IgnoreKind, IgnoreRule, Inventory, Progress, Settings } from './types'
 
 const SUGGESTED_ROOT = 'C:\\code'
-
-interface IgnoreRequest {
-  kind: Extract<IgnoreKind, 'folder' | 'project'>
-  value: string
-  label: string
-}
 
 interface Notice {
   text: string
   undo?: () => void
 }
 
-type Theme = 'dark' | 'light'
-export type Palette = 'faience' | 'parchment'
+/** Where a dialog goes back to when a nested one closes. */
+type Back = 'manage' | 'settings' | null
 
-function stored<T extends string>(key: string, allowed: T[], fallback: T): T {
-  try {
-    const v = localStorage.getItem(key) as T | null
-    return v && allowed.includes(v) ? v : fallback
-  } catch {
-    return fallback
-  }
-}
-
-/** Theme and palette live on <html> so every token follows them. */
-function useAppearance() {
-  const [theme, setTheme] = useState<Theme>(() => stored('mehen-theme', ['dark', 'light'], 'dark'))
-  const [palette, setPalette] = useState<Palette>(() => stored('mehen-palette', ['faience', 'parchment'], 'faience'))
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme
-    document.documentElement.dataset.palette = palette
-    try {
-      localStorage.setItem('mehen-theme', theme)
-      localStorage.setItem('mehen-palette', palette)
-    } catch {
-      // Private storage: the choice lasts for this session only.
-    }
-  }, [theme, palette])
-  return { theme, setTheme, palette, setPalette }
-}
+type Dialog =
+  | { kind: 'settings'; tab?: SettingsTab; repo?: Repo }
+  | { kind: 'manage' }
+  | { kind: 'add-folder'; back: Back }
+  | { kind: 'exclude'; repo: Repo; back: Back }
+  | { kind: 'update'; start: 'confirm' | 'preview'; targets: UpdateTarget[] }
+  | { kind: 'advisory'; row: QueueRow }
 
 function timeAgo(unixSeconds: number | null | undefined): string {
   if (!unixSeconds) return 'never'
@@ -65,9 +44,9 @@ function timeAgo(unixSeconds: number | null | undefined): string {
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export default function App() {
-  const { theme, setTheme } = useAppearance()
+  const { prefs, update: setPrefs, theme } = usePrefs()
   const [settings, setSettings] = useState<Settings | null>(null)
-  const [panelOpen, setPanelOpen] = useState(false)
+  const [dialog, setDialog] = useState<Dialog | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [inventory, setInventory] = useState<Inventory | null>(null)
   const [loading, setLoading] = useState(true)
@@ -79,9 +58,22 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [filters, setFilters] = useState<QueueFilters>({ types: new Set(), ecosystems: new Set(), risk: 'any', riskFirst: true })
   const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [advisory, setAdvisory] = useState<QueueRow | null>(null)
-  const [bulk, setBulk] = useState<{ title: string; targets: BulkTarget[] } | null>(null)
   const searchRef = useRef<HTMLInputElement>(null)
+  const scannedOnOpen = useRef(false)
+
+  const run = useCallback(async (refresh: boolean, only: string[] | null = null) => {
+    setRunning(true)
+    setError(null)
+    setProgress({ phase: only ? `Checking ${only.length === 1 ? folderName(only[0]) : `${only.length} projects`}` : 'Finding projects', done: 0, total: 0 })
+    try {
+      setInventory(await api.scanAndCheck(refresh, only))
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRunning(false)
+      setProgress(null)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -90,12 +82,17 @@ export default function App() {
         if (cancelled) return
         setSettings(s)
         setInventory(inv)
+        if (prefs.scanOnOpen && s.folders.length && !scannedOnOpen.current) {
+          scannedOnOpen.current = true
+          run(false)
+        }
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoading(false))
     return () => {
       cancelled = true
     }
+    // Loads once; the scan-on-open choice is read at start only.
   }, [])
 
   useEffect(() => {
@@ -112,11 +109,11 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const unlisten = api.onProgress(setProgress)
+    const unlisten = api.onProgress((p) => running && setProgress(p))
     return () => {
       unlisten.then((fn) => fn())
     }
-  }, [])
+  }, [running])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -130,43 +127,47 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  const run = async (refresh: boolean) => {
-    setRunning(true)
-    setError(null)
-    setProgress({ phase: 'Finding projects', done: 0, total: 0 })
-    try {
-      setInventory(await api.scanAndCheck(refresh))
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setRunning(false)
-      setProgress(null)
-    }
-  }
-
-  const watchFolder = async (path: string | null) => {
-    if (!path) return
+  const watchFolder = async (path: string) => {
     try {
       setSettings(await api.addFolder(path))
-      await run(false)
+      setNotice({ text: `Watching ${path}. Checking it now.` })
+      await run(false, [path])
     } catch (e) {
       setError(String(e))
     }
   }
 
-  const ignore = async ({ kind, value, label }: IgnoreRequest) => {
+  const removeFolder = async (folder: string) => {
+    try {
+      setSettings(await api.removeFolder(folder))
+      setInventory((inv) => inv && { ...inv, projects: inv.projects.filter((p) => !isWithin(p.dir, folder)) })
+      const count = inventory?.projects.filter((p) => isWithin(p.dir, folder)).length ?? 0
+      setNotice({
+        text: `Stopped watching ${folder}.${count ? ` Its projects will no longer be checked.` : ''}`,
+        undo: async () => {
+          setNotice(null)
+          setSettings(await api.addFolder(folder))
+          await run(false, [folder])
+        },
+      })
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const exclude = async (kind: IgnoreKind, value: string, label: string) => {
     try {
       const result = await api.addIgnore(kind, value)
       setSettings(result.settings)
       if (result.inventory) setInventory(result.inventory)
-      const rule = result.settings.rules.find((r) => r.kind === kind && samePath(r.value, value))
+      const rule = result.settings.rules.find((r) => r.kind === kind && (kind === 'pattern' ? r.value.toLowerCase() === value.toLowerCase() : samePath(r.value, value)))
       setNotice({
         text: `${label} excluded. Mehen will skip it from now on.`,
         undo: rule
           ? async () => {
               setNotice(null)
               setSettings(await api.removeIgnore(rule.id))
-              await run(false)
+              await run(false, kind === 'pattern' ? null : [kind === 'project' ? value.replace(/[\\/][^\\/]*$/, '') : value])
             }
           : undefined,
       })
@@ -175,9 +176,35 @@ export default function App() {
     }
   }
 
-  const closePanel = (changed: boolean) => {
-    setPanelOpen(false)
-    if (changed) run(false)
+  const excludeMany = async (keys: string[]) => {
+    try {
+      let result: Awaited<ReturnType<typeof api.addIgnore>> | null = null
+      for (const key of keys) result = await api.addIgnore('folder', key)
+      if (!result) return
+      setSettings(result.settings)
+      if (result.inventory) setInventory(result.inventory)
+      const rules = result.settings.rules.filter((r) => r.kind === 'folder' && keys.some((k) => samePath(k, r.value)))
+      setNotice({
+        text: `${plural(keys.length, 'project')} excluded.`,
+        undo: async () => {
+          setNotice(null)
+          await include(rules, keys)
+        },
+      })
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const include = async (rules: IgnoreRule[], keys: string[]) => {
+    try {
+      let latest: Settings | null = null
+      for (const rule of rules) latest = await api.removeIgnore(rule.id)
+      if (latest) setSettings(latest)
+      await run(false, keys)
+    } catch (e) {
+      setError(String(e))
+    }
   }
 
   const rows = useMemo(() => (inventory ? queueRows(inventory) : []), [inventory])
@@ -185,6 +212,7 @@ export default function App() {
   const repoByKey = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), r])), [repoList])
   const repo = repoScope ? (repoByKey.get(repoScope.toLowerCase()) ?? null) : null
   const repoOf = useCallback((u: QueueUsage) => repoByKey.get(repoKey(u.project).toLowerCase()), [repoByKey])
+  const nameOf = useCallback((key: string) => repoByKey.get(key.toLowerCase())?.name ?? folderName(key), [repoByKey])
 
   // Drop selections and scope that no longer exist after a check.
   useEffect(() => {
@@ -272,15 +300,17 @@ export default function App() {
     setNotice({ text: `${plural(trayGroups.length, 'update')} removed from the selection.`, undo: () => (setNotice(null), setSelected(new Set(removed))) })
   }
 
-  const review = () => {
-    const byProject = new Map<string, BulkTarget>()
+  const startUpdate = (start: 'confirm' | 'preview') => {
+    const byProject = new Map<string, UpdateTarget>()
     for (const u of trayGroups.flatMap((g) => g.usages)) {
       const entry = byProject.get(u.project.id) ?? { project: u.project, changes: [] as Change[] }
       if (!entry.changes.some((c) => c.name === u.dep.name && c.from === u.dep.requested)) entry.changes.push({ name: u.dep.name, from: u.dep.requested, to: u.target })
       byProject.set(u.project.id, entry)
     }
-    setBulk({ title: plural(trayGroups.length, 'update'), targets: [...byProject.values()] })
+    setDialog({ kind: 'update', start, targets: [...byProject.values()] })
   }
+
+  const openBack = (back: Back) => setDialog(back === 'manage' ? { kind: 'manage' } : back === 'settings' ? { kind: 'settings', tab: 'scanning' } : null)
 
   const excludedCount = settings?.rules.length ?? 0
   const repoCount = repoList.length
@@ -316,15 +346,27 @@ export default function App() {
             </kbd>
           )}
         </label>
-        <button
-          type="button"
-          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          aria-label={`${theme === 'dark' ? 'Dark' : 'Light'} theme. Switch to ${theme === 'dark' ? 'light' : 'dark'}`}
-          className="inline-flex h-[34px] items-center gap-2 rounded-[3px] border border-rail-border px-2.5 text-[12px] text-rail-ink hover:border-rail-border-strong hover:bg-rail-field-hover"
-        >
-          {theme === 'dark' ? <Moon size={15} /> : <Sun size={15} />}
-          {theme === 'dark' ? 'Dark' : 'Light'}
-        </button>
+        <div className="flex gap-1.5">
+          <button
+            type="button"
+            onClick={() => setPrefs({ theme: theme === 'dark' ? 'light' : 'dark' })}
+            aria-label={`${theme === 'dark' ? 'Dark' : 'Light'} theme. Switch to ${theme === 'dark' ? 'light' : 'dark'}`}
+            className="inline-flex h-[34px] items-center gap-2 rounded-[3px] border border-rail-border px-2.5 text-[12px] text-rail-ink hover:border-rail-border-strong hover:bg-rail-field-hover"
+          >
+            {theme === 'dark' ? <Moon size={15} /> : <Sun size={15} />}
+            {theme === 'dark' ? 'Dark' : 'Light'}
+          </button>
+          <button
+            type="button"
+            onClick={() => setDialog({ kind: 'settings' })}
+            disabled={!settings}
+            aria-label="Settings"
+            title="Settings"
+            className="grid size-[34px] place-items-center rounded-[3px] border border-rail-border text-rail-ink hover:border-rail-border-strong hover:bg-rail-field-hover disabled:opacity-50"
+          >
+            <Settings2 size={16} />
+          </button>
+        </div>
       </header>
 
       {running && progress && <ProgressBar progress={progress} />}
@@ -346,7 +388,7 @@ export default function App() {
           folders={settings?.folders ?? []}
           onRun={() => run(false)}
           onWatch={watchFolder}
-          onChoose={async () => watchFolder(await api.pickFolder())}
+          onChoose={() => setDialog({ kind: 'add-folder', back: null })}
         />
       ) : (
         <div className="grid min-h-0 flex-1 grid-cols-[256px_minmax(0,1fr)_316px] max-[1279px]:grid-cols-[232px_minmax(0,1fr)_284px] max-[1100px]:grid-cols-[216px_minmax(0,1fr)_264px]">
@@ -357,13 +399,15 @@ export default function App() {
             query={query}
             excludedCount={excludedCount}
             onSelect={setRepoScope}
-            onManage={() => setPanelOpen(true)}
-            onAddFolder={async () => watchFolder(await api.pickFolder())}
-            onExclusions={() => setPanelOpen(true)}
+            onManage={() => setDialog({ kind: 'manage' })}
+            onAddFolder={() => setDialog({ kind: 'add-folder', back: null })}
+            onExclusions={() => setDialog({ kind: 'settings', tab: 'scanning' })}
             onRefreshAll={() => run(true)}
             onReveal={(path) => api.reveal(path)}
             onOpenInEditor={(path) => api.openInEditor(path)}
-            onIgnoreRepo={(r: Repo) => ignore({ kind: 'folder', value: r.key, label: r.name })}
+            onExclude={(r) => setDialog({ kind: 'exclude', repo: r, back: null })}
+            onProjectSettings={(r) => setDialog({ kind: 'settings', repo: r })}
+            onScanRepo={(r) => run(false, [r.key])}
             footer={
               <ScanStatus
                 running={running}
@@ -391,42 +435,119 @@ export default function App() {
             onClearScope={() => setRepoScope(null)}
             security={security && { packages: security.packages, projects: security.projects, allSelected: security.allSelected }}
             onSelectFixes={() => security && addAll(security.usages, (n) => `${n} security fix${n === 1 ? '' : 'es'} selected.`)}
-            onAdvisory={setAdvisory}
+            onAdvisory={(row) => setDialog({ kind: 'advisory', row })}
             searching={!!q}
             onClearSearch={() => setQuery('')}
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
-            {repo && <ProjectRecord repo={repo} onReveal={() => api.reveal(repo.key)} onOpenInEditor={() => api.openInEditor(repo.key)} />}
-            <Tray groups={trayGroups} repo={repo} onRemove={removeGroup} onClear={clearSelection} onUpdate={review} />
+            {repo && (
+              <ProjectRecord repo={repo} onReveal={() => api.reveal(repo.key)} onOpenInEditor={() => api.openInEditor(repo.key)} onSettings={() => setDialog({ kind: 'settings', repo })} />
+            )}
+            <Tray
+              groups={trayGroups}
+              repo={repo}
+              onRemove={removeGroup}
+              onClear={clearSelection}
+              onUpdate={() => startUpdate('confirm')}
+              onPreview={() => startUpdate('preview')}
+              checks={prefs.checks}
+              commit={prefs.commit}
+              onOptions={setPrefs}
+            />
           </aside>
         </div>
       )}
 
-      {panelOpen && settings && <FoldersPanel settings={settings} onSettings={setSettings} onClose={closePanel} />}
-
-      {advisory && inventory && (
-        <AdvisoryDialog
-          row={advisory}
+      {dialog?.kind === 'settings' && settings && (
+        <SettingsDialog
+          tab={dialog.tab}
+          repo={dialog.repo}
+          settings={settings}
+          prefs={prefs}
           inventory={inventory}
-          allSelected={advisory.usages.filter((u) => u.dep.vulns.length > 0).every((u) => selected.has(u.key))}
-          onSelect={() => {
-            addAll(
-              advisory.usages.filter((u) => u.dep.vulns.length > 0),
-              () => `${advisory.name} fix selected.`,
-            )
-            setAdvisory(null)
+          onPrefs={setPrefs}
+          onSettings={setSettings}
+          onInventory={setInventory}
+          onAddFolder={() => setDialog({ kind: 'add-folder', back: 'settings' })}
+          onScanFolder={(folder) => run(false, [folder])}
+          onRemoveFolder={removeFolder}
+          onClose={(changed) => {
+            setDialog(null)
+            if (changed) run(false)
           }}
-          onClose={() => setAdvisory(null)}
         />
       )}
 
-      {bulk && inventory && (
-        <BulkUpdateDialog
-          title={bulk.title}
-          targets={bulk.targets}
+      {dialog?.kind === 'manage' && settings && (
+        <ManageProjects
+          settings={settings}
+          repos={repoList}
+          onOpen={(key) => {
+            setRepoScope(key)
+            setDialog(null)
+          }}
+          onScan={(paths) => run(false, paths)}
+          onAddFolder={() => setDialog({ kind: 'add-folder', back: 'manage' })}
+          onRemoveFolder={removeFolder}
+          onProjectSettings={(r) => setDialog({ kind: 'settings', repo: r })}
+          onExclude={(r) => setDialog({ kind: 'exclude', repo: r, back: 'manage' })}
+          onExcludeMany={excludeMany}
+          onInclude={include}
+          onReveal={(path) => api.reveal(path)}
+          onOpenInEditor={(path) => api.openInEditor(path)}
+          onClose={() => setDialog(null)}
+        />
+      )}
+
+      {dialog?.kind === 'add-folder' && (
+        <AddFolderDialog
+          onAdd={(path) => {
+            openBack(dialog.back)
+            watchFolder(path)
+          }}
+          onClose={() => openBack(dialog.back)}
+        />
+      )}
+
+      {dialog?.kind === 'exclude' && inventory && (
+        <ExcludeDialog
+          repo={dialog.repo}
           roots={inventory.roots}
+          onExclude={(kind, value, label) => {
+            openBack(dialog.back)
+            exclude(kind, value, label)
+          }}
+          onClose={() => openBack(dialog.back)}
+        />
+      )}
+
+      {dialog?.kind === 'advisory' && inventory && (
+        <AdvisoryDialog
+          row={dialog.row}
+          inventory={inventory}
+          allSelected={dialog.row.usages.filter((u) => u.dep.vulns.length > 0).every((u) => selected.has(u.key))}
+          onSelect={() => {
+            addAll(
+              dialog.row.usages.filter((u) => u.dep.vulns.length > 0),
+              () => `${dialog.row.name} fix selected.`,
+            )
+            setDialog(null)
+          }}
+          onClose={() => setDialog(null)}
+        />
+      )}
+
+      {dialog?.kind === 'update' && inventory && (
+        <UpdateFlow
+          targets={dialog.targets}
+          start={dialog.start}
+          roots={inventory.roots}
+          checks={prefs.checks}
+          commit={prefs.commit}
+          onOptions={setPrefs}
+          nameOf={nameOf}
           onClose={(refreshed) => {
-            setBulk(null)
+            setDialog(null)
             if (refreshed) setInventory(refreshed)
           }}
         />

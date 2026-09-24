@@ -1,4 +1,4 @@
-import { Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, ShieldAlert, SlidersHorizontal } from 'lucide-react'
+import { Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, type Repo } from '../derive'
 import type { Ecosystem } from '../types'
@@ -51,7 +51,9 @@ export function Rail({
   onRefreshAll,
   onReveal,
   onOpenInEditor,
-  onIgnoreRepo,
+  onExclude,
+  onProjectSettings,
+  onScanRepo,
   footer,
 }: {
   repos: Repo[]
@@ -66,7 +68,9 @@ export function Rail({
   onRefreshAll: () => void
   onReveal: (path: string) => void
   onOpenInEditor: (path: string) => void
-  onIgnoreRepo: (repo: Repo) => void
+  onExclude: (repo: Repo) => void
+  onProjectSettings: (repo: Repo) => void
+  onScanRepo: (repo: Repo) => void
   footer: ReactNode
 }) {
   const [manage, setManage] = useState<HTMLElement | null>(null)
@@ -221,9 +225,15 @@ export function Rail({
           <MenuItem icon={<Code2 size={15} />} onSelect={() => (setContext(null), onOpenInEditor(context.repo.key))}>
             Open in VS Code
           </MenuItem>
+          <MenuItem icon={<Settings2 size={15} />} onSelect={() => (setContext(null), onProjectSettings(context.repo))}>
+            Project settings…
+          </MenuItem>
+          <MenuItem icon={<RefreshCw size={15} />} onSelect={() => (setContext(null), onScanRepo(context.repo))}>
+            Check this project again
+          </MenuItem>
           <MenuSeparator />
-          <MenuItem icon={<EyeOff size={15} />} danger onSelect={() => (setContext(null), onIgnoreRepo(context.repo))}>
-            Exclude {context.repo.name}
+          <MenuItem icon={<EyeOff size={15} />} danger onSelect={() => (setContext(null), onExclude(context.repo))}>
+            Exclude…
           </MenuItem>
         </Menu>
       )}

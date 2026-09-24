@@ -13,6 +13,7 @@ export function Dialog({
   icon,
   tone,
   size = 'normal',
+  bare,
   busy,
   onClose,
   footer,
@@ -22,7 +23,9 @@ export function Dialog({
   description?: ReactNode
   icon?: ReactNode
   tone?: 'danger'
-  size?: 'normal' | 'wide'
+  size?: 'normal' | 'wide' | 'settings'
+  /** Children fill the dialog with their own header; `title` becomes its label. */
+  bare?: boolean
   busy?: boolean
   onClose: () => void
   footer?: ReactNode
@@ -42,7 +45,7 @@ export function Dialog({
     root?.setAttribute('inert', '')
     const dialog = ref.current
     const first = dialog?.querySelector<HTMLElement>('[autofocus], [data-autofocus]') ?? dialog?.querySelector<HTMLElement>('footer [data-primary]:not(:disabled)') ?? dialog?.querySelector<HTMLElement>('input, select, textarea, button:not([data-close])')
-    first?.focus()
+    if (!dialog?.contains(document.activeElement)) first?.focus()
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !busyRef.current) {
@@ -74,13 +77,18 @@ export function Dialog({
         ref={ref}
         role="dialog"
         aria-modal="true"
-        aria-labelledby={titleId}
-        aria-describedby={description ? descId : undefined}
+        aria-labelledby={bare ? undefined : titleId}
+        aria-label={bare && typeof title === 'string' ? title : undefined}
+        aria-describedby={description && !bare ? descId : undefined}
         className={cx(
           'flex max-h-[calc(100vh-56px)] w-full flex-col rounded-[4px] border border-line-strong bg-surface text-ink shadow-[var(--shadow)]',
-          size === 'wide' ? 'h-[min(620px,calc(100vh-56px))] max-w-[880px]' : 'max-w-[560px]',
+          size === 'wide' ? 'h-[min(620px,calc(100vh-56px))] max-w-[880px]' : size === 'settings' ? 'h-[min(640px,calc(100vh-56px))] max-w-[860px] overflow-hidden' : 'max-w-[560px]',
         )}
       >
+        {bare ? (
+          children
+        ) : (
+          <>
         <header className="flex items-start gap-3 px-5 pt-[18px] pb-3">
           {icon && <span className={cx('mt-[3px] shrink-0', tone === 'danger' ? 'text-risk-security' : 'text-accent-text')}>{icon}</span>}
           <div className="min-w-0 flex-1">
@@ -99,6 +107,8 @@ export function Dialog({
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-5 pt-1 pb-4">{children}</div>
         {footer && <footer className="flex items-center justify-end gap-2 border-t border-line px-5 py-3">{footer}</footer>}
+          </>
+        )}
       </section>
     </div>,
     document.body,

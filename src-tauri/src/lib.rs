@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mehen_core::batch::{self, BatchEvent, BatchOptions, JobOutcome};
+use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
 use mehen_core::store::StoreStats;
-use mehen_core::update::{self, Change, UpdateEvent, UpdateOutcome, UpdatePlan};
+use mehen_core::update::{self, Change, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
@@ -17,6 +17,10 @@ use tauri_plugin_notification::NotificationExt;
 const BACKGROUND_HOURS: &str = "background_hours";
 /// Setting key: how many update steps may run at once across repositories.
 const UPDATE_PARALLEL: &str = "update_parallel";
+/// Setting key: JSON map of scope to the commands that replace a project's
+/// build and test steps. A scope is a repository path, or `ecosystem:<name>`
+/// for the default of every project of that kind.
+const CHECK_COMMANDS: &str = "check_commands";
 /// How often the background loop wakes to see whether a check is due.
 const BACKGROUND_TICK: Duration = Duration::from_secs(10 * 60);
 
@@ -52,13 +56,18 @@ impl AppState {
         self.store.setting(UPDATE_PARALLEL).and_then(|v| v.parse().ok()).unwrap_or(batch::DEFAULT_PARALLEL).clamp(1, 8)
     }
 
+    fn check_commands(&self) -> BTreeMap<String, Vec<String>> {
+        self.store.setting(CHECK_COMMANDS).and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+    }
+
     fn background_hours(&self) -> u32 {
         self.store.setting(BACKGROUND_HOURS).and_then(|v| v.parse().ok()).unwrap_or(0)
     }
 }
 
 /// Scans the watched folders (minus ignored ones) and checks every package.
-async fn check_now(app: &AppHandle, refresh: bool) -> Result<Inventory, String> {
+/// With `only`, scans just those folders and folds the result into the last one.
+async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) -> Result<Inventory, String> {
     let state = app.state::<AppState>();
     let emit = |p: Progress| {
         let _ = app.emit("mehen://progress", p);
@@ -69,18 +78,31 @@ async fn check_now(app: &AppHandle, refresh: bool) -> Result<Inventory, String> 
         return Err("Add a folder to watch first".into());
     }
     let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
-    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&roots, &ignore)).await.map_err(err)?;
+    let previous = only.as_ref().and_then(|_| state.store.last_inventory());
+    let scan_roots: Vec<PathBuf> = match &only {
+        Some(folders) => folders.iter().map(PathBuf::from).collect(),
+        None => roots,
+    };
+    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&scan_roots, &ignore)).await.map_err(err)?;
     let options = if refresh { CheckOptions::refresh() } else { CheckOptions::default() };
-    Ok(mehen_core::check(inventory, &state.store, options, emit).await)
+    let checked = mehen_core::check(inventory, &state.store, options, emit).await;
+    match (only, previous) {
+        (Some(folders), Some(previous)) => {
+            let merged = previous.merge_partial(checked, &folders);
+            state.store.replace_last_inventory(&merged).map_err(err)?;
+            Ok(merged)
+        }
+        _ => Ok(checked),
+    }
 }
 
 /// Runs a check unless one is already going.
-async fn guarded_check(app: &AppHandle, refresh: bool) -> Result<Inventory, String> {
+async fn guarded_check(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) -> Result<Inventory, String> {
     let state = app.state::<AppState>();
     if state.checking.swap(true, Ordering::SeqCst) {
         return Err("A check is already running".into());
     }
-    let result = check_now(app, refresh).await;
+    let result = check_now(app, refresh, only).await;
     state.checking.store(false, Ordering::SeqCst);
     result
 }
@@ -90,7 +112,7 @@ async fn guarded_check(app: &AppHandle, refresh: bool) -> Result<Inventory, Stri
 /// since the previous result.
 async fn check_and_notify(app: &AppHandle) {
     let before: HashSet<String> = app.state::<AppState>().store.last_inventory().map(|i| i.vulnerabilities.into_iter().map(|v| v.id).collect()).unwrap_or_default();
-    let Ok(inventory) = guarded_check(app, false).await else { return };
+    let Ok(inventory) = guarded_check(app, false, None).await else { return };
     let _ = app.emit("mehen://inventory", &inventory);
 
     let new: Vec<_> = inventory.vulnerabilities.iter().filter(|v| !before.contains(&v.id)).collect();
@@ -250,9 +272,10 @@ fn last_inventory(state: State<'_, AppState>) -> Option<Inventory> {
 }
 
 /// With `refresh`, cached registry and vulnerability answers are ignored.
+/// With `only`, just those folders (repositories or watched folders) are checked.
 #[tauri::command]
-async fn scan_and_check(app: AppHandle, refresh: bool) -> Result<Inventory, String> {
-    guarded_check(&app, refresh).await
+async fn scan_and_check(app: AppHandle, refresh: bool, only: Option<Vec<String>>) -> Result<Inventory, String> {
+    guarded_check(&app, refresh, only).await
 }
 
 /// Works out exactly what an update would change, without writing anything.
@@ -260,36 +283,39 @@ async fn scan_and_check(app: AppHandle, refresh: bool) -> Result<Inventory, Stri
 fn plan_update(state: State<'_, AppState>, project_id: String, changes: Vec<Change>) -> Result<UpdatePlan, String> {
     let inventory = state.store.last_inventory().ok_or("Run a check first")?;
     let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
-    update::plan(project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplyResult {
-    outcome: UpdateOutcome,
-    /// A fresh check after a successful update (served from the cache).
-    inventory: Option<Inventory>,
-}
-
-/// Applies a reviewed plan, then (with `rescan`) re-checks so the results show
-/// the new versions. Batch updates pass `rescan: false` and check once at the end.
-#[tauri::command]
-async fn apply_update(
-    app: AppHandle,
-    plan: UpdatePlan,
-    verify: bool,
-    rescan: Option<bool>,
-    commit_message: Option<String>,
-) -> Result<ApplyResult, String> {
-    let outcome = update::apply(&plan, verify, commit_message.as_deref(), |e: UpdateEvent| {
-        let _ = app.emit("mehen://update", e);
-    })
-    .await;
-    if !outcome.ok || rescan == Some(false) {
-        return Ok(ApplyResult { outcome, inventory: None });
+    let mut plan = update::plan(project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))?;
+    let commands = state.check_commands();
+    let repo = project.repo.clone().unwrap_or_else(|| project.dir.clone());
+    if let Some(list) = commands.iter().find(|(scope, _)| scope.eq_ignore_ascii_case(&repo)).map(|(_, list)| list) {
+        update::use_check_commands(&mut plan, list, &repo);
+    } else if let Some(list) = commands.get(&format!("ecosystem:{}", project.ecosystem.key())) {
+        update::use_check_commands(&mut plan, list, &project.dir);
     }
-    let inventory = check_now(&app, false).await?;
-    Ok(ApplyResult { outcome, inventory: Some(inventory) })
+    Ok(plan)
+}
+
+/// Build and test commands the user set, by scope.
+#[tauri::command]
+fn check_commands(state: State<'_, AppState>) -> BTreeMap<String, Vec<String>> {
+    state.check_commands()
+}
+
+/// Sets (or with `None`, removes) the commands for a scope.
+#[tauri::command]
+fn set_check_commands(state: State<'_, AppState>, scope: String, commands: Option<Vec<String>>) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let mut all = state.check_commands();
+    all.retain(|k, _| !k.eq_ignore_ascii_case(&scope));
+    if let Some(list) = commands {
+        all.insert(scope, list.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect());
+    }
+    state.store.set_setting(CHECK_COMMANDS, &serde_json::to_string(&all).map_err(err)?).map_err(err)?;
+    Ok(all)
+}
+
+/// Commits already-applied updates, one commit per repository.
+#[tauri::command]
+fn commit_update(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
+    batch::commit(plans)
 }
 
 #[derive(Serialize)]
@@ -311,7 +337,7 @@ async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commi
         let _ = app.emit("mehen://batch", e);
     })
     .await;
-    let inventory = if outcomes.iter().any(|o| o.ok) { Some(check_now(&app, false).await?) } else { None };
+    let inventory = if outcomes.iter().any(|o| o.ok) { Some(check_now(&app, false, None).await?) } else { None };
     Ok(BatchResult { outcomes, inventory })
 }
 
@@ -377,8 +403,10 @@ pub fn run() {
             last_inventory,
             scan_and_check,
             plan_update,
-            apply_update,
             apply_batch,
+            check_commands,
+            set_check_commands,
+            commit_update,
             store_stats,
             clear_cache,
             open_in_editor

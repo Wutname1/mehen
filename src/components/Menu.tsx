@@ -60,7 +60,10 @@ export function Menu({
       else if (e.key === 'ArrowUp') items[(i - 1 + items.length) % items.length]?.focus()
       else if (e.key === 'Home') items[0]?.focus()
       else if (e.key === 'End') items.at(-1)?.focus()
-      else if (e.key === 'Escape') close(true)
+      else if (e.key === 'Escape') {
+        e.stopPropagation()
+        close(true)
+      }
       else if (e.key === 'Tab') close(false)
       else return
       if (e.key !== 'Tab') e.preventDefault()

@@ -98,6 +98,9 @@ pub struct UpdatePlan {
     /// have uncommitted changes that would be swept into the commit).
     #[serde(default)]
     pub commit_blocked: Option<String>,
+    /// The checked-out branch, where a commit would land.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +159,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         warnings: Vec::new(),
         repo: project.repo.clone(),
         commit_blocked: None,
+        branch: None,
     };
     // One edit covers every entry with the same name and spelling (e.g. the
     // package listed in both dependencies and devDependencies).
@@ -190,7 +194,30 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         None => Some("not inside a git repository".into()),
         Some(r) => dirty_files(r, &touched_paths(&plan)).map(|dirty| format!("uncommitted changes in {dirty}")),
     };
+    plan.branch = repo.as_deref().and_then(current_branch);
     Ok(plan)
+}
+
+/// The checked-out branch, or `detached HEAD`.
+fn current_branch(repo: &Path) -> Option<String> {
+    let out = git(repo).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    match (out.status.success(), name.as_str()) {
+        (false, _) | (true, "") => None,
+        (true, "HEAD") => Some("detached HEAD".into()),
+        (true, _) => Some(name),
+    }
+}
+
+/// Swaps the built-in build and test steps for the user's own commands, run
+/// in `cwd`. Each command is one program and its arguments, split on spaces.
+pub fn use_check_commands(plan: &mut UpdatePlan, commands: &[String], cwd: &str) {
+    plan.steps.retain(|s| !s.kind.is_check());
+    for command in commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+        let mut parts = command.split_whitespace();
+        let program = parts.next().unwrap_or_default().to_string();
+        plan.steps.push(Step { kind: StepKind::Test, label: command.to_string(), program, args: parts.map(str::to_string).collect(), cwd: cwd.to_string() });
+    }
 }
 
 /// Every file an update writes: the edits plus lockfiles the steps rewrite.
