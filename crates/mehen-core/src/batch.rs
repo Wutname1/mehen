@@ -513,4 +513,25 @@ mod tests {
         assert!(outcomes[0].error.as_deref().is_some_and(|e| e.contains("vitest")), "{:?}", outcomes[0].error);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "before");
     }
+
+    /// Runs real processes through the same launcher the app uses. Needs node
+    /// and git on PATH, so it only runs on request: cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn real_processes_take_turns_by_tool() {
+        let dir = temp("real");
+        let (a, b, c, d) = (dir.join("a"), dir.join("b"), dir.join("c"), dir.join("R&D"));
+        for x in [&a, &b, &c, &d] {
+            std::fs::create_dir_all(x).unwrap();
+        }
+        let sleep = |d: &Path| Step { kind: StepKind::Install, label: "node sleep".into(), program: "node".into(), args: vec!["-e".into(), "setTimeout(()=>{},800)".into()], cwd: d.display().to_string() };
+        let git = Step { kind: StepKind::Install, label: "git version".into(), program: "git".into(), args: vec!["--version".into()], cwd: c.display().to_string() };
+        // npm is a .cmd launcher on Windows, run from a folder whose name has a shell character.
+        let npm = Step { kind: StepKind::Install, label: "npm version".into(), program: "npm".into(), args: vec!["--version".into()], cwd: d.display().to_string() };
+        let plans = vec![plan(&a, "package.json", None, vec![sleep(&a)]), plan(&b, "package.json", None, vec![sleep(&b)]), plan(&c, "x.csproj", None, vec![git]), plan(&d, "y.csproj", None, vec![npm])];
+        let started = Instant::now();
+        let outcomes = run(plans, BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true }, |s| async move { update::run_step(&s).await }, |_| {}).await;
+        assert!(outcomes.iter().all(|o| o.ok), "{:?}", outcomes.iter().map(|o| &o.error).collect::<Vec<_>>());
+        assert!(started.elapsed() >= Duration::from_millis(1500), "the two node steps overlapped: {:?}", started.elapsed());
+    }
 }

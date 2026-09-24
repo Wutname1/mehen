@@ -706,18 +706,27 @@ pub(crate) fn tail(output: &str) -> String {
     lines[lines.len().saturating_sub(OUTPUT_TAIL_LINES)..].join("\n")
 }
 
+/// The full path of a program found on PATH. On Windows, npm, pnpm, yarn and
+/// bun are `.cmd` launchers; starting them by full path lets the standard
+/// library pass arguments through cmd safely, where wrapping everything in
+/// `cmd /C` would treat `&`, `>` or `|` in an argument or folder as shell syntax.
+fn resolve_program(program: &str) -> PathBuf {
+    let given = PathBuf::from(program);
+    if !cfg!(windows) || given.extension().is_some() || given.components().count() > 1 {
+        return given;
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let dirs = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    dirs.iter()
+        .flat_map(|dir| exts.split(';').filter(|e| !e.is_empty()).map(move |ext| dir.join(format!("{program}{}", ext.to_lowercase()))))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(given)
+}
+
 /// Runs one step and returns whether it succeeded plus the end of its output.
 pub async fn run_step(step: &Step) -> (bool, String) {
-    let mut cmd = if cfg!(windows) {
-        // npm, pnpm, yarn and bun are .cmd shims on Windows.
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(&step.program).args(&step.args);
-        c
-    } else {
-        let mut c = tokio::process::Command::new(&step.program);
-        c.args(&step.args);
-        c
-    };
+    let mut cmd = tokio::process::Command::new(resolve_program(&step.program));
+    cmd.args(&step.args);
     cmd.current_dir(&step.cwd).kill_on_drop(true).stdin(std::process::Stdio::null());
     if step.kind == StepKind::Test {
         // Test runners that watch for changes by default run once under CI.
@@ -978,8 +987,8 @@ mod tests {
         plan.steps = vec![Step {
             kind: StepKind::Install,
             label: "fail".into(),
-            program: if cfg!(windows) { "echo broken> package-lock.json && exit 1".into() } else { "sh".into() },
-            args: if cfg!(windows) { vec![] } else { vec!["-c".into(), "echo broken > package-lock.json; exit 1".into()] },
+            program: if cfg!(windows) { "cmd".into() } else { "sh".into() },
+            args: if cfg!(windows) { vec!["/C".into(), "echo broken> package-lock.json && exit 1".into()] } else { vec!["-c".into(), "echo broken > package-lock.json; exit 1".into()] },
             cwd: dir.display().to_string(),
         }];
         let outcome = apply(&plan, true, None, |_| {}).await;
