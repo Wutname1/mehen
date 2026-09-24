@@ -330,6 +330,42 @@ const mock = (() => {
       const runJob = async ([job, list]: [string, UpdatePlan[]]): Promise<JobOutcome> => {
         const projects = list.map((p) => p.projectId)
         const results: StepResult[] = []
+        const major = (a: string, b: string) => a.replace(/^\D+/, '').split('.')[0] !== b.replace(/^\D+/, '').split('.')[0]
+        const clash = list.flatMap((p) => p.changes).find((c) => /eslint/.test(c.name) && major(c.from, c.to))
+        if (clash) {
+          const line = clash.from.replace(/^\D+/, '').split('.')[0]
+          const range = `^${line}.0.0`
+          emit({ job, projects, state: 'running', label: 'npm install', lane: 'npm' })
+          await new Promise((r) => setTimeout(r, 900))
+          emit({ job, projects, state: 'rolled-back', label: 'npm install failed', lane: null })
+          const output = `npm error code ERESOLVE
+npm error ERESOLVE unable to resolve dependency tree
+npm error
+npm error Found: ${clash.name}@${clash.to}
+npm error
+npm error Could not resolve dependency:
+npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
+          return {
+            job,
+            name: job.split(/[\\/]/).pop() ?? job,
+            repo: list[0].repo,
+            projects,
+            ok: false,
+            rolledBack: true,
+            error: '`npm install` failed',
+            steps: [{ label: 'npm install', kind: 'install', ok: false, output, ms: 900 }],
+            committed: null,
+            commitError: null,
+            commitSkipped: null,
+            conflicts: [
+              {
+                summary: `eslint-plugin-react-hooks 5.2.0 needs ${clash.name} ${range}, not ${clash.to}`,
+                keep: { ecosystem: 'npm', name: clash.name, line, from: clash.from, to: clash.to },
+                blocking: true,
+              },
+            ],
+          }
+        }
         for (const step of list.flatMap((p) => p.steps).filter((s) => checks || s.kind === 'install')) {
           const previous = lanes.get(step.program) ?? Promise.resolve()
           let release = () => {}
@@ -343,7 +379,7 @@ const mock = (() => {
         }
         emit({ job, projects, state: 'done', label: null, lane: null })
         const repo = list[0].repo
-        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null }
+        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null, conflicts: [] }
       }
       for (const [job, list] of jobs) emit({ job, projects: list.map((p) => p.projectId), state: 'queued', label: null, lane: null })
       const outcomes = await Promise.all([...jobs].map(runJob))

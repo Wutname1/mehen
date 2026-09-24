@@ -207,6 +207,17 @@ export interface JobOutcome {
   commitError: string | null
   /** Why no commit was attempted although one was asked for. */
   commitSkipped: string | null
+  /** Dependency conflicts the package managers reported along the way. */
+  conflicts: Conflict[]
+}
+
+export interface Conflict {
+  /** One sentence: "eslint-plugin-react-hooks 5.2.0 needs eslint ^8.57.0 || ^9.0.0, not 10.0.1". */
+  summary: string
+  /** The updated package to keep back, when the conflict points at one. */
+  keep: { ecosystem: Ecosystem; name: string; line: string; from: string; to: string } | null
+  /** The step failed over it; otherwise the install only warned. */
+  blocking: boolean
 }
 
 export interface BatchResult {

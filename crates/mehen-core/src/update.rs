@@ -740,7 +740,7 @@ pub async fn run_step(step: &Step) -> (bool, String) {
         Ok(Err(e)) => (false, format!("Could not start `{}`: {e}", step.program)),
         Ok(Ok(out)) => {
             let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            (out.status.success(), tail(&text))
+            (out.status.success(), text)
         }
     }
 }
@@ -795,6 +795,7 @@ pub async fn apply(plan: &UpdatePlan, run_verify: bool, commit_message: Option<&
         on_event(UpdateEvent { index, label: step.label.clone(), state: "running".into() });
         let started = Instant::now();
         let (ok, output) = run_step(step).await;
+        let output = tail(&output);
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output, ms: started.elapsed().as_millis() as u64 });
         on_event(UpdateEvent { index, label: step.label.clone(), state: if ok { "ok" } else { "failed" }.into() });
         if !ok {

@@ -13,7 +13,8 @@ use futures::future::join_all;
 use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::update::{self, Step, StepKind, StepResult, UpdatePlan};
+use crate::diagnose::{self, Conflict};
+use crate::update::{self, PlannedChange, Step, StepKind, StepResult, UpdatePlan};
 
 /// How many steps may run at once when the user leaves it on automatic:
 /// a quarter of the CPU threads, between 1 and 4.
@@ -78,6 +79,8 @@ pub struct JobOutcome {
     pub commit_error: Option<String>,
     /// Why no commit was attempted although one was asked for.
     pub commit_skipped: Option<String>,
+    /// Dependency conflicts the package managers reported along the way.
+    pub conflicts: Vec<Conflict>,
 }
 
 /// One repository's share of the batch.
@@ -244,6 +247,7 @@ where
         committed: None,
         commit_error: None,
         commit_skipped: None,
+        conflicts: Vec::new(),
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -305,7 +309,15 @@ where
         on_event(job.event(JobState::Running, Some(step.label.clone()), Some(lane.clone())));
         let started = Instant::now();
         let (ok, output) = run_step(step.clone()).await;
-        outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output, ms: started.elapsed().as_millis() as u64 });
+        if let Some(ecosystem) = diagnose::ecosystem_of(&step.program) {
+            let changes: Vec<PlannedChange> = job.plans.iter().filter(|p| p.ecosystem == ecosystem).flat_map(|p| p.changes.clone()).collect();
+            for conflict in diagnose::diagnose(&output, ok, ecosystem, &changes) {
+                if !outcome.conflicts.contains(&conflict) {
+                    outcome.conflicts.push(conflict);
+                }
+            }
+        }
+        outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output: update::tail(&output), ms: started.elapsed().as_millis() as u64 });
         if !ok {
             if step.kind.is_check() && !options.stop_on_failure {
                 failed_checks.push(step.label.clone());
@@ -430,6 +442,21 @@ mod tests {
                 assert!(!overlaps(x, y), "a limit of 1 still ran steps together");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_install_names_the_package_to_keep() {
+        let dir = temp("conflict");
+        let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)])];
+        let output = "npm error Could not resolve dependency:
+npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
+        let opts = BatchOptions { checks: false, commit: false, parallel: 1, stop_on_failure: true };
+        let outcomes = run(plans, opts, |_| async move { (false, output.to_string()) }, |_| {}).await;
+        let conflicts = &outcomes[0].conflicts;
+        assert!(outcomes[0].rolled_back);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].summary, "some-plugin 3.0.0 needs package.json-dep ^1.0.0, not 2.0.0");
+        assert_eq!(conflicts[0].keep.as_ref().map(|k| (k.name.as_str(), k.line.as_str())), Some(("package.json-dep", "1")));
     }
 
     #[tokio::test]

@@ -65,6 +65,8 @@ export default function App() {
   const [icons, setIcons] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLInputElement>(null)
   const scannedOnOpen = useRef(false)
+  /** Repositories whose holds changed during an update, checked again once it closes. */
+  const keptDuringUpdate = useRef<Set<string>>(new Set())
 
   const run = useCallback(async (refresh: boolean, only: string[] | null = null) => {
     setRunning(true)
@@ -657,9 +659,16 @@ export default function App() {
           onOptions={setPrefs}
           nameOf={nameOf}
           icons={icons}
+          onKeep={async (k, scope) => {
+            setHolds(await api.setHold(k.ecosystem, k.name, scope, k.line))
+            keptDuringUpdate.current.add(scope)
+          }}
           onClose={(refreshed) => {
             setDialog(null)
             if (refreshed) setInventory(refreshed)
+            const scopes = [...keptDuringUpdate.current]
+            keptDuringUpdate.current.clear()
+            if (scopes.length) run(false, scopes)
           }}
         />
       )}

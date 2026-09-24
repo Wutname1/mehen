@@ -1,8 +1,8 @@
-import { AlertTriangle, Box, Check, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
+import { AlertTriangle, Box, Check, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { folderName, relativePath } from '../derive'
-import type { BatchEvent, Change, CommitOutcome, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
+import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { Checkbox } from './Queue'
@@ -139,6 +139,7 @@ export function UpdateFlow({
   onOptions,
   nameOf,
   icons,
+  onKeep,
   onClose,
 }: {
   targets: UpdateTarget[]
@@ -150,8 +151,12 @@ export function UpdateFlow({
   onOptions: (patch: { checks?: boolean; commit?: boolean }) => void
   nameOf: (key: string) => string
   icons: Record<string, string>
+  /** Keeps a package on its line in `scope` (a repository) from now on. */
+  onKeep: (keep: NonNullable<Conflict['keep']>, scope: string) => Promise<void>
   onClose: (refreshed: Inventory | null) => void
 }) {
+  const [current, setCurrent] = useState(targets)
+  const [kept, setKept] = useState<Set<string>>(new Set())
   iconsByKey = icons
   const [stage, setStage] = useState<Stage>('planning')
   const [plans, setPlans] = useState<UpdatePlan[]>([])
@@ -167,7 +172,7 @@ export function UpdateFlow({
   useEffect(() => {
     let cancelled = false
     Promise.all(
-      targets.map((t) =>
+      current.map((t) =>
         api.planUpdate(t.project.id, t.changes).then(
           (plan) => (plan.edits.length || plan.steps.length ? { plan } : { error: 'Nothing to change', project: t.project }),
           (e) => ({ error: String(e), project: t.project }),
@@ -182,7 +187,7 @@ export function UpdateFlow({
     return () => {
       cancelled = true
     }
-  }, [targets, start])
+  }, [current, start])
 
   useEffect(() => {
     const unlisten = api.onBatchEvent((e: BatchEvent) => {
@@ -213,6 +218,29 @@ export function UpdateFlow({
       setError(String(e))
     }
     setStage('done')
+  }
+
+  /** Plans the repository again without `names`, keeping the rest of its updates. */
+  const retry = (job: Job, names: string[]) => {
+    const ids = new Set(job.plans.map((p) => p.projectId.toLowerCase()))
+    const next = current
+      .filter((t) => ids.has(t.project.id.toLowerCase()))
+      .map((t) => ({ ...t, changes: t.changes.filter((c) => !names.includes(c.name)) }))
+      .filter((t) => t.changes.length > 0)
+    setOutcomes([])
+    setCommits([])
+    setLive({})
+    setStage('planning')
+    setCurrent(next)
+  }
+
+  const keep = async (k: NonNullable<Conflict['keep']>, scope: string) => {
+    try {
+      await onKeep(k, scope)
+      setKept((prev) => new Set([...prev, `${scope.toLowerCase()}|${k.name}`]))
+    } catch (e) {
+      setError(String(e))
+    }
   }
 
   const outcomeOf = (job: Job) => outcomes.find((o) => o.projects.some((id) => job.plans.some((p) => p.projectId === id)))
@@ -516,7 +544,9 @@ export function UpdateFlow({
   return (
     <Dialog
       title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : 'Update finished'}
-      description={anyCommitted ? 'Each committed project has a new local commit. Nothing was pushed.' : 'Changed files are ready to commit. Nothing has been committed yet.'}
+      description={
+        anyCommitted ? 'Each committed project has a new local commit. Nothing was pushed.' : passed.length ? 'Changed files are ready to commit. Nothing has been committed yet.' : 'Nothing on disk was changed.'
+      }
       icon={broke.length || error ? <AlertTriangle size={22} /> : <ShieldCheck size={22} />}
       tone={broke.length || error ? 'danger' : undefined}
       size="wide"
@@ -551,7 +581,7 @@ export function UpdateFlow({
             </b>
             <span className="text-[12.5px] text-muted">
               {broke.length
-                ? `${broke.map((j) => j.name).join(', ')} failed ${broke.length === 1 ? 'its' : 'their'} checks and ${broke.length === 1 ? 'was' : 'were'} restored.`
+                ? `${broke.map((j) => j.name).join(', ')} could not be updated and ${broke.length === 1 ? 'was' : 'were'} put back as ${broke.length === 1 ? 'it was' : 'they were'}.`
                 : ran.checks
                   ? 'Every build and test passed.'
                   : 'Checks were skipped. Run your tests or let CI check before merging.'}
@@ -567,6 +597,11 @@ export function UpdateFlow({
         const why = o.commitError ?? c?.error ?? (ran.commit ? o.commitSkipped : null)
         const changes = changesOf(job)
         const failing = o.steps.filter((s) => !s.ok)
+        const blocking = o.conflicts.filter((x) => x.blocking)
+        const warned = o.conflicts.filter((x) => !x.blocking)
+        const culprits = [...new Set(blocking.flatMap((x) => (x.keep ? [x.keep.name] : [])))]
+        const rest = changes.filter((ch) => !culprits.includes(ch.name)).length
+        const log = [o.error, ...failing.map((s) => s.output)].filter(Boolean).join('\n\n')
         return (
           <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-start gap-2.5 border-b border-line py-2.5">
             <Avatar name={job.name} repo={job.key} />
@@ -577,12 +612,59 @@ export function UpdateFlow({
                   {changes.map((ch) => `${ch.name} ${ch.to}`).join(', ')}
                   {hash && ` · committed ${hash}${job.branch ? ` on ${job.branch}` : ''}`}
                   {why && <span className="text-risk-review"> · not committed: {why}</span>}
+                  {warned.length > 0 && (
+                    <span className="mt-0.5 flex items-start gap-1.5 text-risk-review" title={warned.map((x) => x.summary).join('\n')}>
+                      <AlertTriangle size={13} className="mt-px shrink-0" />
+                      {warned[0].summary}.{warned.length > 1 && ` (+${warned.length - 1} more)`}
+                    </span>
+                  )}
                 </small>
+              ) : blocking.length ? (
+                <>
+                  <small className="text-[12px] text-risk-security">
+                    Files restored. {blocking.length === 1 ? 'A package the project uses' : 'Packages the project uses'} would not work with this update:
+                  </small>
+                  <ul className="m-0 mt-1 grid list-none gap-1.5 p-0">
+                    {blocking.map((x) => {
+                      const done = x.keep && kept.has(`${job.key.toLowerCase()}|${x.keep.name}`)
+                      return (
+                        <li key={x.summary} className="flex items-center gap-2 text-[12.5px]">
+                          <AlertTriangle size={14} className="shrink-0 text-risk-review" />
+                          <span className="min-w-0 flex-1">{x.summary}.</span>
+                          {x.keep &&
+                            (done ? (
+                              <span className="inline-flex items-center gap-1 text-[12px] whitespace-nowrap text-state">
+                                <Pin size={13} />
+                                Kept on {x.keep.line}.x
+                              </span>
+                            ) : (
+                              <Button onClick={() => keep(x.keep!, job.key)} title={`Stop offering ${x.keep.name} updates past ${x.keep.line}.x in ${job.name}. You can change this in Settings.`}>
+                                <Pin size={14} />
+                                Keep {x.keep.name} on {x.keep.line}.x
+                              </Button>
+                            ))}
+                        </li>
+                      )
+                    })}
+                  </ul>
+                  {culprits.length > 0 && rest > 0 && (
+                    <div className="mt-1.5">
+                      <Button onClick={() => retry(job, culprits)}>
+                        <RotateCcw size={14} />
+                        Try again without {culprits.join(', ')}
+                      </Button>
+                    </div>
+                  )}
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-[12px] text-muted hover:text-ink">Show output</summary>
+                    <pre className="mt-1 max-h-60 overflow-auto rounded-[3px] bg-sunken px-2.5 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-ink">{log}</pre>
+                  </details>
+                </>
               ) : (
                 <>
                   <small className="text-[12px] text-risk-security">{o.rolledBack ? 'Files restored. The updates are still selected so you can try again.' : o.error}</small>
                   <pre className="mt-1 max-h-60 overflow-auto rounded-[3px] bg-sunken px-2.5 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-ink">
-                    {[o.error, ...failing.map((s) => s.output)].filter(Boolean).join('\n\n')}
+                    {log}
                   </pre>
                 </>
               )}
