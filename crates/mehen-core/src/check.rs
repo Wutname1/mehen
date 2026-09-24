@@ -516,13 +516,27 @@ fn fix_target(current: Option<&str>, latest: Option<&str>, versions: &[String], 
     safe.into_iter().filter(|(v, _)| line(v) == lowest).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, s)| s.clone())
 }
 
+/// An advisory bound in its ecosystem's own spelling. PyPI writes
+/// pre-releases as `5.0a1` or `2.1rc1`: those read as the release they lead
+/// up to, marked pre-release so they sort just before it (`1.0.post1` sorts
+/// with its release).
+fn bound(s: &str) -> Option<Version> {
+    Version::parse(s).or_else(|| {
+        let release: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let release = release.trim_end_matches('.');
+        let mut v = Version::parse(release)?;
+        v.prerelease = !s[release.len()..].trim_start_matches('.').starts_with("post");
+        Some(v)
+    })
+}
+
 /// Whether an advisory range includes `v`. An unreadable bound counts as
 /// covered, so a doubtful version is never offered as the fix.
 fn covers(range: &AffectedRange, v: &Version) -> bool {
-    let started = range.introduced.as_deref().is_none_or(|i| Version::parse(i).is_none_or(|i| *v >= i));
+    let started = range.introduced.as_deref().is_none_or(|i| bound(i).is_none_or(|i| *v >= i));
     let not_ended = match (range.fixed.as_deref(), range.last_affected.as_deref()) {
-        (Some(fixed), _) => Version::parse(fixed).is_none_or(|f| *v < f),
-        (None, Some(last)) => Version::parse(last).is_none_or(|l| *v <= l),
+        (Some(fixed), _) => bound(fixed).is_none_or(|f| *v < f),
+        (None, Some(last)) => bound(last).is_none_or(|l| *v <= l),
         (None, None) => true,
     };
     started && not_ended
@@ -632,6 +646,10 @@ mod tests {
         let unfixed = AffectedRange::default();
         let with_unfixed: Vec<&AffectedRange> = ranges.iter().copied().chain([&unfixed]).collect();
         assert_eq!(fix_target(Some("12.0.1"), Some("16.2.0"), &versions, &with_unfixed).as_deref(), Some("15.1.3"), "an advisory nothing fixes is set aside");
+        let pre = AffectedRange { introduced: Some("16.0a1".into()), fixed: Some("16.1.1".into()), last_affected: None };
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert!(!covers(&pre, &v("15.1.3")), "a pre-release start is not every version");
+        assert!(covers(&pre, &v("16.0.0")) && !covers(&pre, &v("16.1.1")));
     }
 
     #[test]

@@ -64,6 +64,8 @@ export function AdvisoryDialog({
   const unfixed = new Set(vulns.filter((v) => rangesOf(v).some((r) => !r.fixed && !r.lastAffected)).map((v) => v.id))
   const fixable = vulns.length - unfixed.size
   const them = fixable === 1 ? 'it' : 'them'
+  // Advisories the usual target still falls inside: only fixed further on than this update goes.
+  const beyond = vulns.filter((v) => !unfixed.has(v.id) && newest.some((t) => rangesOf(v).some((r) => covers(r, t)))).length
   const noFix = unfixed.size ? ` ${unfixed.size === vulns.length ? (unfixed.size === 1 ? 'It has' : 'They have') : `${unfixed.size} ${unfixed.size === 1 ? 'has' : 'have'}`} no fix yet.` : ''
 
   const option = (value: Pick, versions: string[], detail: string) => (
@@ -84,7 +86,7 @@ export function AdvisoryDialog({
   return (
     <Dialog
       title={`${row.name} advisories`}
-      description={`You have ${installed.join(', ')} in ${projects} project${projects === 1 ? '' : 's'}.${hasChoice || !fixable ? '' : ` Updating to ${newest.at(-1)} fixes ${unfixed.size ? `${fixable} of them` : them}.`}${noFix}`}
+      description={`You have ${installed.join(', ')} in ${projects} project${projects === 1 ? '' : 's'}.${hasChoice || !fixable ? '' : beyond === fixable ? ` Updating to ${newest.at(-1)} does not fix ${them}: ${fixable === 1 ? 'the fix is' : 'the fixes are'} in newer versions than this update goes to.` : ` Updating to ${newest.at(-1)} fixes ${unfixed.size || beyond ? `${fixable - beyond} of them` : them}.${beyond ? ` ${beyond} more ${beyond === 1 ? 'is' : 'are'} only fixed in newer versions than this update goes to.` : ''}`}${noFix}`}
       icon={<ShieldAlert size={22} />}
       tone="danger"
       onClose={onClose}
