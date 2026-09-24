@@ -391,10 +391,15 @@ fn proxy_from_env() -> Option<String> {
 fn fake_download(tx: mpsc::Sender<DownloadMsg>) {
     let total: u64 = 25_000_000;
     let steps = 100;
+    let fail = std::env::args().any(|a| a == "--fail");
     for i in 0..=steps {
         let downloaded = total * i / steps;
         let _ = tx.send(DownloadMsg::Progress(downloaded, total));
         thread::sleep(std::time::Duration::from_millis(100));
+        if fail && i == 40 {
+            let _ = tx.send(DownloadMsg::Error("Could not download Mehen: the connection was reset.".into()));
+            return;
+        }
     }
     thread::sleep(std::time::Duration::from_millis(500));
     let _ = tx.send(DownloadMsg::Done(PathBuf::from("C:\\fake\\Mehen-Setup.exe")));

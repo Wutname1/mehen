@@ -105,24 +105,34 @@ jobs:
       # under a key no later run can reproduce.
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: |
-            . -> target
-            src-tauri/bootstrapper -> target
+          workspaces: . -> target
 
       - name: Install frontend dependencies
         run: npm ci
 
-      # The setup program, bundled into the app as well. Run with --updating it
+      # The setup program, bundled into the app as well: run with --updating it
       # draws the "Updating Mehen" window over the gap between the old app
-      # exiting and the new one starting. Built here rather than downloaded when
-      # an update runs, because that is exactly when a download is least
-      # welcome. See spawn_update_cover in src-tauri/src/self_update.rs.
-      - name: Build the update cover helper
+      # exiting and the new one starting. See spawn_update_cover in
+      # src-tauri/src/self_update.rs.
+      #
+      # Taken from the CDN rather than compiled here, so every release carries
+      # the exact file the download button serves. It only changes when the
+      # Build Setup workflow publishes a new one.
+      - name: Fetch the published setup program
         shell: bash
         run: |
-          cargo build --release --manifest-path src-tauri/bootstrapper/Cargo.toml
+          set -euo pipefail
           mkdir -p src-tauri/resources
-          cp src-tauri/bootstrapper/target/release/mehen-setup.exe src-tauri/resources/mehen-setup.exe
+          if ! curl -fsSL -o src-tauri/resources/mehen-setup.exe https://cdn.gitwyrm.com/mehen/Mehen-Setup.exe; then
+            echo "::error::cdn.gitwyrm.com/mehen/Mehen-Setup.exe is not published. Run the Build Setup workflow first."
+            exit 1
+          fi
+          size=$(stat -c %s src-tauri/resources/mehen-setup.exe)
+          if [ "$size" -lt 500000 ]; then
+            echo "::error::The published setup program is only $size bytes; refusing to bundle it."
+            exit 1
+          fi
+          echo "Bundling the published setup program ($size bytes)"
 
       - name: Build and release (installer + updater manifest)
         uses: tauri-apps/tauri-action@v1

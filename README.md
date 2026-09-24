@@ -135,7 +135,7 @@ cargo run -p mehen-core --example survey -- C:\code --json public/dev-inventory.
 Push a version tag (`git tag 0.2.0 && git push origin 0.2.0`). `.github/workflows/release.yml` then:
 
 1. Refuses a tag that is not ahead of the latest release.
-2. Builds the Windows installer and the update-cover helper, signs the installer for the updater, and attaches it to a draft GitHub release, plus a fixed-name `Mehen-Setup.exe`.
+2. Builds the Windows installer, signs it for the updater, and attaches it to a draft GitHub release, plus a fixed-name `Mehen-Setup.exe`. The setup program bundled inside (for the "Updating Mehen" window) is downloaded from the CDN, not rebuilt, so the manual `Build Setup` workflow must have published it before the first release.
 3. Turns commit subjects since the previous tag into release notes (`new:`, `fixes:`, `improved:` prefixes), stores them on gitwyrm.com under the product `Mehen`, and uses the same notes for the release page.
 4. Publishes the release, checks every updater download link, and only then writes `https://cdn.gitwyrm.com/mehen/updates/stable.json`, the manifest Mehen checks for new versions.
 
@@ -149,6 +149,16 @@ What lives where:
 | `github.com/Wutname1/mehen/releases` | Every installer, kept per version. |
 
 Repository secrets the workflows need: `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the updater key; its public half is in `tauri.conf.json`), `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, and `CHANGELOG_API_KEY`.
+
+The setup program (`src-tauri/bootstrapper`) is its own small Rust program, built separately from the app. To see it without installing anything:
+
+| Script | Shows |
+|---|---|
+| `npm run bootstrapper:dev` | The install window, with a pretend download |
+| `npm run bootstrapper:dev:error` | The install window failing partway |
+| `npm run bootstrapper:updater:dev` | The "Updating Mehen" card, walking through both steps |
+| `npm run bootstrapper:updater:dev:error` | The card's error state |
+| `npm run bootstrapper:build` | Just builds it, to `src-tauri/bootstrapper/target/release/mehen-setup.exe` |
 
 A local `npm run tauri build` needs `TAURI_SIGNING_PRIVATE_KEY` set too, because the bundle includes updater signatures.
 
