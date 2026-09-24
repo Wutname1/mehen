@@ -10,10 +10,11 @@ const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: '
 
 export type RailSort = 'az' | 'za' | 'updates'
 
-const SORTS: { id: RailSort; label: string; Icon: typeof ArrowDownAZ }[] = [
-  { id: 'az', label: 'Name, A to Z', Icon: ArrowDownAZ },
-  { id: 'za', label: 'Name, Z to A', Icon: ArrowDownZA },
-  { id: 'updates', label: 'Most updates first, vulnerable projects on top', Icon: ArrowDownWideNarrow },
+/** One button cycles through these, in order. */
+const SORTS: { id: RailSort; short: string; label: string; Icon: typeof ArrowDownAZ }[] = [
+  { id: 'az', short: 'A to Z', label: 'name, A to Z', Icon: ArrowDownAZ },
+  { id: 'za', short: 'Z to A', label: 'name, Z to A', Icon: ArrowDownZA },
+  { id: 'updates', short: 'Updates', label: 'most updates first, vulnerable on top', Icon: ArrowDownWideNarrow },
 ]
 
 const byName = (a: Repo, b: Repo) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
@@ -172,27 +173,26 @@ export function Rail({
       )}
 
       <div className="mx-3 mb-2 flex items-center justify-between">
-        <span className="font-mono text-[11px] tracking-[0.04em] text-rail-muted uppercase" id="rail-sort-label">
+        <span className="font-mono text-[11px] tracking-[0.04em] text-rail-muted uppercase">
           Sort
         </span>
-        <div role="group" aria-labelledby="rail-sort-label" className="flex gap-px rounded-[3px] border border-rail-border p-[2px]">
-          {SORTS.map(({ id, label, Icon }) => (
+        {(() => {
+          const i = Math.max(0, SORTS.findIndex((x) => x.id === sort))
+          const { short, label, Icon } = SORTS[i]
+          const next = SORTS[(i + 1) % SORTS.length]
+          return (
             <button
-              key={id}
               type="button"
-              onClick={() => onSort(id)}
-              aria-pressed={sort === id}
-              aria-label={label}
-              title={label}
-              className={cx(
-                'grid h-6 w-7 place-items-center rounded-[2px]',
-                sort === id ? 'bg-rail-active text-rail-ink shadow-[inset_0_0_0_1px_var(--rail-active-line)]' : 'text-rail-muted hover:bg-rail-hover hover:text-rail-ink',
-              )}
+              onClick={() => onSort(next.id)}
+              aria-label={`Sorted by ${label}. Change to ${next.label}`}
+              title={`Sorted by ${label}. Click for ${next.label}.`}
+              className="inline-flex h-7 items-center gap-1.5 rounded-[3px] border border-rail-border px-2 text-[12px] text-rail-ink-2 hover:border-rail-border-strong hover:bg-rail-hover hover:text-rail-ink"
             >
               <Icon size={15} />
+              {short}
             </button>
-          ))}
-        </div>
+          )
+        })()}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-2">
