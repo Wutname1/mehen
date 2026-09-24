@@ -202,3 +202,131 @@ export function isWithin(path: string, folder: string): boolean {
 export function samePath(a: string, b: string): boolean {
   return normalizePath(a) === normalizePath(b)
 }
+
+/** The repository, or outside git the project folder: one rail entry and one update job. */
+export const repoKey = (p: Project) => p.repo ?? p.dir
+
+export const folderName = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
+
+export type Risk = 'security' | 'major' | 'minor' | 'patch'
+
+export const RISK_ORDER: Risk[] = ['security', 'major', 'minor', 'patch']
+
+export interface QueueUsage {
+  key: string
+  project: Project
+  dep: Dependency
+  /** The version this project would move to: the newest it can use. */
+  target: string
+}
+
+/** One package that has an update somewhere, with every usage that can take it. */
+export interface QueueRow {
+  key: string
+  name: string
+  ecosystem: Ecosystem
+  usages: QueueUsage[]
+  risk: Risk
+  vulnIds: string[]
+}
+
+export const usageKey = (project: Project, dep: Dependency) => `${project.id}|${dep.name}|${dep.requested}`
+
+/** Where a dependency can move to, or null when there is nothing to do. */
+export function updateTarget(dep: Dependency): string | null {
+  if (!canRetarget(dep) || !dep.latest || !isOutdated(dep.status)) return null
+  return dep.latest
+}
+
+export function riskOf(usages: { dep: Dependency }[]): Risk {
+  if (usages.some((u) => u.dep.vulns.length > 0)) return 'security'
+  const worst = worstStatus(usages.map((u) => u.dep.status))
+  return worst === 'major' || worst === 'minor' ? worst : 'patch'
+}
+
+export function queueRows(inventory: Inventory): QueueRow[] {
+  const rows = new Map<string, QueueRow>()
+  for (const project of inventory.projects) {
+    for (const dep of project.dependencies) {
+      const target = updateTarget(dep)
+      if (!target) continue
+      const key = `${dep.ecosystem}:${dep.name}`
+      const row = rows.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, usages: [], risk: 'patch', vulnIds: [] }
+      row.usages.push({ key: usageKey(project, dep), project, dep, target })
+      for (const id of dep.vulns) if (!row.vulnIds.includes(id)) row.vulnIds.push(id)
+      rows.set(key, row)
+    }
+  }
+  for (const row of rows.values()) row.risk = riskOf(row.usages)
+  return [...rows.values()]
+}
+
+/** Versions in a list, lowest first, without repeats. */
+export function distinctVersions(versions: string[]): string[] {
+  return [...new Set(versions)].sort(compareVersions)
+}
+
+export interface Repo {
+  key: string
+  name: string
+  /** The watched folder it was found in. */
+  root: string | null
+  projects: Project[]
+  ecosystems: Ecosystem[]
+  /** Packages with an update available. */
+  updates: number
+  /** Packages with a known vulnerability. */
+  vulnerable: number
+  dependencies: number
+}
+
+export function repos(inventory: Inventory, rows: QueueRow[]): Repo[] {
+  const map = new Map<string, Repo>()
+  for (const project of inventory.projects) {
+    const key = repoKey(project)
+    const id = key.toLowerCase()
+    const repo = map.get(id) ?? {
+      key,
+      name: folderName(key),
+      root: inventory.roots.find((r) => isWithin(key, r)) ?? null,
+      projects: [],
+      ecosystems: [],
+      updates: 0,
+      vulnerable: 0,
+      dependencies: 0,
+    }
+    repo.projects.push(project)
+    if (!repo.ecosystems.includes(project.ecosystem)) repo.ecosystems.push(project.ecosystem)
+    repo.dependencies += project.dependencies.length
+    map.set(id, repo)
+  }
+  for (const row of rows) {
+    const touched = new Set(row.usages.map((u) => repoKey(u.project).toLowerCase()))
+    for (const id of touched) {
+      const repo = map.get(id)
+      if (!repo) continue
+      repo.updates++
+      if (row.vulnIds.length && row.usages.some((u) => u.dep.vulns.length > 0 && repoKey(u.project).toLowerCase() === id)) repo.vulnerable++
+    }
+  }
+  for (const repo of map.values()) repo.ecosystems.sort((a, b) => ECOSYSTEMS.indexOf(a) - ECOSYSTEMS.indexOf(b))
+  // Folders with the same name in different places get their parent folder too.
+  const counts = new Map<string, number>()
+  for (const repo of map.values()) counts.set(repo.name.toLowerCase(), (counts.get(repo.name.toLowerCase()) ?? 0) + 1)
+  for (const repo of map.values()) {
+    if ((counts.get(repo.name.toLowerCase()) ?? 0) > 1) repo.name = `${folderName(repo.key.replace(/[\\/][^\\/]*$/, ''))}/${repo.name}`
+  }
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+}
+
+export type ProjectType = 'web' | 'rust' | 'dotnet'
+
+export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', rust: 'Rust', dotnet: '.NET' }
+
+export function projectTypes(ecosystems: Ecosystem[]): ProjectType[] {
+  const types: ProjectType[] = []
+  if (ecosystems.includes('npm')) types.push('web')
+  if (ecosystems.includes('cargo')) types.push('rust')
+  if (ecosystems.includes('nuget')) types.push('dotnet')
+  return types
+}

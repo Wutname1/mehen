@@ -1,9 +1,9 @@
-import { ArrowRight, Check, ChevronRight, CircleAlert, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
+import { Check, ChevronRight, CircleAlert, Loader2, RotateCcw, TriangleAlert, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import * as api from '../api'
 import { relativePath } from '../derive'
-import type { Change, Ecosystem, Inventory, Project, UpdateOutcome, UpdatePlan } from '../types'
-import { EcoBadge, cx } from './bits'
+import type { Change, Inventory, Project, UpdateOutcome, UpdatePlan } from '../types'
+import { cx } from './bits'
 
 export interface BulkTarget {
   project: Project
@@ -24,21 +24,17 @@ interface Row {
 type Phase = 'planning' | 'review' | 'applying' | 'refreshing' | 'done'
 
 /**
- * Moves one package to the same version across many projects: plans each
- * project, shows them together for review, then applies them one at a time.
- * A failing project is rolled back on its own and the rest carry on.
+ * Updates a selection across many projects: plans each project, shows them
+ * together for review, then applies them through the batch runner. A failing
+ * repository is rolled back on its own and the rest carry on.
  */
 export function BulkUpdateDialog({
-  packageName,
-  ecosystem,
-  to,
+  title,
   targets,
   roots,
   onClose,
 }: {
-  packageName: string
-  ecosystem: Ecosystem
-  to: string
+  title: string
   targets: BulkTarget[]
   roots: string[]
   onClose: (refreshed: Inventory | null) => void
@@ -127,13 +123,11 @@ export function BulkUpdateDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <header className="flex items-center gap-3 border-b border-line px-5 py-3">
-          <EcoBadge ecosystem={ecosystem} />
           <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold">
-            {packageName} <ArrowRight size={14} className="mx-1 inline text-dim" />
-            <span className="font-mono text-turq">{to}</span>
+            {title}
             <span className="font-normal text-muted">
               {' '}
-              in {targets.length} project{targets.length === 1 ? '' : 's'}
+              in {targets.length} manifest{targets.length === 1 ? '' : 's'}
             </span>
           </h2>
           <button type="button" onClick={close} disabled={busy} aria-label="Close" className="rounded-md p-1 text-dim hover:bg-hover hover:text-ink disabled:opacity-40">
