@@ -92,17 +92,24 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         // Old packages sometimes publish `engines` as an array; keep it loose.
         #[serde(default)]
         engines: Option<serde_json::Value>,
+        #[serde(rename = "peerDependencies", default)]
+        peer_dependencies: Option<std::collections::HashMap<String, String>>,
     }
     let url = format!("https://registry.npmjs.org/{}", name.replace('/', "%2f"));
     let doc: Packument = get(http, &url, Some("application/vnd.npm.install-v1+json")).await?.json().await?;
-    let requirements = doc
-        .versions
-        .iter()
-        .filter_map(|(v, meta)| {
-            let range = meta.engines.as_ref()?.get("node")?.as_str()?.trim();
-            (!range.is_empty() && range != "*").then(|| (v.clone(), Requirement::Node { range: range.to_string() }))
-        })
-        .collect();
+    let mut requirements = Vec::new();
+    for (v, meta) in &doc.versions {
+        if let Some(range) = meta.engines.as_ref().and_then(|e| e.get("node")).and_then(|n| n.as_str()).map(str::trim) {
+            if !range.is_empty() && range != "*" {
+                requirements.push((v.clone(), Requirement::Node { range: range.to_string() }));
+            }
+        }
+        if let Some(peers) = meta.peer_dependencies.as_ref().filter(|p| !p.is_empty()) {
+            let mut peers: Vec<(String, String)> = peers.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
+            peers.sort();
+            requirements.push((v.clone(), Requirement::Peers { peers }));
+        }
+    }
     Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
 }
 

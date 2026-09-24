@@ -16,6 +16,8 @@ pub enum Requirement {
     Rust { version: String },
     /// npm: the `engines.node` range.
     Node { range: String },
+    /// npm: `peerDependencies`, packages this version expects the project to already have.
+    Peers { peers: Vec<(String, String)> },
 }
 
 /// What a project can accept. `None`/empty means unknown, which never blocks.
@@ -24,6 +26,8 @@ pub struct ProjectEnv {
     pub frameworks: Vec<String>,
     pub rust: Option<String>,
     pub node: Option<String>,
+    /// npm packages the project has installed, name to version, for peer checks.
+    pub installed: std::collections::HashMap<String, String>,
 }
 
 /// `Err` carries a short reason for the UI, like "only supports net10.0".
@@ -47,6 +51,16 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
             (Some(have), Some(need)) if Version::parse(have).is_some_and(|h| h < need) => Err(format!("needs Rust {version}")),
             _ => Ok(()),
         },
+        Requirement::Peers { peers } => {
+            for (name, range) in peers {
+                if let Some(have) = env.installed.get(name) {
+                    if !semver_satisfies(have, range) {
+                        return Err(format!("needs {name} {}; this project has {have}", range.trim()));
+                    }
+                }
+            }
+            Ok(())
+        }
         Requirement::Node { range } => {
             let Some(have) = env.node.as_deref().and_then(coerce_node) else { return Ok(()) };
             match nodejs_semver::Range::parse(range) {
@@ -60,6 +74,14 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
 /// Does Node `version` fall inside `range`? Unparseable input counts as yes.
 pub fn node_satisfies(version: &str, range: &str) -> bool {
     match (coerce_node(version), nodejs_semver::Range::parse(range)) {
+        (Some(v), Ok(r)) => v.satisfies(&r),
+        _ => true,
+    }
+}
+
+/// Does an npm `version` fall inside an npm `range`? Unparseable input counts as yes.
+pub fn semver_satisfies(version: &str, range: &str) -> bool {
+    match (nodejs_semver::Version::parse(version.trim_start_matches(['v', 'V'])).ok().or_else(|| coerce_node(version)), nodejs_semver::Range::parse(range)) {
         (Some(v), Ok(r)) => v.satisfies(&r),
         _ => true,
     }

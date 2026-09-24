@@ -19,6 +19,31 @@ pub const OSV_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const ADVISORY_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const SCANS_KEPT: i64 = 30;
 
+/// A package kept on one release line, everywhere or in one project.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hold {
+    pub id: i64,
+    pub ecosystem: Ecosystem,
+    pub name: String,
+    /// A project folder, or `*` for every project.
+    pub scope: String,
+    /// The release line to stay on: `5` for 5.x, `5.2` for 5.2.x.
+    pub line: String,
+}
+
+impl Hold {
+    pub fn applies_to(&self, folder: &str) -> bool {
+        self.scope == "*" || crate::model::path_within(folder, &self.scope) && crate::model::path_within(&self.scope, folder)
+    }
+
+    /// Whether `version` stays on the held line.
+    pub fn allows(&self, version: &str) -> bool {
+        let (Some(v), Some(line)) = (crate::version::Version::parse(version), crate::version::Version::parse(&self.line)) else { return true };
+        (0..line.parts.len()).all(|i| v.part(i) == line.part(i))
+    }
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -133,6 +158,23 @@ impl Store {
         if version < 6 {
             // Empty icon_path records that the folder was searched and had no logo.
             conn.execute_batch("CREATE TABLE repo_icon (repo TEXT PRIMARY KEY, icon_path TEXT NOT NULL, searched_at INTEGER NOT NULL); PRAGMA user_version = 6;")?;
+        }
+        if version < 7 {
+            // Holds keep a package on a release line; npm answers cached before
+            // peer dependencies were read are dropped so the next check has them.
+            conn.execute_batch(
+                "CREATE TABLE hold (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ecosystem TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    line TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE (ecosystem, name, scope)
+                );
+                DELETE FROM package WHERE ecosystem = 'npm';
+                PRAGMA user_version = 7;",
+            )?;
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -333,6 +375,40 @@ impl Store {
         Ok(())
     }
 
+    pub fn holds(&self) -> Vec<Hold> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare("SELECT id, ecosystem, name, scope, line FROM hold ORDER BY name, scope") else { return Vec::new() };
+        stmt.query_map([], |r| {
+            let eco: String = r.get(1)?;
+            Ok((r.get::<_, i64>(0)?, eco, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+        })
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|(id, eco, name, scope, line)| {
+                    let ecosystem = [Ecosystem::Npm, Ecosystem::Cargo, Ecosystem::Nuget, Ecosystem::GithubActions].into_iter().find(|e| eco_key(*e) == eco)?;
+                    Some(Hold { id, ecosystem, name, scope, line })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Keeps `name` on `line` (`5` or `5.2`) in `scope`: a project folder, or `*` for all.
+    pub fn put_hold(&self, ecosystem: Ecosystem, name: &str, scope: &str, line: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO hold (ecosystem, name, scope, line, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (ecosystem, name, scope) DO UPDATE SET line = excluded.line",
+            params![eco_key(ecosystem), name, scope, line, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_hold(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM hold WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     /// The remembered logo for a project folder: `Some(Some(path))` when one
     /// was found, `Some(None)` when the folder was searched and had none, and
     /// `None` when it was never searched.
@@ -392,5 +468,22 @@ mod tests {
         store.put_osv_hits(&[(Ecosystem::Npm, "left-pad".into(), "1.0.0".into(), vec!["GHSA-1".into()])]);
         assert_eq!(store.osv_hits(Ecosystem::Npm, "left-pad", "1.0.0", OSV_TTL), Some(vec!["GHSA-1".to_string()]));
         assert_eq!(store.osv_hits(Ecosystem::Npm, "left-pad", "1.0.1", OSV_TTL), None);
+    }
+
+    #[test]
+    fn holds_round_trip_and_match_their_scope() {
+        let store = Store::open_in_memory().unwrap();
+        store.put_hold(Ecosystem::Npm, "@mui/material", "*", "5").unwrap();
+        store.put_hold(Ecosystem::Npm, "eslint", "C:\\code\\app", "8").unwrap();
+        store.put_hold(Ecosystem::Npm, "eslint", "C:\\code\\app", "9").unwrap();
+        let holds = store.holds();
+        assert_eq!(holds.len(), 2, "the same package and scope is updated, not duplicated");
+        let eslint = holds.iter().find(|h| h.name == "eslint").unwrap();
+        assert_eq!(eslint.line, "9");
+        assert!(eslint.applies_to("c:/code/app/"));
+        assert!(!eslint.applies_to("C:\\code\\other"));
+        assert!(eslint.allows("9.4.0") && !eslint.allows("10.0.0"));
+        store.remove_hold(eslint.id).unwrap();
+        assert_eq!(store.holds().len(), 1);
     }
 }

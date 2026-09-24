@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt, stream};
 
-use crate::compat::{self, ProjectEnv};
-use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Status, Vulnerability};
+use crate::compat::{self, ProjectEnv, Requirement};
+use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Project, Status, Vulnerability};
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
-use crate::store::{self, Store};
+use crate::store::{self, Hold, Store};
 use crate::version::{Version, compare, from_spec, max_version, safe_target, patch_target};
 
 const LOOKUP_CONCURRENCY: usize = 8;
@@ -108,14 +108,31 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
     stats.throttled = throttled.into_inner().unwrap().into_iter().map(|e| e.osv_name().to_string()).collect();
 
     let toolchain = Toolchain::detect().await;
+    let holds = store.holds();
     for project in &mut inventory.projects {
+        let installed: HashMap<String, String> = project
+            .dependencies
+            .iter()
+            .filter(|d| d.ecosystem == Ecosystem::Npm)
+            .filter_map(|d| d.current.clone().map(|c| (d.name.clone(), c)))
+            .collect();
+        let limits = peer_limits(project, &infos);
+        let folder = project.repo.clone().unwrap_or_else(|| project.dir.clone());
         let env = ProjectEnv {
             frameworks: project.frameworks.clone(),
             rust: project.rust_version.clone().or_else(|| toolchain.rust.clone()),
             node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
+            installed,
         };
         for dep in &mut project.dependencies {
-            apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env);
+            let mut own: Vec<Limit> = limits.get(&dep.name).cloned().unwrap_or_default();
+            own.extend(
+                holds
+                    .iter()
+                    .filter(|h| h.ecosystem == dep.ecosystem && h.name == dep.name && h.applies_to(&folder))
+                    .map(|h| Limit::Hold(h.clone())),
+            );
+            apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env, &own);
         }
     }
 
@@ -206,7 +223,45 @@ fn reset(dep: &mut Dependency) {
     };
 }
 
-fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, env: &ProjectEnv) {
+/// A limit on a dependency that comes from outside its own package: another
+/// installed package's peer range, or the user keeping it on a release line.
+#[derive(Debug, Clone)]
+enum Limit {
+    Peer { owner: String, range: String },
+    Hold(Hold),
+}
+
+impl Limit {
+    fn check(&self, dep: &str, version: &str) -> Result<(), String> {
+        match self {
+            Limit::Peer { owner, range } if !compat::semver_satisfies(version, range) => Err(format!("{owner} needs {dep} {}", range.trim())),
+            Limit::Hold(h) if !h.allows(version) => Err(format!("kept on {}.x", h.line)),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// For each npm package, the peer ranges other installed packages put on it:
+/// `@mui/material 5.1.2` asking for `react ^17 || ^18` limits react.
+fn peer_limits(project: &Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>) -> HashMap<String, Vec<Limit>> {
+    let mut limits: HashMap<String, Vec<Limit>> = HashMap::new();
+    for dep in project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm) {
+        let (Some(current), Some(Ok(info))) = (dep.current.as_deref(), infos.get(&(Ecosystem::Npm, dep.name.clone()))) else { continue };
+        for (version, requirement) in &info.requirements {
+            if version != current {
+                continue;
+            }
+            if let Requirement::Peers { peers } = requirement {
+                for (name, range) in peers {
+                    limits.entry(name.clone()).or_default().push(Limit::Peer { owner: format!("{} {current}", dep.name), range: range.clone() });
+                }
+            }
+        }
+    }
+    limits
+}
+
+fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, env: &ProjectEnv, limits: &[Limit]) {
     if dep.status != Status::Pending {
         return;
     }
@@ -224,8 +279,17 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
     };
     // Only versions this project can actually use count as update targets.
     // When the newest release is out of reach, keep it (and why) for display.
-    let requirements: HashMap<&str, &compat::Requirement> = info.requirements.iter().map(|(v, r)| (v.as_str(), r)).collect();
-    let check = |v: &str| requirements.get(v).map_or(Ok(()), |r| compat::check(r, env));
+    let mut requirements: HashMap<&str, Vec<&compat::Requirement>> = HashMap::new();
+    for (v, r) in &info.requirements {
+        requirements.entry(v.as_str()).or_default().push(r);
+    }
+    let name = dep.name.clone();
+    let check = |v: &str| -> Result<(), String> {
+        for r in requirements.get(v).into_iter().flatten() {
+            compat::check(r, env)?;
+        }
+        limits.iter().try_for_each(|l| l.check(&name, v))
+    };
     // If the version already in use fails the check, our picture of the
     // project's environment is wrong; trust reality and skip filtering rather
     // than suggest a downgrade.
@@ -337,7 +401,7 @@ mod tests {
         let mut dep = Dependency::new("Microsoft.EntityFrameworkCore", Ecosystem::Nuget, DepKind::Normal, "8.0.0");
         reset(&mut dep);
         let env = ProjectEnv { frameworks: vec!["net8.0".into()], ..Default::default() };
-        apply_info(&mut dep, Some(&Ok(info(&[("8.0.0", Some("net8.0")), ("9.0.20", Some("net8.0")), ("10.0.12", Some("net10.0"))]))), &env);
+        apply_info(&mut dep, Some(&Ok(info(&[("8.0.0", Some("net8.0")), ("9.0.20", Some("net8.0")), ("10.0.12", Some("net10.0"))]))), &env, &[]);
         assert_eq!(dep.latest.as_deref(), Some("9.0.20"));
         assert_eq!(dep.newest.as_deref(), Some("10.0.12"));
         assert_eq!(dep.blocked_reason.as_deref(), Some("only supports net10.0"));
@@ -349,7 +413,7 @@ mod tests {
         let mut dep = Dependency::new("x", Ecosystem::Nuget, DepKind::Normal, "10.0.0");
         reset(&mut dep);
         let env = ProjectEnv { frameworks: vec!["net8.0".into()], ..Default::default() };
-        apply_info(&mut dep, Some(&Ok(info(&[("9.0.0", Some("net8.0")), ("10.0.0", Some("net10.0")), ("10.0.5", Some("net10.0"))]))), &env);
+        apply_info(&mut dep, Some(&Ok(info(&[("9.0.0", Some("net8.0")), ("10.0.0", Some("net10.0")), ("10.0.5", Some("net10.0"))]))), &env, &[]);
         assert_eq!(dep.latest.as_deref(), Some("10.0.5"));
         assert!(dep.newest.is_none());
     }
@@ -360,6 +424,84 @@ mod tests {
         assert_eq!(project_node(None, Some("^18"), Some("26.3.1")).as_deref(), Some("18"));
         assert_eq!(project_node(Some("20.11.0"), Some(">=18"), Some("26.3.1")).as_deref(), Some("20.11.0"));
         assert_eq!(project_node(None, None, Some("26.3.1")).as_deref(), Some("26.3.1"));
+    }
+
+    fn npm_info(versions: &[&str], peers: &[(&str, &[(&str, &str)])]) -> PackageInfo {
+        PackageInfo {
+            latest: versions.last().map(|v| v.to_string()),
+            versions: versions.iter().map(|v| v.to_string()).collect(),
+            tags: Vec::new(),
+            requirements: peers
+                .iter()
+                .map(|(v, list)| (v.to_string(), Requirement::Peers { peers: list.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect() }))
+                .collect(),
+        }
+    }
+
+    fn npm_dep(name: &str, version: &str) -> Dependency {
+        let mut dep = Dependency::new(name, Ecosystem::Npm, DepKind::Normal, version);
+        dep.installed = Some(version.into());
+        reset(&mut dep);
+        dep
+    }
+
+    #[test]
+    fn skips_a_version_whose_peers_the_project_does_not_have() {
+        let mut mui = npm_dep("@mui/material", "5.1.2");
+        let env = ProjectEnv { installed: [("react".to_string(), "18.3.1".to_string())].into(), ..Default::default() };
+        let info = npm_info(&["5.1.2", "6.4.0", "7.0.0"], &[("6.4.0", &[("react", "^17.0.0 || ^18.0.0 || ^19.0.0")]), ("7.0.0", &[("react", "^19.0.0")])]);
+        apply_info(&mut mui, Some(&Ok(info)), &env, &[]);
+        assert_eq!(mui.latest.as_deref(), Some("6.4.0"));
+        assert_eq!(mui.newest.as_deref(), Some("7.0.0"));
+        assert_eq!(mui.blocked_reason.as_deref(), Some("needs react ^19.0.0; this project has 18.3.1"));
+    }
+
+    #[test]
+    fn an_installed_package_caps_its_peer() {
+        let mut react = npm_dep("react", "18.2.0");
+        let limits = [Limit::Peer { owner: "@mui/material 5.1.2".into(), range: "^17.0.0 || ^18.0.0".into() }];
+        apply_info(&mut react, Some(&Ok(npm_info(&["18.2.0", "18.3.1", "19.1.0"], &[]))), &ProjectEnv::default(), &limits);
+        assert_eq!(react.latest.as_deref(), Some("18.3.1"));
+        assert_eq!(react.newest.as_deref(), Some("19.1.0"));
+        assert_eq!(react.blocked_reason.as_deref(), Some("@mui/material 5.1.2 needs react ^17.0.0 || ^18.0.0"));
+    }
+
+    #[test]
+    fn a_hold_keeps_a_package_on_its_line() {
+        let mut mui = npm_dep("@mui/material", "5.1.2");
+        let hold = Hold { id: 1, ecosystem: Ecosystem::Npm, name: "@mui/material".into(), scope: "*".into(), line: "5".into() };
+        apply_info(&mut mui, Some(&Ok(npm_info(&["5.1.2", "5.16.7", "6.4.0", "7.0.0"], &[]))), &ProjectEnv::default(), &[Limit::Hold(hold)]);
+        assert_eq!(mui.latest.as_deref(), Some("5.16.7"));
+        assert_eq!(mui.newest.as_deref(), Some("7.0.0"));
+        assert_eq!(mui.blocked_reason.as_deref(), Some("kept on 5.x"));
+        assert_eq!(mui.status, Status::Minor);
+    }
+
+    #[test]
+    fn peer_limits_come_from_installed_versions_only() {
+        let project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            ecosystem: Ecosystem::Npm,
+            dir: "C:\\app".into(),
+            manifest: "C:\\app\\package.json".into(),
+            repo: None,
+            frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
+            dependencies: vec![npm_dep("@mui/material", "5.1.2"), npm_dep("react", "18.2.0")],
+        };
+        let mut infos = HashMap::new();
+        infos.insert(
+            (Ecosystem::Npm, "@mui/material".to_string()),
+            Ok(npm_info(&["5.1.2", "7.0.0"], &[("5.1.2", &[("react", "^17.0.0 || ^18.0.0")]), ("7.0.0", &[("react", "^19.0.0")])])),
+        );
+        let limits = peer_limits(&project, &infos);
+        let react = &limits["react"];
+        assert_eq!(react.len(), 1, "only the installed 5.1.2 limits react, not 7.0.0");
+        assert!(react[0].check("react", "19.0.0").is_err());
+        assert!(react[0].check("react", "18.3.1").is_ok());
     }
 }
 
