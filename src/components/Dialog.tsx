@@ -14,6 +14,7 @@ export function Dialog({
   tone,
   size = 'normal',
   bare,
+  onEnter,
   busy,
   onClose,
   footer,
@@ -26,6 +27,8 @@ export function Dialog({
   size?: 'normal' | 'wide' | 'settings'
   /** Children fill the dialog with their own header; `title` becomes its label. */
   bare?: boolean
+  /** Runs on Enter anywhere in the dialog except on buttons, links, and text areas, which keep their own Enter. */
+  onEnter?: () => void
   busy?: boolean
   onClose: () => void
   footer?: ReactNode
@@ -38,6 +41,8 @@ export function Dialog({
   close.current = onClose
   const busyRef = useRef(busy)
   busyRef.current = busy
+  const enter = useRef(onEnter)
+  enter.current = onEnter
 
   useEffect(() => {
     const returnTo = document.activeElement as HTMLElement | null
@@ -51,6 +56,14 @@ export function Dialog({
       if (e.key === 'Escape' && !busyRef.current) {
         e.stopPropagation()
         close.current()
+      }
+      if (e.key === 'Enter' && enter.current && !busyRef.current) {
+        const t = e.target as HTMLElement
+        if (dialog?.contains(t) && !t.closest('button, a, textarea, select, [role^="menuitem"]')) {
+          e.preventDefault()
+          enter.current()
+          return
+        }
       }
       if (e.key !== 'Tab' || !dialog) return
       const nodes = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]')].filter((n) => n.offsetParent !== null)

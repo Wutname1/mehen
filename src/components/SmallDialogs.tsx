@@ -17,6 +17,7 @@ export function AddFolderDialog({ onAdd, onClose }: { onAdd: (path: string) => v
       description="Mehen looks for npm, Cargo, NuGet, and GitHub Actions projects anywhere under this folder. Your exclusions still apply."
       icon={<FolderPlus size={22} />}
       onClose={onClose}
+      onEnter={add}
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
@@ -37,7 +38,6 @@ export function AddFolderDialog({ onAdd, onClose }: { onAdd: (path: string) => v
           autoFocus
           value={path}
           onChange={(e) => setPath(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && add()}
           placeholder="C:\code"
           spellCheck={false}
           className="flex-1"
@@ -97,6 +97,7 @@ export function ExcludeDialog({ repo, roots, onExclude, onClose }: { repo: Repo;
   ]
   const [picked, setPicked] = useState(choices[0].id)
   const choice = choices.find((c) => c.id === picked)!
+  const confirm = () => onExclude(choice.kind, choice.value, choice.id === 'repo' ? repo.name : choice.title.replace(/^Only /, ''))
 
   return (
     <Dialog
@@ -104,10 +105,11 @@ export function ExcludeDialog({ repo, roots, onExclude, onClose }: { repo: Repo;
       description="Excluded projects are skipped when checking and never updated. You can bring them back under Settings, Scanning."
       icon={<EyeOff size={22} />}
       onClose={onClose}
+      onEnter={confirm}
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
-          <Button variant="danger" onClick={() => onExclude(choice.kind, choice.value, choice.id === 'repo' ? repo.name : choice.title.replace(/^Only /, ''))}>
+          <Button variant="danger" onClick={confirm}>
             Exclude
           </Button>
         </>
