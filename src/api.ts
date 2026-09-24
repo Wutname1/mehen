@@ -107,6 +107,12 @@ export async function setVersionPolicy(scope: string, policy: VersionPolicy | nu
 
 const mockPolicies: VersionPolicies = {}
 
+/** Logos for project folders; `discover` searches folders not looked at before. */
+export async function repoIcons(repos: string[], discover: boolean): Promise<{ repo: string; dataUrl: string }[]> {
+  if (!inTauri || !repos.length) return []
+  return invoke<{ repo: string; dataUrl: string }[]>('repo_icons', { repos, discover })
+}
+
 export async function setNotify(notify: boolean): Promise<Settings> {
   if (!inTauri) return mock.setNotify(notify)
   return invoke<Settings>('set_notify', { notify })

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.22"
 futures = "0.3.34"
 globset = "0.4.20"
 ignore = "0.4.33"

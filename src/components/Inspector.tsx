@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo } from '../derive'
 import { cx } from './bits'
 import { Menu, MenuCheck, MenuSeparator, MenuTitle } from './Menu'
+import { RepoAvatar } from './RepoAvatar'
 
 /** Selected usages grouped by package, for the tray. */
 export interface TrayGroup {
@@ -20,10 +21,11 @@ function Fact({ label, children, warn }: { label: string; children: ReactNode; w
   )
 }
 
-export function ProjectRecord({ repo, onReveal, onOpenInEditor, onSettings }: { repo: Repo; onReveal: () => void; onOpenInEditor: () => void; onSettings: () => void }) {
+export function ProjectRecord({ repo, icon, onReveal, onOpenInEditor, onSettings }: { repo: Repo; icon?: string; onReveal: () => void; onOpenInEditor: () => void; onSettings: () => void }) {
   return (
     <section className="shrink-0 border-b border-line px-[18px] pt-4 pb-3.5">
       <div className="flex items-start gap-2">
+        {icon && <RepoAvatar name={repo.name} icon={icon} size={30} />}
         <h2 className="m-0 min-w-0 flex-1 font-display text-[22px] leading-tight font-semibold tracking-[-0.015em] [overflow-wrap:anywhere]">{repo.name}</h2>
         <button type="button" onClick={onSettings} aria-label={`${repo.name} settings`} title="Settings for this project" className="grid size-[30px] shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
           <Settings2 size={16} />

@@ -5,6 +5,7 @@
 pub mod batch;
 pub mod check;
 pub mod compat;
+pub mod icons;
 pub mod ignore;
 pub mod lockfiles;
 pub mod model;

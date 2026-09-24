@@ -40,6 +40,11 @@ fn fresh_after(max_age: Duration) -> i64 {
     now() - max_age.as_secs() as i64
 }
 
+/// Lowercase with backslashes and no trailing separator, so one folder is one row.
+fn repo_key(path: &str) -> String {
+    path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+}
+
 fn eco_key(ecosystem: Ecosystem) -> &'static str {
     match ecosystem {
         Ecosystem::Npm => "npm",
@@ -124,6 +129,10 @@ impl Store {
         }
         if version < 5 {
             conn.execute_batch("CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version = 5;")?;
+        }
+        if version < 6 {
+            // Empty icon_path records that the folder was searched and had no logo.
+            conn.execute_batch("CREATE TABLE repo_icon (repo TEXT PRIMARY KEY, icon_path TEXT NOT NULL, searched_at INTEGER NOT NULL); PRAGMA user_version = 6;")?;
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -322,6 +331,26 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("DELETE FROM package; DELETE FROM osv_query; DELETE FROM advisory;")?;
         Ok(())
+    }
+
+    /// The remembered logo for a project folder: `Some(Some(path))` when one
+    /// was found, `Some(None)` when the folder was searched and had none, and
+    /// `None` when it was never searched.
+    pub fn repo_icon(&self, repo: &str) -> Option<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT icon_path FROM repo_icon WHERE repo = ?1", params![repo_key(repo)], |r| r.get::<_, String>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .map(|p| (!p.is_empty()).then_some(p))
+    }
+
+    pub fn put_repo_icon(&self, repo: &str, icon: Option<&str>) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO repo_icon (repo, icon_path, searched_at) VALUES (?1, ?2, ?3)",
+            params![repo_key(repo), icon.unwrap_or(""), now()],
+        );
     }
 
     pub fn stats(&self) -> anyhow::Result<StoreStats> {

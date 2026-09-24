@@ -8,6 +8,7 @@ import { Button, Dialog } from './Dialog'
 import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 import { Checkbox } from './Queue'
 import { TextInput } from './controls'
+import { RepoAvatar } from './RepoAvatar'
 
 const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: 'Nu', 'github-actions': 'GA' }
 
@@ -28,6 +29,7 @@ interface Entry {
 export function ManageProjects({
   settings,
   repos,
+  icons,
   onOpen,
   onScan,
   onAddFolder,
@@ -42,6 +44,7 @@ export function ManageProjects({
 }: {
   settings: Settings
   repos: Repo[]
+  icons: Record<string, string>
   onOpen: (key: string) => void
   onScan: (paths: string[]) => Promise<void>
   onAddFolder: () => void
@@ -291,9 +294,7 @@ export function ManageProjects({
                             disabled={off}
                             className="group flex min-w-0 items-center gap-2.5 py-1 pr-2 text-left disabled:cursor-default"
                           >
-                            <span aria-hidden className="grid size-7 shrink-0 place-items-center rounded-[3px] border border-line bg-paper font-mono text-[11px] font-bold text-muted">
-                              {e.name.slice(0, 2).toUpperCase()}
-                            </span>
+                            <RepoAvatar name={e.name} icon={icons[e.key.toLowerCase()]} />
                             <span className="flex min-w-0 flex-col">
                               <b className={cx('truncate text-[13px]', !off && 'group-hover:underline group-hover:underline-offset-2')}>{e.name}</b>
                               <small className="truncate font-mono text-[12px] text-muted">

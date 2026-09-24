@@ -59,6 +59,7 @@ export default function App() {
   const [filters, setFilters] = useState<QueueFilters>(() => ({ types: new Set(), ecosystems: new Set(), risk: 'any', riskFirst: prefs.riskFirst }))
   const [policies, setPolicies] = useState<VersionPolicies>({})
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [icons, setIcons] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLInputElement>(null)
   const scannedOnOpen = useRef(false)
 
@@ -215,6 +216,31 @@ export default function App() {
   const repo = repoScope ? (repoByKey.get(repoScope.toLowerCase()) ?? null) : null
   const repoOf = useCallback((u: QueueUsage) => repoByKey.get(repoKey(u.project).toLowerCase()), [repoByKey])
   const nameOf = useCallback((key: string) => repoByKey.get(key.toLowerCase())?.name ?? folderName(key), [repoByKey])
+
+  // Logos: remembered ones first (instant), then a one-time search of new folders.
+  const repoKeys = useMemo(() => repoList.map((r) => r.key).join('|'), [repoList])
+  useEffect(() => {
+    if (!repoKeys) return
+    const keys = repoKeys.split('|')
+    let cancelled = false
+    const merge = (found: { repo: string; dataUrl: string }[]) =>
+      !cancelled && found.length && setIcons((prev) => ({ ...prev, ...Object.fromEntries(found.map((f) => [f.repo.toLowerCase(), f.dataUrl])) }))
+    api
+      .repoIcons(keys, false)
+      .then((found) => {
+        merge(found)
+        const known = new Set(found.map((f) => f.repo.toLowerCase()))
+        return api.repoIcons(
+          keys.filter((k) => !known.has(k.toLowerCase())),
+          true,
+        )
+      })
+      .then(merge)
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [repoKeys])
 
   // Drop selections and scope that no longer exist after a check.
   useEffect(() => {
@@ -397,6 +423,7 @@ export default function App() {
           <Rail
             repos={repoList}
             roots={inventory.roots}
+            icons={icons}
             selected={repo?.key ?? null}
             query={query}
             excludedCount={excludedCount}
@@ -446,7 +473,7 @@ export default function App() {
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (
-              <ProjectRecord repo={repo} onReveal={() => api.reveal(repo.key)} onOpenInEditor={() => api.openInEditor(repo.key)} onSettings={() => setDialog({ kind: 'settings', repo })} />
+              <ProjectRecord repo={repo} icon={icons[repo.key.toLowerCase()]} onReveal={() => api.reveal(repo.key)} onOpenInEditor={() => api.openInEditor(repo.key)} onSettings={() => setDialog({ kind: 'settings', repo })} />
             )}
             <Tray
               groups={trayGroups}
@@ -492,6 +519,7 @@ export default function App() {
         <ManageProjects
           settings={settings}
           repos={repoList}
+          icons={icons}
           onOpen={(key) => {
             setRepoScope(key)
             setDialog(null)
@@ -557,6 +585,7 @@ export default function App() {
           stopOnFailure={prefs.stopOnFailure}
           onOptions={setPrefs}
           nameOf={nameOf}
+          icons={icons}
           onClose={(refreshed) => {
             setDialog(null)
             if (refreshed) setInventory(refreshed)

@@ -393,6 +393,42 @@ fn set_version_policy(state: State<'_, AppState>, scope: String, policy: Option<
     Ok(all)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RepoIcon {
+    repo: String,
+    data_url: String,
+}
+
+/// Logos for project folders. Remembered answers come straight from the store;
+/// with `discover`, folders never searched (or whose logo file moved) are
+/// searched once and the answer remembered, including "no logo".
+#[tauri::command]
+async fn repo_icons(app: AppHandle, repos: Vec<String>, discover: bool) -> Result<Vec<RepoIcon>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = &app.state::<AppState>().store;
+        repos
+            .into_iter()
+            .filter_map(|repo| {
+                let path = match store.repo_icon(&repo) {
+                    Some(Some(p)) if std::path::Path::new(&p).is_file() => Some(p),
+                    Some(None) => None,
+                    _ if discover => {
+                        let found = mehen_core::icons::find_icon(std::path::Path::new(&repo)).map(|p| p.display().to_string());
+                        store.put_repo_icon(&repo, found.as_deref());
+                        found
+                    }
+                    _ => None,
+                }?;
+                let data_url = mehen_core::icons::data_url(std::path::Path::new(&path))?;
+                Some(RepoIcon { repo, data_url })
+            })
+            .collect()
+    })
+    .await
+    .map_err(err)
+}
+
 /// Commits already-applied updates, one commit per repository.
 #[tauri::command]
 fn commit_update(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
@@ -489,6 +525,7 @@ pub fn run() {
             check_commands,
             set_check_commands,
             commit_update,
+            repo_icons,
             version_policy,
             set_version_policy,
             store_stats,

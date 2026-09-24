@@ -4,6 +4,7 @@ import { ECOSYSTEM_LABEL, type Repo } from '../derive'
 import type { Ecosystem } from '../types'
 import { cx } from './bits'
 import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
+import { RepoAvatar } from './RepoAvatar'
 
 const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: 'Nu', 'github-actions': 'GA' }
 
@@ -41,6 +42,7 @@ export function ScanStatus({ running, phase, checkedAgo, detail, hint, onScan }:
 export function Rail({
   repos,
   roots,
+  icons,
   selected,
   query,
   excludedCount,
@@ -58,6 +60,7 @@ export function Rail({
 }: {
   repos: Repo[]
   roots: string[]
+  icons: Record<string, string>
   selected: string | null
   query: string
   excludedCount: number
@@ -186,9 +189,7 @@ export function Rail({
                       active ? 'bg-rail-active text-white shadow-[inset_0_0_0_1px_var(--rail-active-line)]' : 'text-rail-ink-2 hover:bg-rail-hover',
                     )}
                   >
-                    <span aria-hidden className="grid size-7 place-items-center rounded-[3px] border border-rail-border bg-rail-raised font-mono text-[11px] font-bold text-rail-ink-2">
-                      {monogram(repo.name)}
-                    </span>
+                    <RepoAvatar name={repo.name} icon={icons[repo.key.toLowerCase()]} tone="rail" />
                     <span className="flex min-w-0 flex-col gap-1">
                       <b className="truncate text-[12.5px] font-semibold">{repo.name}</b>
                       <span className="flex gap-[3px]" aria-hidden>
@@ -242,8 +243,4 @@ export function Rail({
   )
 }
 
-function monogram(name: string): string {
-  const words = name.replace(/[._-]+/g, ' ').split(/\s+|(?=[A-Z][a-z])/).filter(Boolean)
-  return (words.length > 1 ? words[0][0] + words[1][0] : name.slice(0, 2)).toUpperCase()
-}
 

@@ -16,12 +16,18 @@ export interface Prefs {
   riskFirst: boolean
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: false, stopOnFailure: true, riskFirst: true }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true }
+
+/** Bumped when a default changes and older saved choices should pick it up. */
+const VERSION = 2
 const KEY = 'mehen-prefs'
 
 function load(): Prefs {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) ?? '{}') }
+    const saved = JSON.parse(localStorage.getItem(KEY) ?? '{}')
+    // Version 2 turned on checking at launch for everyone.
+    if ((saved.version ?? 1) < 2) delete saved.scanOnOpen
+    return { ...DEFAULTS, ...saved }
   } catch {
     return DEFAULTS
   }
@@ -47,7 +53,7 @@ export function usePrefs() {
     document.documentElement.dataset.theme = theme
     document.documentElement.dataset.palette = prefs.palette
     try {
-      localStorage.setItem(KEY, JSON.stringify(prefs))
+      localStorage.setItem(KEY, JSON.stringify({ ...prefs, version: VERSION }))
     } catch {
       // Storage unavailable: choices last for this session.
     }

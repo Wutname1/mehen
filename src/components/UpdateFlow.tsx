@@ -6,6 +6,7 @@ import type { BatchEvent, Change, CommitOutcome, Inventory, JobOutcome, JobState
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { Checkbox } from './Queue'
+import { RepoAvatar } from './RepoAvatar'
 
 export interface UpdateTarget {
   project: Project
@@ -75,14 +76,11 @@ const labels = (steps: { label: string }[]) => {
   return [...counts].map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)).join(', ')
 }
 
-const monogram = (name: string) => name.replace(/^.*\//, '').slice(0, 2).toUpperCase()
+/** Logos by lowercased project folder, filled in by the app. */
+let iconsByKey: Record<string, string> = {}
 
-function Avatar({ name }: { name: string }) {
-  return (
-    <span aria-hidden className="grid size-6 shrink-0 place-items-center rounded-[3px] border border-line bg-paper-2 font-mono text-[10.5px] font-bold text-muted">
-      {monogram(name)}
-    </span>
-  )
+function Avatar({ name, repo }: { name: string; repo?: string }) {
+  return <RepoAvatar name={name} icon={repo ? iconsByKey[repo.toLowerCase()] : undefined} size={24} />
 }
 
 function Diff({ diff }: { diff: string }) {
@@ -140,6 +138,7 @@ export function UpdateFlow({
   stopOnFailure,
   onOptions,
   nameOf,
+  icons,
   onClose,
 }: {
   targets: UpdateTarget[]
@@ -150,8 +149,10 @@ export function UpdateFlow({
   stopOnFailure: boolean
   onOptions: (patch: { checks?: boolean; commit?: boolean }) => void
   nameOf: (key: string) => string
+  icons: Record<string, string>
   onClose: (refreshed: Inventory | null) => void
 }) {
+  iconsByKey = icons
   const [stage, setStage] = useState<Stage>('planning')
   const [plans, setPlans] = useState<UpdatePlan[]>([])
   const [failed, setFailed] = useState<{ project: Project; error: string }[]>([])
@@ -300,7 +301,7 @@ export function UpdateFlow({
           return (
             <section key={job.key} className="mb-5">
               <h3 className="mb-2 flex items-center gap-2 text-[13px] font-semibold">
-                <Avatar name={job.name} />
+                <Avatar name={job.name} repo={job.key} />
                 {job.name}
                 {job.branch && (
                   <span className="inline-flex items-center gap-1 font-mono text-[12px] font-normal text-muted">
@@ -353,7 +354,7 @@ export function UpdateFlow({
             return (
               <section key={job.key} className="rounded-[3px] border border-line bg-paper">
                 <header className="flex items-center gap-2.5 border-b border-line px-3 py-2.5">
-                  <Avatar name={job.name} />
+                  <Avatar name={job.name} repo={job.key} />
                   <span className="flex min-w-0 flex-1 flex-col">
                     <b className="text-[13px]">{job.name}</b>
                     <small className="truncate font-mono text-[12px] text-muted">{job.key}</small>
@@ -442,7 +443,7 @@ export function UpdateFlow({
           const state = now?.state ?? 'queued'
           return (
             <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-center gap-2.5 border-b border-line py-2.5">
-              <Avatar name={job.name} />
+              <Avatar name={job.name} repo={job.key} />
               <span className="flex min-w-0 flex-col">
                 <b className="text-[13px]">{job.name}</b>
                 <small className="truncate text-[12px] text-muted">{state === 'queued' ? `${changesOf(job).length} package${changesOf(job).length === 1 ? '' : 's'}` : (now?.label ?? '')}</small>
@@ -492,7 +493,7 @@ export function UpdateFlow({
           const changes = changesOf(job)
           return (
             <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-start gap-2.5 border-b border-line py-2.5">
-              <Avatar name={job.name} />
+              <Avatar name={job.name} repo={job.key} />
               <span className="flex min-w-0 flex-col">
                 <b className="text-[13px]">{job.name}</b>
                 <small className="text-[12px] text-ink">“{commitSubject(changes.length)}”</small>
@@ -568,7 +569,7 @@ export function UpdateFlow({
         const failing = o.steps.filter((s) => !s.ok)
         return (
           <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-start gap-2.5 border-b border-line py-2.5">
-            <Avatar name={job.name} />
+            <Avatar name={job.name} repo={job.key} />
             <span className="flex min-w-0 flex-col gap-0.5">
               <b className="text-[13px]">{job.name}</b>
               {o.ok ? (
