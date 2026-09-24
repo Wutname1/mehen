@@ -252,7 +252,8 @@ export function updateTarget(dep: Dependency, policy: VersionPolicy = 'any'): st
 
 /** How big the jump from `current` to `target` is. */
 export function bumpOf(current: string, target: string): Exclude<Risk, 'security'> {
-  const parse = (v: string) => v.replace(/^v/i, '').split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0)
+  // Tolerates a written spec like `^5.1.2` or `>=5` as well as a version.
+  const parse = (v: string) => v.replace(/^[^\d]+/, '').split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0)
   const [c, t] = [parse(current), parse(target)]
   if ((t[0] ?? 0) !== (c[0] ?? 0)) return 'major'
   if ((t[1] ?? 0) !== (c[1] ?? 0)) return 'minor'

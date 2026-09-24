@@ -1,7 +1,7 @@
-import { AlertTriangle, Box, Check, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
+import { AlertTriangle, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import { folderName, relativePath } from '../derive'
+import { bumpOf, folderName, relativePath } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
@@ -386,7 +386,8 @@ export function UpdateFlow({
         <div className="grid gap-2.5">
           {jobs.map((job) => {
             const changes = changesOf(job)
-            const files = [...new Set(job.plans.flatMap((p) => [...p.edits.map((e) => e.path), ...p.snapshots]))].map((f) => relativePath([job.key], f))
+            const edited = new Set(job.plans.flatMap((p) => p.edits.map((e) => e.path.toLowerCase())))
+            const lockfiles = [...new Set(job.plans.flatMap((p) => p.snapshots).filter((f) => !edited.has(f.toLowerCase())))].map((f) => relativePath([job.key], f))
             const { install, checks: steps } = stepsOf(job, checks)
             const warnings = [...new Set(job.plans.flatMap((p) => p.warnings))]
             return (
@@ -404,20 +405,16 @@ export function UpdateFlow({
                     </span>
                   )}
                 </header>
-                <ul className="m-0 grid list-none gap-1 px-3 pt-2 pb-2.5 text-[12.5px]">
-                  {changes.map((c) => (
-                    <li key={c.name} className="flex items-center gap-2">
-                      <Box size={14} className="shrink-0 text-muted" />
-                      <b>{c.name}</b>
-                      <code className="font-mono text-[12px] text-muted">{c.from}</code> to <code className="font-mono text-[12px]">{c.to}</code>
+                <PlanFiles job={job} />
+                <ul className="m-0 grid list-none gap-1 px-3 pt-1 pb-2.5 text-[12.5px]">
+                  {lockfiles.length > 0 && (
+                    <li className="flex items-center gap-2 text-muted">
+                      <FileText size={14} className="shrink-0" />
+                      <span className="truncate" title={lockfiles.join('\n')}>
+                        Also refreshes {lockfiles.join(', ')}
+                      </span>
                     </li>
-                  ))}
-                  <li className="flex items-center gap-2 text-muted">
-                    <FileText size={14} className="shrink-0" />
-                    <span className="truncate" title={files.join('\n')}>
-                      {files.join(', ')}
-                    </span>
-                  </li>
+                  )}
                   <li className="flex items-center gap-2 text-muted">
                     <Terminal size={14} className="shrink-0" />
                     {!install.length && !job.plans.some((p) => p.steps.length)
@@ -699,6 +696,82 @@ export function UpdateFlow({
         )
       })}
     </Dialog>
+  )
+}
+
+/**
+ * The packages each manifest changes, one collapsible row per file. Small
+ * updates open expanded; big ones start collapsed so the dialog stays short.
+ */
+function PlanFiles({ job }: { job: Job }) {
+  const files = job.plans
+    .map((plan) => {
+      const paths = plan.edits.map((e) => relativePath([job.key], e.path))
+      const manifest = relativePath([job.key], plan.projectId)
+      return {
+        key: plan.projectId,
+        label: paths.length === 1 ? paths[0] : manifest,
+        // A workflow folder edits several files under one project.
+        others: paths.length > 1 ? paths : [],
+        changes: [...plan.changes].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+      }
+    })
+    .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
+  const total = files.reduce((n, f) => n + f.changes.length, 0)
+  const [open, setOpen] = useState<Set<string>>(() => new Set(files.length === 1 || total <= 12 ? files.map((f) => f.key) : []))
+  const allOpen = open.size === files.length
+  const toggle = (key: string, isOpen: boolean) =>
+    setOpen((prev) => {
+      if (prev.has(key) === isOpen) return prev
+      const next = new Set(prev)
+      if (isOpen) next.add(key)
+      else next.delete(key)
+      return next
+    })
+
+  return (
+    <div className="px-3 pt-1.5">
+      {files.length > 2 && (
+        <div className="flex items-center justify-between pb-0.5 text-[12px] text-muted">
+          <span>
+            {total} change{total === 1 ? '' : 's'} in {files.length} files
+          </span>
+          <button type="button" onClick={() => setOpen(allOpen ? new Set() : new Set(files.map((f) => f.key)))} className="rounded-[3px] px-1.5 py-0.5 hover:bg-sunken hover:text-ink">
+            {allOpen ? 'Collapse all' : 'Expand all'}
+          </button>
+        </div>
+      )}
+      {files.map((file) => {
+        const majors = file.changes.filter((c) => bumpOf(c.from, c.to) === 'major').length
+        return (
+          <details key={file.key} open={open.has(file.key)} onToggle={(e) => toggle(file.key, e.currentTarget.open)} className="group border-b border-line last:border-b-0">
+            <summary className="flex cursor-pointer list-none items-center gap-2 py-1.5 text-[12.5px] hover:text-ink [&::-webkit-details-marker]:hidden">
+              <ChevronRight size={14} className="shrink-0 text-muted transition-transform group-open:rotate-90" />
+              <FileText size={14} className="shrink-0 text-muted" />
+              <span className="min-w-0 truncate font-mono text-[12px]" title={file.label}>
+                {file.label}
+              </span>
+              <span className="ml-auto shrink-0 pl-2 text-[12px] text-muted">
+                {file.changes.length} package{file.changes.length === 1 ? '' : 's'}
+                {majors > 0 && <span className="text-risk-major"> · {majors} major</span>}
+              </span>
+            </summary>
+            <ul className="m-0 grid list-none gap-1 pb-2 pl-[22px] text-[12.5px]">
+              {file.changes.map((c) => (
+                <li key={`${c.name}|${c.from}`} className="flex min-w-0 items-center gap-2">
+                  <Box size={14} className="shrink-0 text-muted" />
+                  <b className="truncate">{c.name}</b>
+                  <code className="shrink-0 font-mono text-[12px] text-muted">{c.from}</code>
+                  <span className="shrink-0 text-muted">to</span>
+                  <code className={cx('shrink-0 font-mono text-[12px]', bumpOf(c.from, c.to) === 'major' && 'text-risk-major')}>{c.to}</code>
+                </li>
+              ))}
+              {file.others.length > 0 && <li className="truncate text-[12px] text-muted">Files: {file.others.join(', ')}</li>}
+            </ul>
+          </details>
+        )
+      })}
+    </div>
   )
 }
 
