@@ -75,6 +75,7 @@ pub async fn lookup(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) ->
         Ecosystem::GithubActions => github_tags(http, name).await,
         Ecosystem::Go => go_module(http, name).await,
         Ecosystem::Pypi => pypi(http, name).await,
+        Ecosystem::Pub => pub_dev(http, name).await,
     }
 }
 
@@ -113,6 +114,36 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         }
     }
     Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
+}
+
+/// pub.dev lists every version with the Dart SDK it needs. Retracted
+/// versions are skipped.
+async fn pub_dev(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    #[derive(Deserialize)]
+    struct Doc {
+        latest: Release,
+        #[serde(default)]
+        versions: Vec<Release>,
+    }
+    #[derive(Deserialize)]
+    struct Release {
+        version: String,
+        #[serde(default)]
+        pubspec: serde_json::Value,
+        #[serde(default)]
+        retracted: bool,
+    }
+    let doc: Doc = get(http, &format!("https://pub.dev/api/packages/{name}"), Some("application/vnd.pub.v2+json")).await?.json().await?;
+    let mut versions = Vec::new();
+    let mut requirements = Vec::new();
+    for release in doc.versions.into_iter().filter(|r| !r.retracted) {
+        if let Some(range) = release.pubspec["environment"]["sdk"].as_str().map(str::trim).filter(|r| !r.is_empty() && *r != "any") {
+            requirements.push((release.version.clone(), Requirement::Dart { range: range.to_string() }));
+        }
+        versions.push(release.version);
+    }
+    let latest = Some(doc.latest.version).filter(|v| versions.contains(v)).or_else(|| max_version(versions.iter().map(String::as_str)));
+    Ok(PackageInfo { latest, versions, requirements, ..Default::default() })
 }
 
 /// PyPI's JSON document: every release with the Python it needs. Releases

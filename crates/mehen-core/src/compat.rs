@@ -1,5 +1,6 @@
 //! Whether a published package version can be used by a particular project:
-//! .NET target frameworks, a crate's minimum Rust version, or npm `engines.node`.
+//! .NET target frameworks, a crate's minimum Rust version, npm `engines.node`
+//! and peers, Python's `requires-python`, or the Dart SDK a package needs.
 //! Versions that fail are never offered as update targets.
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,8 @@ pub enum Requirement {
     Peers { peers: Vec<(String, String)> },
     /// PyPI: the `requires-python` specifier.
     Python { range: String },
+    /// Pub: the `environment: sdk:` constraint.
+    Dart { range: String },
 }
 
 /// What a project can accept. `None`/empty means unknown, which never blocks.
@@ -32,6 +35,8 @@ pub struct ProjectEnv {
     pub installed: std::collections::HashMap<String, String>,
     /// The lowest Python the project supports.
     pub python: Option<String>,
+    /// The installed Dart SDK: pub resolves against it, not the project's own `sdk` range.
+    pub dart: Option<String>,
 }
 
 /// `Err` carries a short reason for the UI, like "only supports net10.0".
@@ -67,6 +72,11 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
         }
         Requirement::Python { range } => match &env.python {
             Some(have) if !crate::python::satisfies(have, range) => Err(format!("needs Python {}; this project supports {have}", range.trim())),
+            _ => Ok(()),
+        },
+        // Dart constraints use npm's range syntax (`>=3.0.0 <4.0.0`, `^3.4.0`).
+        Requirement::Dart { range } => match &env.dart {
+            Some(have) if !semver_satisfies(have, range) => Err(format!("needs Dart {}; Dart {have} is installed", range.trim())),
             _ => Ok(()),
         },
         Requirement::Node { range } => {
@@ -242,6 +252,18 @@ fn tfm_compatible(project: &Tfm, pkg: &Tfm) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dart_and_python_requirements() {
+        let dart = |have: Option<&str>| ProjectEnv { dart: have.map(Into::into), ..Default::default() };
+        let needs = Requirement::Dart { range: ">=3.12.0 <4.0.0".into() };
+        assert!(check(&needs, &dart(Some("3.13.1"))).is_ok());
+        assert_eq!(check(&needs, &dart(Some("3.10.0"))).unwrap_err(), "needs Dart >=3.12.0 <4.0.0; Dart 3.10.0 is installed");
+        assert!(check(&needs, &dart(None)).is_ok(), "no SDK installed never blocks");
+        let python = ProjectEnv { python: Some("3.8".into()), ..Default::default() };
+        assert!(check(&Requirement::Python { range: ">=3.10".into() }, &python).is_err());
+        assert!(check(&Requirement::Python { range: ">=3.7, !=3.7.0".into() }, &python).is_ok());
+    }
 
     fn frameworks(list: &[&str]) -> Requirement {
         Requirement::Frameworks { frameworks: list.iter().map(|s| s.to_string()).collect() }

@@ -1,6 +1,6 @@
 import type { Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
 
-export const ECOSYSTEMS: Ecosystem[] = ['npm', 'pypi', 'cargo', 'nuget', 'go', 'github-actions']
+export const ECOSYSTEMS: Ecosystem[] = ['npm', 'pypi', 'cargo', 'nuget', 'go', 'pub', 'github-actions']
 
 export const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
   npm: 'npm',
@@ -9,6 +9,7 @@ export const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
   'github-actions': 'Actions',
   go: 'Go',
   pypi: 'PyPI',
+  pub: 'Pub',
 }
 
 const STATUS_RANK: Record<Status, number> = {
@@ -344,9 +345,9 @@ export function repos(inventory: Inventory, rows: QueueRow[]): Repo[] {
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
 }
 
-export type ProjectType = 'web' | 'python' | 'rust' | 'dotnet' | 'dotnet-framework' | 'go'
+export type ProjectType = 'web' | 'python' | 'rust' | 'dotnet' | 'dotnet-framework' | 'go' | 'dart'
 
-export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', python: 'Python', rust: 'Rust', dotnet: '.NET', 'dotnet-framework': '.NET Framework', go: 'Go' }
+export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', python: 'Python', rust: 'Rust', dotnet: '.NET', 'dotnet-framework': '.NET Framework', go: 'Go', dart: 'Dart / Flutter' }
 
 /** `net48`, `net472`, `v4.7.2`: the Windows-only .NET Framework, not modern .NET (`net8.0`, `netstandard2.0`). */
 const isFrameworkTarget = (tfm: string) => /^net\d{2,3}$/i.test(tfm) || /^v[1-4](\.|$)/i.test(tfm)
@@ -359,6 +360,7 @@ export function projectTypes(projects: Project[]): ProjectType[] {
     if (p.ecosystem === 'cargo') types.add('rust')
     if (p.ecosystem === 'go') types.add('go')
     if (p.ecosystem === 'pypi') types.add('python')
+    if (p.ecosystem === 'pub') types.add('dart')
     if (p.ecosystem !== 'nuget') continue
     // packages.config belongs to .NET Framework projects.
     if (p.frameworks.length === 0) types.add(/packages\.config$/i.test(p.manifest) ? 'dotnet-framework' : 'dotnet')

@@ -9,10 +9,11 @@ pub enum Ecosystem {
     GithubActions,
     Go,
     Pypi,
+    Pub,
 }
 
 impl Ecosystem {
-    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`, `pypi`).
+    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`, `pypi`, `pub`).
     pub fn key(self) -> &'static str {
         match self {
             Ecosystem::Npm => "npm",
@@ -21,6 +22,7 @@ impl Ecosystem {
             Ecosystem::GithubActions => "github-actions",
             Ecosystem::Go => "go",
             Ecosystem::Pypi => "pypi",
+            Ecosystem::Pub => "pub",
         }
     }
 
@@ -33,6 +35,7 @@ impl Ecosystem {
             Ecosystem::GithubActions => "GitHub Actions",
             Ecosystem::Go => "Go",
             Ecosystem::Pypi => "PyPI",
+            Ecosystem::Pub => "Pub",
         }
     }
 }

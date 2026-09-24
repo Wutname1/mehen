@@ -301,6 +301,7 @@ html {
   --brand-dotnet: #512bd4;
   --brand-go: #00add8;
   --brand-python: #3776ab;
+  --brand-dart: #0175c2;
 }
 
 /* The rail is dark in both themes. */
@@ -313,6 +314,7 @@ html[data-theme='dark'],
   --brand-javascript: #f7df1e;
   --brand-dotnet: #9780e5;
   --brand-python: #5a9fd4;
+  --brand-dart: #40a9e6;
 }
 
 html[data-theme='dark'] {

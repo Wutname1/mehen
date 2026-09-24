@@ -91,6 +91,7 @@ fn eco_key(ecosystem: Ecosystem) -> &'static str {
         Ecosystem::GithubActions => "github-actions",
         Ecosystem::Go => "go",
         Ecosystem::Pypi => "pypi",
+        Ecosystem::Pub => "pub",
     }
 }
 

@@ -5,6 +5,7 @@
 pub mod batch;
 pub mod check;
 pub mod compat;
+pub mod dart;
 pub mod diagnose;
 pub mod icons;
 pub mod golang;

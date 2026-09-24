@@ -187,6 +187,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         Ecosystem::Nuget => plan_nuget(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Go => plan_go(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::Pypi => plan_python(&mut plan, &manifest, &dir, &deps)?,
+        Ecosystem::Pub => plan_pub(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
     for edit in &mut plan.edits {
@@ -482,6 +483,42 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
     push_step(plan, StepKind::Install, "cargo update (only the selected crates)", "cargo", &args, dir);
     push_step(plan, StepKind::Verify, "cargo check", "cargo", &["check", "--quiet"], dir);
     push_step(plan, StepKind::Test, "cargo test", "cargo", &["test", "--quiet"], dir);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- Dart / Flutter
+
+/// Rewrites each constraint in `pubspec.yaml` (an `any` constraint already
+/// allows the target and stays), then `pub upgrade` moves `pubspec.lock`.
+/// Flutter projects use `flutter`, plain Dart packages `dart`.
+fn plan_pub(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+    let before = read(manifest)?;
+    let mut text = before.clone();
+    for (dep, change) in deps {
+        let (old, new) = match crate::dart::set_constraint(&text, &dep.name, &change.to) {
+            Some((next, old, new)) => {
+                text = next;
+                (old, new)
+            }
+            None if dep.requested.trim().is_empty() || dep.requested.trim() == "any" => (dep.requested.clone(), dep.requested.clone()),
+            None => bail!("{}: no version constraint found in pubspec.yaml", dep.name),
+        };
+        plan.changes.push(PlannedChange { name: dep.name.clone(), from: dep.current.clone().unwrap_or(old.clone()), to: change.to.clone(), written_before: old, written_after: new });
+    }
+    push_edit(plan, manifest, before, text.clone());
+    let lock = dir.join("pubspec.lock");
+    if lock.is_file() {
+        plan.snapshots.push(lock.display().to_string());
+    }
+    let program = if crate::dart::parse(&text).map(|p| p.flutter).unwrap_or(false) { "flutter" } else { "dart" };
+    let mut args = vec!["pub".to_string(), "upgrade".to_string()];
+    args.extend(deps.iter().map(|(d, _)| d.name.clone()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    push_step(plan, StepKind::Install, &format!("{program} pub upgrade"), program, &args, dir);
+    push_step(plan, StepKind::Verify, &format!("{program} analyze"), program, &["analyze"], dir);
+    if dir.join("test").is_dir() {
+        push_step(plan, StepKind::Test, &format!("{program} test"), program, &["test"], dir);
+    }
     Ok(())
 }
 
@@ -887,7 +924,7 @@ pub(crate) fn tail(output: &str) -> String {
 /// bun are `.cmd` launchers; starting them by full path lets the standard
 /// library pass arguments through cmd safely, where wrapping everything in
 /// `cmd /C` would treat `&`, `>` or `|` in an argument or folder as shell syntax.
-fn resolve_program(program: &str) -> PathBuf {
+pub(crate) fn resolve_program(program: &str) -> PathBuf {
     let given = PathBuf::from(program);
     if !cfg!(windows) || given.extension().is_some() || given.components().count() > 1 {
         return given;
@@ -1118,6 +1155,23 @@ mod tests {
         assert!(pipfile.edits[0].after.contains("flask = \"==3.1.0\""));
         assert!(pipfile.edits[0].after.contains("pytest = {version = \">=8.3.4\"}"), "{}", pipfile.edits[0].after);
         assert_eq!(pipfile.steps[0].program, "pipenv");
+    }
+
+    #[test]
+    fn pub_rewrites_constraints_and_upgrades_with_flutter() {
+        let dir = temp("pub");
+        std::fs::write(dir.join("pubspec.yaml"), "name: app\n\ndependencies:\n  flutter:\n    sdk: flutter\n  http: ^1.1.0 # client\n  intl: any\n").unwrap();
+        std::fs::write(dir.join("pubspec.lock"), "packages: {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("test")).unwrap();
+        let deps = vec![dep("http", Ecosystem::Pub, "^1.1.0", "1.2.2"), dep("intl", Ecosystem::Pub, "any", "0.19.0")];
+        let p = project(&dir, "pubspec.yaml", Ecosystem::Pub, deps);
+        let changes = [Change { from: None, name: "http".into(), to: "1.4.0".into() }, Change { from: None, name: "intl".into(), to: "0.20.2".into() }];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        assert!(plan.edits[0].after.contains("  http: ^1.4.0 # client\n"));
+        assert!(plan.edits[0].after.contains("  intl: any\n"), "any already allows it");
+        assert_eq!(plan.changes[1].written_after, "any");
+        let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
+        assert_eq!(steps, ["flutter pub upgrade http intl", "flutter analyze", "flutter test"]);
     }
 
     #[test]

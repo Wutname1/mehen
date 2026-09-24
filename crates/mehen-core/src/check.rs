@@ -139,6 +139,7 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
             installed,
             python: project.python_version.clone(),
+            dart: toolchain.dart.clone(),
         };
         for dep in &mut project.dependencies {
             let mut own: Vec<Limit> = limits.get(&dep.name).cloned().unwrap_or_default();
@@ -199,6 +200,7 @@ fn project_node(pinned: Option<&str>, engines: Option<&str>, installed: Option<&
 struct Toolchain {
     rust: Option<String>,
     node: Option<String>,
+    dart: Option<String>,
 }
 
 /// Installed toolchains rarely change, and asking costs two process starts.
@@ -212,8 +214,9 @@ impl Toolchain {
                 return known.clone();
             }
         }
-        let (rust, node) = futures::join!(version_of("rustc", 1), version_of("node", 0));
-        let found = Toolchain { rust, node };
+        // `Dart SDK version: 3.5.0 (stable) ...`
+        let (rust, node, dart) = futures::join!(version_of("rustc", 1), version_of("node", 0), version_of("dart", 3));
+        let found = Toolchain { rust, node, dart };
         *TOOLCHAIN.lock().unwrap() = Some((Instant::now(), found.clone()));
         found
     }
@@ -222,7 +225,8 @@ impl Toolchain {
 /// Runs `<program> --version` and takes the given whitespace-separated word:
 /// `rustc 1.97.1 (8bab26f4f 2026-07-14)` -> word 1, `v26.3.1` -> word 0.
 async fn version_of(program: &str, word: usize) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(program);
+    // Found the way update steps are, so `dart.bat` (from Flutter) works too.
+    let mut cmd = tokio::process::Command::new(crate::update::resolve_program(program));
     cmd.arg("--version").kill_on_drop(true);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);

@@ -16,7 +16,7 @@ use crate::version::{Version, from_spec};
 
 const SKIP_DIRS: &[&str] = &[
     "node_modules", "target", "bin", "obj", ".git", "dist", "build", "out", ".next", ".nuxt", ".turbo", ".svelte-kit", ".venv", "venv",
-    ".vs", ".idea", "coverage", ".gradle", "Pods", ".pnpm-store", ".yarn",
+    ".vs", ".idea", "coverage", ".dart_tool", ".gradle", "Pods", ".pnpm-store", ".yarn",
 ];
 
 static USES_RE: LazyLock<Regex> =
@@ -106,6 +106,7 @@ pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
             "package.json" => scanner.package_json(path),
             "Cargo.toml" => scanner.cargo_toml(path),
             "go.mod" => scanner.go_mod(path),
+            "pubspec.yaml" => scanner.pubspec(path),
             "pyproject.toml" => scanner.pyproject(path),
             "Pipfile" => scanner.pipfile(path),
             _ if file_name.starts_with("requirements") && ext == "txt" => scanner.requirements_txt(path),
@@ -166,7 +167,7 @@ fn dedupe_python(deps: &mut Vec<Dependency>) {
 }
 
 fn is_manifest(file_name: &str, ext: &str) -> bool {
-    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod" | "pyproject.toml" | "Pipfile")
+    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod" | "pyproject.toml" | "Pipfile" | "pubspec.yaml")
         || file_name.starts_with("requirements") && ext == "txt"
         || matches!(ext, "csproj" | "fsproj" | "vbproj" | "yml" | "yaml")
 }
@@ -401,6 +402,36 @@ impl Scanner {
     /// Direct requirements only: `// indirect` ones come along with them, as
     /// npm's nested packages do. A replaced module is local, since updating
     /// the original would change nothing.
+    /// Versions come from `pubspec.lock`; the Flutter SDK, folders, git and
+    /// other package servers are local.
+    fn pubspec(&mut self, path: &Path) -> anyhow::Result<()> {
+        let spec = crate::dart::parse(&read_text(path)?)?;
+        let dir = path.parent().unwrap_or(path);
+        let lock = dir.join("pubspec.lock");
+        let locked = crate::dart::read_lock(&lock);
+        let mut deps = Vec::new();
+        for entry in &spec.entries {
+            let kind = if entry.dev { DepKind::Dev } else { DepKind::Normal };
+            let mut dep = Dependency::new(&entry.name, Ecosystem::Pub, kind, &entry.constraint);
+            match (entry.local, locked.get(&entry.name)) {
+                (Some(why), _) => {
+                    dep.status = Status::Local;
+                    dep.note = Some(why.into());
+                }
+                (None, Some(version)) => {
+                    dep.installed = Some(version.clone());
+                    dep.installed_from = Some("pubspec.lock".into());
+                }
+                (None, None) if entry.constraint.is_empty() || entry.constraint == "any" => dep.note = Some("no version given".into()),
+                (None, None) => {}
+            }
+            deps.push(dep);
+        }
+        let name = spec.name.clone().unwrap_or_else(|| dir_name(dir));
+        self.push(path, name, Ecosystem::Pub, Vec::new(), deps);
+        Ok(())
+    }
+
     fn go_mod(&mut self, path: &Path) -> anyhow::Result<()> {
         let parsed = crate::golang::parse(&read_text(path)?);
         let dir = path.parent().unwrap_or(path);

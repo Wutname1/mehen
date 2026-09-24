@@ -1,6 +1,6 @@
 // Mirrors crates/mehen-core/src/model.rs (serde camelCase / kebab-case).
 
-export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go' | 'pypi'
+export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go' | 'pypi' | 'pub'
 export type DepKind = 'normal' | 'dev' | 'build' | 'peer' | 'action'
 export type Status = 'pending' | 'local' | 'unpinned' | 'unknown' | 'up-to-date' | 'patch' | 'minor' | 'major'
 
