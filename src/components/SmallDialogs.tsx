@@ -14,7 +14,7 @@ export function AddFolderDialog({ onAdd, onClose }: { onAdd: (path: string) => v
   return (
     <Dialog
       title="Add a folder to scan"
-      description="Mehen looks for npm, Cargo, NuGet, and GitHub Actions projects anywhere under this folder. Your exclusions still apply."
+      description="Mehen looks for npm, Cargo, NuGet, Go, Python, Dart and Flutter, PHP, Ruby, and GitHub Actions projects anywhere under this folder. Your exclusions still apply."
       icon={<FolderPlus size={22} />}
       onClose={onClose}
       onEnter={add}

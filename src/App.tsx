@@ -759,7 +759,7 @@ function Welcome({
       <Logo size={72} />
       <h1 className="font-display text-[22px] font-semibold tracking-[-0.015em]">Every project, checked in one place</h1>
       <p className="max-w-lg leading-relaxed text-muted">
-        Mehen finds every npm, Cargo, NuGet and GitHub Actions project in the folders you choose, checks each package for newer versions and known
+        Mehen finds every npm, Cargo, NuGet, Go, Python, Dart and Flutter, PHP, Ruby, and GitHub Actions project in the folders you choose, checks each package for newer versions and known
         vulnerabilities, and shows where your projects have drifted apart.
       </p>
       {folders.length > 0 ? (

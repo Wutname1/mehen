@@ -6,7 +6,7 @@
 
 A desktop app you open when you want to check every project on your machine for outdated and unsafe dependencies, and update them.
 
-Point it at a folder like `C:\code` and Mehen finds every npm, Cargo, NuGet and GitHub Actions project inside, checks each package against its registry and the [OSV](https://osv.dev) vulnerability database, and shows you three things no single-project tool can:
+Point it at a folder like `C:\code` and Mehen finds every npm, Cargo, NuGet, Go, Python, Dart and Flutter, PHP, Ruby and GitHub Actions project inside, checks each package against its registry and the [OSV](https://osv.dev) vulnerability database, and shows you three things no single-project tool can:
 
 - **What is out of date**, across every project at once
 - **Where your projects have drifted apart**: the same package on different versions in different repos
@@ -33,12 +33,17 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
   | Cargo | `Cargo.toml` (members, workspaces, target-specific tables) | `Cargo.lock` |
   | NuGet | SDK-style `.csproj`/`.fsproj`/`.vbproj`, `packages.config` (.NET Framework), `Directory.Packages.props` | the manifest (exact versions) |
   | GitHub Actions | `.github/workflows/*.yml`, `action.yml` | the ref itself; commit-pinned actions are resolved to their tag |
+  | Go | `go.mod` (`replace`d modules are marked local) | `go.mod` |
+  | Python | `pyproject.toml` (PEP 621, dependency groups, Poetry, PDM), `Pipfile`, `requirements*.txt` | `uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, or an exact `==` pin |
+  | Dart and Flutter | `pubspec.yaml` | `pubspec.lock` |
+  | PHP | `composer.json` | `composer.lock` |
+  | Ruby | `Gemfile` | `Gemfile.lock` |
 
 - **Ignore rules** keep out what you don't care about: a whole folder or repo, a single project, or a name pattern like `temp` or `fixtures` that matches anywhere. Set them before a check (the Folders panel lists every project found, with checkboxes) or after one (Ignore project / Ignore repo on any result, with Undo).
 
 ### Check
 
-- Latest versions from npm, the crates.io sparse index, the NuGet registration API, and `git ls-remote` for Actions (no GitHub API rate limit)
+- Latest versions from npm, the crates.io sparse index, the NuGet registration API, the Go module proxy, PyPI, pub.dev, Packagist and rubygems.org, and `git ls-remote` for Actions (no GitHub API rate limit)
 - A **safe** target alongside the latest: the newest release on the current major line (or minor line for `0.x`), where breaking changes are unlikely
 - **Only versions the project can use** are offered. .NET: the version must ship for the project's target framework (`net8.0` is offered EF Core 9, with 10 marked "only supports net10.0"). Cargo: the crate's `rust-version` must fit the project's (or your installed Rust). npm: its `engines.node` must accept the Node the project runs on (`.nvmrc`, or your installed Node when it fits `engines`). A version already in use is never filtered out, so Mehen never suggests a downgrade
 - Vulnerabilities from OSV, with severity, summary and fixed versions
@@ -53,7 +58,7 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
   - Cargo keeps short versions (`"0.13"`), inline tables and comments
   - NuGet handles either attribute order, `<Version>` child elements, central package versions, and `packages.config` HintPaths
   - Actions keep their pin style: `@v4` becomes `@v7`, and a commit pin becomes the new tag's commit with a `# v7.0.1` comment
-- Then runs an install for the right tool (npm/pnpm/yarn/bun chosen by lockfile, `cargo update -p` for only the chosen crates, `dotnet restore`) and optionally a build check (`npm run build`, `cargo check`, `dotnet build`)
+- Then runs an install for the right tool (npm/pnpm/yarn/bun chosen by lockfile, `cargo update -p` for only the chosen crates, `dotnet restore`, `go mod tidy`, the project's Python tool, `flutter`/`dart pub upgrade`, `composer update`, `bundle update --conservative`) and optionally its build and tests (the defaults are listed under Settings > Updates and checks)
 - **Rollback**: the manifest and lockfile are saved first. If any step fails they are restored byte for byte. If the files changed since you reviewed the update, nothing is written.
 - **Optional git commit** of exactly the files the update touched (default message `chore(deps): update X to Y`, editable), on the current branch. Other staged work is left alone, hooks run, nothing is pushed. Not offered when those files already had uncommitted edits.
 

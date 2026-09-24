@@ -560,8 +560,8 @@ export function SettingsDialog({
                 </SettingRow>
                 <SectionTitle>Where advisories come from</SectionTitle>
                 <p className="py-1 text-[12.5px] leading-relaxed text-muted">
-                  Mehen asks the open OSV database (osv.dev) about every installed version. OSV gathers GitHub Security Advisories, which cover npm and
-                  NuGet, and the RustSec database for Cargo. Answers are cached locally, and Check everything again skips the cache.
+                  Mehen asks the open OSV database (osv.dev) about every installed version. OSV gathers GitHub Security Advisories, which cover every kind
+                  of project Mehen checks, plus the RustSec, Go, and Python advisory databases. Answers are cached locally, and Check everything again skips the cache.
                 </p>
               </>
             )}

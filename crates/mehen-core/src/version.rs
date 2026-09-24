@@ -1,4 +1,4 @@
-//! Lenient version handling that works across npm, Cargo, NuGet and action tags.
+//! Lenient version handling that works across every supported ecosystem and action tags.
 //! Strict semver would reject NuGet's four-part versions and `v4`-style tags.
 
 use std::cmp::Ordering;
