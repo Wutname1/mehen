@@ -140,6 +140,8 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             installed,
             python: project.python_version.clone(),
             dart: toolchain.dart.clone(),
+            php: project.php_version.clone().or_else(|| toolchain.php.clone()),
+            ruby: toolchain.ruby.clone(),
         };
         for dep in &mut project.dependencies {
             let mut own: Vec<Limit> = limits.get(&dep.name).cloned().unwrap_or_default();
@@ -201,6 +203,8 @@ struct Toolchain {
     rust: Option<String>,
     node: Option<String>,
     dart: Option<String>,
+    php: Option<String>,
+    ruby: Option<String>,
 }
 
 /// Installed toolchains rarely change, and asking costs two process starts.
@@ -215,8 +219,10 @@ impl Toolchain {
             }
         }
         // `Dart SDK version: 3.5.0 (stable) ...`
-        let (rust, node, dart) = futures::join!(version_of("rustc", 1), version_of("node", 0), version_of("dart", 3));
-        let found = Toolchain { rust, node, dart };
+        // `PHP 8.3.4 (cli) ...`, `ruby 3.3.0 (2023-12-25 ...)`.
+        let (rust, node, dart, php, ruby) =
+            futures::join!(version_of("rustc", 1), version_of("node", 0), version_of("dart", 3), version_of("php", 1), version_of("ruby", 1));
+        let found = Toolchain { rust, node, dart, php, ruby };
         *TOOLCHAIN.lock().unwrap() = Some((Instant::now(), found.clone()));
         found
     }
@@ -232,7 +238,8 @@ async fn version_of(program: &str, word: usize) -> Option<String> {
     cmd.creation_flags(0x0800_0000);
     let out = tokio::time::timeout(Duration::from_secs(5), cmd.output()).await.ok()?.ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let raw = text.split_whitespace().nth(word)?.trim_start_matches('v');
+    // Older Ruby writes its patch level on: `2.7.8p225`.
+    let raw = text.split_whitespace().nth(word)?.trim_start_matches('v').split('p').next()?;
     Version::parse(raw).map(|_| raw.to_string())
 }
 
@@ -625,6 +632,7 @@ mod tests {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: vec![dep],
         };
         let mut inventory = Inventory { projects: vec![project], ..Default::default() };
@@ -751,6 +759,7 @@ mod tests {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: vec![npm_dep("@mui/material", "5.1.2"), npm_dep("react", "18.2.0")],
         };
         let mut infos = HashMap::new();

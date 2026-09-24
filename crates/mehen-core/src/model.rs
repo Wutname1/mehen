@@ -10,10 +10,13 @@ pub enum Ecosystem {
     Go,
     Pypi,
     Pub,
+    Packagist,
+    #[serde(rename = "rubygems")]
+    RubyGems,
 }
 
 impl Ecosystem {
-    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`, `pypi`, `pub`).
+    /// The name used in settings and the UI (`npm`, `cargo`, `nuget`, `github-actions`, `go`, `pypi`, `pub`, `packagist`, `rubygems`).
     pub fn key(self) -> &'static str {
         match self {
             Ecosystem::Npm => "npm",
@@ -23,6 +26,8 @@ impl Ecosystem {
             Ecosystem::Go => "go",
             Ecosystem::Pypi => "pypi",
             Ecosystem::Pub => "pub",
+            Ecosystem::Packagist => "packagist",
+            Ecosystem::RubyGems => "rubygems",
         }
     }
 
@@ -36,6 +41,8 @@ impl Ecosystem {
             Ecosystem::Go => "Go",
             Ecosystem::Pypi => "PyPI",
             Ecosystem::Pub => "Pub",
+            Ecosystem::Packagist => "Packagist",
+            Ecosystem::RubyGems => "RubyGems",
         }
     }
 }
@@ -157,6 +164,9 @@ pub struct Project {
     /// `python`, or `.python-version`).
     #[serde(default)]
     pub python_version: Option<String>,
+    /// Composer's `config.platform.php`: the PHP to resolve for instead of the installed one.
+    #[serde(default)]
+    pub php_version: Option<String>,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -303,6 +313,7 @@ mod tests {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: vec![dep],
         }
     }

@@ -92,6 +92,8 @@ fn eco_key(ecosystem: Ecosystem) -> &'static str {
         Ecosystem::Go => "go",
         Ecosystem::Pypi => "pypi",
         Ecosystem::Pub => "pub",
+        Ecosystem::Packagist => "packagist",
+        Ecosystem::RubyGems => "rubygems",
     }
 }
 
@@ -657,6 +659,7 @@ mod tests {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: vec![mui],
         };
         let inventory = Inventory { roots: vec!["C:\\".into()], projects: vec![project], ..Default::default() };

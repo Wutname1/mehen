@@ -1,6 +1,6 @@
 // Mirrors crates/mehen-core/src/model.rs (serde camelCase / kebab-case).
 
-export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go' | 'pypi' | 'pub'
+export type Ecosystem = 'npm' | 'cargo' | 'nuget' | 'github-actions' | 'go' | 'pypi' | 'pub' | 'packagist' | 'rubygems'
 export type DepKind = 'normal' | 'dev' | 'build' | 'peer' | 'action'
 export type Status = 'pending' | 'local' | 'unpinned' | 'unknown' | 'up-to-date' | 'patch' | 'minor' | 'major'
 
@@ -41,6 +41,8 @@ export interface Project {
   nodeEngines: string | null
   /** The lowest Python the project supports. */
   pythonVersion?: string | null
+  /** Composer's platform PHP, when the project sets one. */
+  phpVersion?: string | null
   dependencies: Dependency[]
 }
 

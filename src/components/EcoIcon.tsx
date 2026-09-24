@@ -1,13 +1,17 @@
 import { ECOSYSTEM_LABEL, PROJECT_TYPE_LABEL, type ProjectType } from '../derive'
 import type { Ecosystem } from '../types'
 
-type Brand = 'npm' | 'rust' | 'nuget' | 'github' | 'javascript' | 'dotnet' | 'go' | 'python' | 'dart'
+type Brand = 'npm' | 'rust' | 'nuget' | 'github' | 'javascript' | 'dotnet' | 'go' | 'python' | 'dart' | 'php' | 'ruby'
 
 /**
  * Brand marks from Simple Icons (CC0), filled with each brand's color. The
  * colors live in styles.css so dark surfaces can lift the darkest ones.
  */
 const PATHS: Record<Brand, string> = {
+  php:
+    'M7.01 10.207h-.944l-.515 2.648h.838c.556 0 .97-.105 1.242-.314.272-.21.455-.559.55-1.049.092-.47.05-.802-.124-.995-.175-.193-.523-.29-1.047-.29zM12 5.688C5.373 5.688 0 8.514 0 12s5.373 6.313 12 6.313S24 15.486 24 12c0-3.486-5.373-6.312-12-6.312zm-3.26 7.451c-.261.25-.575.438-.917.551-.336.108-.765.164-1.285.164H5.357l-.327 1.681H3.652l1.23-6.326h2.65c.797 0 1.378.209 1.744.628.366.418.476 1.002.33 1.752a2.836 2.836 0 0 1-.305.847c-.143.255-.33.49-.561.703zm4.024.715l.543-2.799c.063-.318.039-.536-.068-.651-.107-.116-.336-.174-.687-.174H11.46l-.704 3.625H9.388l1.23-6.327h1.367l-.327 1.682h1.218c.767 0 1.295.134 1.586.401s.378.7.263 1.299l-.572 2.944h-1.389zm7.597-2.265a2.782 2.782 0 0 1-.305.847c-.143.255-.33.49-.561.703a2.44 2.44 0 0 1-.917.551c-.336.108-.765.164-1.286.164h-1.18l-.327 1.682h-1.378l1.23-6.326h2.649c.797 0 1.378.209 1.744.628.366.417.477 1.001.331 1.751zM17.766 10.207h-.943l-.516 2.648h.838c.557 0 .971-.105 1.242-.314.272-.21.455-.559.551-1.049.092-.47.049-.802-.125-.995s-.524-.29-1.047-.29z',
+  ruby:
+    'M20.156.083c3.033.525 3.893 2.598 3.829 4.77L24 4.822 22.635 22.71 4.89 23.926h.016C3.433 23.864.15 23.729 0 19.139l1.645-3 2.819 6.586.503 1.172 2.805-9.144-.03.007.016-.03 9.255 2.956-1.396-5.431-.99-3.9 8.82-.569-.615-.51L16.5 2.114 20.159.073l-.003.01zM0 19.089zM5.13 5.073c3.561-3.533 8.157-5.621 9.922-3.84 1.762 1.777-.105 6.105-3.673 9.636-3.563 3.532-8.103 5.734-9.864 3.957-1.766-1.777.045-6.217 3.612-9.75l.003-.003z',
   dart:
     'M4.105 4.105S9.158 1.58 11.684.316a3.079 3.079 0 0 1 1.481-.315c.766.047 1.677.788 1.677.788L24 9.948v9.789h-4.263V24H9.789l-9-9C.303 14.5 0 13.795 0 13.105c0-.319.18-.818.316-1.105l3.789-7.895zm.679.679v11.787c.002.543.021 1.024.498 1.508L10.204 23h8.533v-4.263L4.784 4.784zm12.055-.678c-.899-.896-1.809-1.78-2.74-2.643-.302-.267-.567-.468-1.07-.462-.37.014-.87.195-.87.195L6.341 4.105l10.498.001z',
   python:
@@ -28,8 +32,8 @@ const PATHS: Record<Brand, string> = {
     'M24 8.77h-2.468v7.565h-1.425V8.77h-2.462V7.53H24zm-6.852 7.565h-4.821V7.53h4.63v1.24h-3.205v2.494h2.953v1.234h-2.953v2.604h3.396zm-6.708 0H8.882L4.78 9.863a2.896 2.896 0 0 1-.258-.51h-.036c.032.189.048.592.048 1.21v5.772H3.157V7.53h1.659l3.965 6.32c.167.261.275.442.323.54h.024c-.04-.233-.06-.629-.06-1.185V7.529h1.372zm-8.703-.693a.868.829 0 0 1-.869.829.868.829 0 0 1-.868-.83.868.829 0 0 1 .868-.828.868.829 0 0 1 .869.829Z',
 }
 
-const ECOSYSTEM_BRAND: Record<Ecosystem, Brand> = { npm: 'npm', cargo: 'rust', nuget: 'nuget', 'github-actions': 'github', go: 'go', pypi: 'python', pub: 'dart' }
-const PROJECT_TYPE_BRAND: Record<ProjectType, Brand> = { web: 'javascript', python: 'python', rust: 'rust', dotnet: 'dotnet', 'dotnet-framework': 'dotnet', go: 'go', dart: 'dart' }
+const ECOSYSTEM_BRAND: Record<Ecosystem, Brand> = { npm: 'npm', cargo: 'rust', nuget: 'nuget', 'github-actions': 'github', go: 'go', pypi: 'python', pub: 'dart', packagist: 'php', rubygems: 'ruby' }
+const PROJECT_TYPE_BRAND: Record<ProjectType, Brand> = { web: 'javascript', python: 'python', rust: 'rust', dotnet: 'dotnet', 'dotnet-framework': 'dotnet', go: 'go', dart: 'dart', php: 'php', ruby: 'ruby' }
 
 function BrandIcon({ brand, label, size = 14, className }: { brand: Brand; label: string; size?: number; className?: string }) {
   return (

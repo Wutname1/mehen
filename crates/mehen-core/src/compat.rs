@@ -1,6 +1,6 @@
 //! Whether a published package version can be used by a particular project:
 //! .NET target frameworks, a crate's minimum Rust version, npm `engines.node`
-//! and peers, Python's `requires-python`, or the Dart SDK a package needs.
+//! and peers, Python's `requires-python`, or the Dart, PHP or Ruby a package needs.
 //! Versions that fail are never offered as update targets.
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,10 @@ pub enum Requirement {
     Python { range: String },
     /// Pub: the `environment: sdk:` constraint.
     Dart { range: String },
+    /// Packagist: the `php` requirement.
+    Php { range: String },
+    /// RubyGems: `required_ruby_version`.
+    Ruby { range: String },
 }
 
 /// What a project can accept. `None`/empty means unknown, which never blocks.
@@ -37,6 +41,10 @@ pub struct ProjectEnv {
     pub python: Option<String>,
     /// The installed Dart SDK: pub resolves against it, not the project's own `sdk` range.
     pub dart: Option<String>,
+    /// The PHP Composer resolves for: `config.platform.php`, else the installed one.
+    pub php: Option<String>,
+    /// The installed Ruby, which Bundler resolves against.
+    pub ruby: Option<String>,
 }
 
 /// `Err` carries a short reason for the UI, like "only supports net10.0".
@@ -77,6 +85,14 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
         // Dart constraints use npm's range syntax (`>=3.0.0 <4.0.0`, `^3.4.0`).
         Requirement::Dart { range } => match &env.dart {
             Some(have) if !semver_satisfies(have, range) => Err(format!("needs Dart {}; Dart {have} is installed", range.trim())),
+            _ => Ok(()),
+        },
+        Requirement::Php { range } => match &env.php {
+            Some(have) if !semver_satisfies(have, &crate::php::as_npm_range(range)) => Err(format!("needs PHP {}; this project uses {have}", range.trim())),
+            _ => Ok(()),
+        },
+        Requirement::Ruby { range } => match &env.ruby {
+            Some(have) if !crate::ruby::satisfies(have, range) => Err(format!("needs Ruby {}; Ruby {have} is installed", range.trim())),
             _ => Ok(()),
         },
         Requirement::Node { range } => {

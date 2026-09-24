@@ -16,7 +16,7 @@ use crate::version::{Version, from_spec};
 
 const SKIP_DIRS: &[&str] = &[
     "node_modules", "target", "bin", "obj", ".git", "dist", "build", "out", ".next", ".nuxt", ".turbo", ".svelte-kit", ".venv", "venv",
-    ".vs", ".idea", "coverage", ".dart_tool", ".gradle", "Pods", ".pnpm-store", ".yarn",
+    ".vs", ".idea", "coverage", ".dart_tool", "vendor", ".gradle", "Pods", ".pnpm-store", ".yarn",
 ];
 
 static USES_RE: LazyLock<Regex> =
@@ -107,6 +107,8 @@ pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
             "Cargo.toml" => scanner.cargo_toml(path),
             "go.mod" => scanner.go_mod(path),
             "pubspec.yaml" => scanner.pubspec(path),
+            "composer.json" => scanner.composer_json(path),
+            "Gemfile" => scanner.gemfile(path),
             "pyproject.toml" => scanner.pyproject(path),
             "Pipfile" => scanner.pipfile(path),
             _ if file_name.starts_with("requirements") && ext == "txt" => scanner.requirements_txt(path),
@@ -167,7 +169,7 @@ fn dedupe_python(deps: &mut Vec<Dependency>) {
 }
 
 fn is_manifest(file_name: &str, ext: &str) -> bool {
-    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod" | "pyproject.toml" | "Pipfile" | "pubspec.yaml")
+    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod" | "pyproject.toml" | "Pipfile" | "pubspec.yaml" | "composer.json" | "Gemfile")
         || file_name.starts_with("requirements") && ext == "txt"
         || matches!(ext, "csproj" | "fsproj" | "vbproj" | "yml" | "yaml")
 }
@@ -289,6 +291,7 @@ impl Scanner {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies,
         });
         self.projects.last_mut()
@@ -333,6 +336,7 @@ impl Scanner {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: merged,
         });
     }
@@ -429,6 +433,60 @@ impl Scanner {
         }
         let name = spec.name.clone().unwrap_or_else(|| dir_name(dir));
         self.push(path, name, Ecosystem::Pub, Vec::new(), deps);
+        Ok(())
+    }
+
+    /// `require` and `require-dev` packages (platform requirements like `php`
+    /// and `ext-json` are not packages), versioned by `composer.lock`.
+    fn composer_json(&mut self, path: &Path) -> anyhow::Result<()> {
+        let json: serde_json::Value = serde_json::from_str(&read_text(path)?)?;
+        let dir = path.parent().unwrap_or(path);
+        let locked = crate::php::read_lock(&dir.join("composer.lock"));
+        let mut deps = Vec::new();
+        for (section, kind) in [("require", DepKind::Normal), ("require-dev", DepKind::Dev)] {
+            for (name, constraint) in json[section].as_object().into_iter().flatten().filter(|(n, _)| crate::php::is_package(n)) {
+                let constraint = constraint.as_str().unwrap_or_default();
+                let mut dep = Dependency::new(name, Ecosystem::Packagist, kind, constraint);
+                if constraint.starts_with("dev-") {
+                    dep.status = Status::Unpinned;
+                    dep.note = Some("follows a branch".into());
+                } else if let Some(version) = locked.get(name) {
+                    dep.installed = Some(version.clone());
+                    dep.installed_from = Some("composer.lock".into());
+                }
+                deps.push(dep);
+            }
+        }
+        let name = json["name"].as_str().map(str::to_string).unwrap_or_else(|| dir_name(dir));
+        let platform_php = json["config"]["platform"]["php"].as_str().map(str::to_string);
+        if let Some(project) = self.push(path, name, Ecosystem::Packagist, Vec::new(), deps) {
+            project.php_version = platform_php;
+        }
+        Ok(())
+    }
+
+    fn gemfile(&mut self, path: &Path) -> anyhow::Result<()> {
+        let dir = path.parent().unwrap_or(path);
+        let locked = crate::ruby::read_lock(&dir.join("Gemfile.lock"));
+        let mut deps = Vec::new();
+        for gem in crate::ruby::parse_gemfile(&read_text(path)?) {
+            let kind = if gem.dev { DepKind::Dev } else { DepKind::Normal };
+            let mut dep = Dependency::new(&gem.name, Ecosystem::RubyGems, kind, &gem.requirement);
+            match (gem.local, locked.get(&gem.name)) {
+                (Some(why), _) => {
+                    dep.status = Status::Local;
+                    dep.note = Some(why.into());
+                }
+                (None, Some(version)) => {
+                    dep.installed = Some(version.clone());
+                    dep.installed_from = Some("Gemfile.lock".into());
+                }
+                (None, None) if gem.requirement.is_empty() => dep.note = Some("no version given".into()),
+                (None, None) => {}
+            }
+            deps.push(dep);
+        }
+        self.push(path, format!("{} (Gemfile)", dir_name(dir)), Ecosystem::RubyGems, Vec::new(), deps);
         Ok(())
     }
 

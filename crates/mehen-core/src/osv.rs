@@ -174,6 +174,8 @@ fn from_osv_name(name: &str) -> Option<Ecosystem> {
         "Go" => Some(Ecosystem::Go),
         "PyPI" => Some(Ecosystem::Pypi),
         "Pub" => Some(Ecosystem::Pub),
+        "Packagist" => Some(Ecosystem::Packagist),
+        "RubyGems" => Some(Ecosystem::RubyGems),
         _ => None,
     }
 }

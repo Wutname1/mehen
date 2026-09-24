@@ -76,6 +76,8 @@ pub async fn lookup(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) ->
         Ecosystem::Go => go_module(http, name).await,
         Ecosystem::Pypi => pypi(http, name).await,
         Ecosystem::Pub => pub_dev(http, name).await,
+        Ecosystem::Packagist => packagist(http, name).await,
+        Ecosystem::RubyGems => rubygems(http, name).await,
     }
 }
 
@@ -114,6 +116,51 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         }
     }
     Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
+}
+
+/// Packagist's compact `p2` document, with each version's PHP requirement.
+/// Branch versions (`dev-main`) live in a separate document and are never
+/// offered.
+async fn packagist(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    let doc: serde_json::Value = get(http, &format!("https://repo.packagist.org/p2/{name}.json"), None).await?.json().await?;
+    let entries = doc["packages"][name].as_array().cloned().unwrap_or_default();
+    let mut versions = Vec::new();
+    let mut requirements = Vec::new();
+    for (version, php) in crate::php::expand_versions(&entries) {
+        if version.starts_with("dev-") || version.ends_with("-dev") {
+            continue;
+        }
+        if let Some(range) = php.filter(|p| !p.trim().is_empty()) {
+            requirements.push((version.clone(), Requirement::Php { range }));
+        }
+        versions.push(version);
+    }
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
+}
+
+/// rubygems.org lists each version once per platform; pre-releases are skipped.
+async fn rubygems(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    #[derive(Deserialize)]
+    struct Release {
+        number: String,
+        #[serde(default)]
+        prerelease: bool,
+        #[serde(default)]
+        ruby_version: Option<String>,
+    }
+    let releases: Vec<Release> = get(http, &format!("https://rubygems.org/api/v1/versions/{name}.json"), None).await?.json().await?;
+    let mut versions: Vec<String> = Vec::new();
+    let mut requirements = Vec::new();
+    for release in releases.into_iter().filter(|r| !r.prerelease) {
+        if versions.contains(&release.number) {
+            continue;
+        }
+        if let Some(range) = release.ruby_version.filter(|r| !r.trim().is_empty() && r.trim() != ">= 0") {
+            requirements.push((release.number.clone(), Requirement::Ruby { range }));
+        }
+        versions.push(release.number);
+    }
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
 }
 
 /// pub.dev lists every version with the Dart SDK it needs. Retracted

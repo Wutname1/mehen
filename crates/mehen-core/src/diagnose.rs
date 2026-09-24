@@ -65,6 +65,8 @@ pub fn ecosystem_of(program: &str) -> Option<Ecosystem> {
         "go" => Some(Ecosystem::Go),
         "uv" | "poetry" | "pdm" | "pipenv" | "pip" | "python" => Some(Ecosystem::Pypi),
         "flutter" | "dart" => Some(Ecosystem::Pub),
+        "composer" => Some(Ecosystem::Packagist),
+        "bundle" | "bundler" | "gem" | "ruby" => Some(Ecosystem::RubyGems),
         _ => None,
     }
 }
@@ -76,7 +78,7 @@ pub fn diagnose(output: &str, ok: bool, ecosystem: Ecosystem, changes: &[Planned
         Ecosystem::Npm => [npm(output), pnpm(output), yarn(output)].concat(),
         Ecosystem::Nuget => nuget(output),
         Ecosystem::Cargo => cargo(output),
-        Ecosystem::GithubActions | Ecosystem::Go | Ecosystem::Pypi | Ecosystem::Pub => Vec::new(),
+        Ecosystem::GithubActions | Ecosystem::Go | Ecosystem::Pypi | Ecosystem::Pub | Ecosystem::Packagist | Ecosystem::RubyGems => Vec::new(),
     };
     let mut conflicts: Vec<Conflict> = Vec::new();
     for f in findings {

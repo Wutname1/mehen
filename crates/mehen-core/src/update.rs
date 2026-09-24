@@ -188,6 +188,8 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         Ecosystem::Go => plan_go(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::Pypi => plan_python(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::Pub => plan_pub(&mut plan, &manifest, &dir, &deps)?,
+        Ecosystem::Packagist => plan_composer(&mut plan, &manifest, &dir, &deps)?,
+        Ecosystem::RubyGems => plan_bundler(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
     for edit in &mut plan.edits {
@@ -483,6 +485,82 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
     push_step(plan, StepKind::Install, "cargo update (only the selected crates)", "cargo", &args, dir);
     push_step(plan, StepKind::Verify, "cargo check", "cargo", &["check", "--quiet"], dir);
     push_step(plan, StepKind::Test, "cargo test", "cargo", &["test", "--quiet"], dir);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- PHP
+
+/// Rewrites each constraint in `composer.json`, then `composer update`
+/// moves those packages (and what they need) in `composer.lock`.
+fn plan_composer(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+    let before = read(manifest)?;
+    let mut text = before.clone();
+    for (dep, change) in deps {
+        let new = crate::php::rewrite(&dep.requested, &change.to);
+        if new != dep.requested {
+            let re = Regex::new(&format!(r#"("{}"\s*:\s*"){}(")"#, regex::escape(&dep.name), regex::escape(&dep.requested)))?;
+            text = replace_middle(&re, &text, &new).ok_or_else(|| anyhow!("{}: `{}` not found in composer.json", dep.name, dep.requested))?;
+        }
+        plan.changes.push(PlannedChange { name: dep.name.clone(), from: dep.current.clone().unwrap_or_else(|| dep.requested.clone()), to: change.to.clone(), written_before: dep.requested.clone(), written_after: new });
+    }
+    let json = serde_json::from_str::<serde_json::Value>(&before).ok();
+    let test_script = json.as_ref().is_some_and(|j| !j["scripts"]["test"].is_null());
+    push_edit(plan, manifest, before, text);
+    let lock = dir.join("composer.lock");
+    if lock.is_file() {
+        plan.snapshots.push(lock.display().to_string());
+    }
+    let mut args = vec!["update".to_string(), "--with-dependencies".to_string()];
+    args.extend(deps.iter().map(|(d, _)| d.name.clone()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    push_step(plan, StepKind::Install, "composer update", "composer", &args, dir);
+    if test_script {
+        push_step(plan, StepKind::Test, "composer test", "composer", &["run-script", "test"], dir);
+    } else if ["phpunit.xml", "phpunit.xml.dist"].iter().any(|f| dir.join(f).is_file()) {
+        push_step(plan, StepKind::Test, "phpunit", "composer", &["exec", "phpunit"], dir);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- Ruby
+
+/// Replaces the version strings at the start of `name`'s `gem` line, keeping
+/// its quotes and options. A gem with no version is left as written.
+fn gemfile_set(text: &str, name: &str, new: &str) -> Option<String> {
+    let re = Regex::new(&format!(r#"(?m)^([ \t]*gem[ \t]+(['"]){}['"])((?:[ \t]*,[ \t]*['"][^'"\n]*['"])+)"#, regex::escape(name))).ok()?;
+    let caps = re.captures(text)?;
+    let quote = &caps[2];
+    let strings = new.split(", ").map(|r| format!("{quote}{r}{quote}")).collect::<Vec<_>>().join(", ");
+    let whole = caps.get(0)?;
+    Some(format!("{}{}, {strings}{}", &text[..whole.start()], &caps[1], &text[whole.end()..]))
+}
+
+/// Rewrites each gem's requirement in the Gemfile, then `bundle update
+/// --conservative` moves only those gems in `Gemfile.lock`.
+fn plan_bundler(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+    let before = read(manifest)?;
+    let mut text = before.clone();
+    for (dep, change) in deps {
+        let new = crate::ruby::rewrite(&dep.requested, &change.to);
+        if new != dep.requested && !dep.requested.is_empty() {
+            text = gemfile_set(&text, &dep.name, &new).ok_or_else(|| anyhow!("{}: no version found on its gem line", dep.name))?;
+        }
+        plan.changes.push(PlannedChange { name: dep.name.clone(), from: dep.current.clone().unwrap_or_else(|| dep.requested.clone()), to: change.to.clone(), written_before: dep.requested.clone(), written_after: new });
+    }
+    push_edit(plan, manifest, before, text);
+    let lock = dir.join("Gemfile.lock");
+    if lock.is_file() {
+        plan.snapshots.push(lock.display().to_string());
+    }
+    let mut args = vec!["update".to_string(), "--conservative".to_string()];
+    args.extend(deps.iter().map(|(d, _)| d.name.clone()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    push_step(plan, StepKind::Install, "bundle update", "bundle", &args, dir);
+    if dir.join("spec").is_dir() {
+        push_step(plan, StepKind::Test, "bundle exec rspec", "bundle", &["exec", "rspec"], dir);
+    } else if dir.join("test").is_dir() && dir.join("Rakefile").is_file() {
+        push_step(plan, StepKind::Test, "bundle exec rake test", "bundle", &["exec", "rake", "test"], dir);
+    }
     Ok(())
 }
 
@@ -1060,6 +1138,7 @@ mod tests {
             node_version: None,
             node_engines: None,
             python_version: None,
+            php_version: None,
             dependencies: deps,
         }
     }
@@ -1172,6 +1251,49 @@ mod tests {
         assert_eq!(plan.changes[1].written_after, "any");
         let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
         assert_eq!(steps, ["flutter pub upgrade http intl", "flutter analyze", "flutter test"]);
+    }
+
+    #[test]
+    fn composer_rewrites_constraints_and_updates() {
+        let dir = temp("composer");
+        std::fs::write(
+            dir.join("composer.json"),
+            "{\n    \"require\": {\n        \"php\": \"^8.1\",\n        \"monolog/monolog\": \"^2.9\",\n        \"guzzlehttp/guzzle\": \"^7.2 || ^8.0\"\n    },\n    \"scripts\": {\"test\": \"phpunit\"}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("composer.lock"), "{}").unwrap();
+        let deps = vec![dep("monolog/monolog", Ecosystem::Packagist, "^2.9", "2.9.3"), dep("guzzlehttp/guzzle", Ecosystem::Packagist, "^7.2 || ^8.0", "7.9.2")];
+        let p = project(&dir, "composer.json", Ecosystem::Packagist, deps);
+        let changes = [Change { from: None, name: "monolog/monolog".into(), to: "3.8.1".into() }, Change { from: None, name: "guzzlehttp/guzzle".into(), to: "9.0.1".into() }];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        let after = &plan.edits[0].after;
+        assert!(after.contains("\"monolog/monolog\": \"^3.8\""), "{after}");
+        assert!(after.contains("\"guzzlehttp/guzzle\": \"^9.0\""), "{after}");
+        assert!(after.contains("\"php\": \"^8.1\""));
+        let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
+        assert_eq!(steps, ["composer update --with-dependencies monolog/monolog guzzlehttp/guzzle", "composer run-script test"]);
+    }
+
+    #[test]
+    fn bundler_rewrites_gem_lines_and_updates_conservatively() {
+        let dir = temp("bundler");
+        std::fs::write(dir.join("Gemfile"), "source \"https://rubygems.org\"\n\ngem \"rails\", \"~> 7.1\", \">= 7.1.3\" # app\ngem 'puma', '>= 5.0', require: false\ngem 'bootsnap'\n").unwrap();
+        std::fs::write(dir.join("Gemfile.lock"), "GEM\n").unwrap();
+        std::fs::create_dir_all(dir.join("spec")).unwrap();
+        let deps = vec![dep("rails", Ecosystem::RubyGems, "~> 7.1, >= 7.1.3", "7.1.3"), dep("puma", Ecosystem::RubyGems, ">= 5.0", "6.4.2"), dep("bootsnap", Ecosystem::RubyGems, "", "1.18.3")];
+        let p = project(&dir, "Gemfile", Ecosystem::RubyGems, deps);
+        let changes = [
+            Change { from: None, name: "rails".into(), to: "8.0.1".into() },
+            Change { from: None, name: "puma".into(), to: "6.5.0".into() },
+            Change { from: None, name: "bootsnap".into(), to: "1.18.4".into() },
+        ];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        let after = &plan.edits[0].after;
+        assert!(after.contains("gem \"rails\", \"~> 8.0\", \">= 8.0.1\" # app\n"), "{after}");
+        assert!(after.contains("gem 'puma', '>= 6.5.0', require: false\n"), "{after}");
+        assert!(after.contains("gem 'bootsnap'\n"), "no version, only the lockfile moves");
+        let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
+        assert_eq!(steps, ["bundle update --conservative rails puma bootsnap", "bundle exec rspec"]);
     }
 
     #[test]
