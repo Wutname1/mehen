@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
-use mehen_core::store::StoreStats;
+use mehen_core::store::{Hold, StoreStats};
 use mehen_core::update::{self, Change, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
 use serde::{Deserialize, Serialize};
@@ -429,6 +429,26 @@ async fn repo_icons(app: AppHandle, repos: Vec<String>, discover: bool) -> Resul
     .map_err(err)
 }
 
+/// Packages kept on a release line.
+#[tauri::command]
+fn holds(state: State<'_, AppState>) -> Vec<Hold> {
+    state.store.holds()
+}
+
+/// Keeps `name` on `line` (`5` for 5.x) in `scope`: a project folder, or `*` for every project.
+/// Takes effect at the next check.
+#[tauri::command]
+fn set_hold(state: State<'_, AppState>, ecosystem: Ecosystem, name: String, scope: String, line: String) -> Result<Vec<Hold>, String> {
+    state.store.put_hold(ecosystem, &name, &scope, &line).map_err(err)?;
+    Ok(state.store.holds())
+}
+
+#[tauri::command]
+fn remove_hold(state: State<'_, AppState>, id: i64) -> Result<Vec<Hold>, String> {
+    state.store.remove_hold(id).map_err(err)?;
+    Ok(state.store.holds())
+}
+
 /// Commits already-applied updates, one commit per repository.
 #[tauri::command]
 fn commit_update(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
@@ -526,6 +546,9 @@ pub fn run() {
             set_check_commands,
             commit_update,
             repo_icons,
+            holds,
+            set_hold,
+            remove_hold,
             version_policy,
             set_version_policy,
             store_stats,

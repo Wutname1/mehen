@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { isWithin, samePath } from './derive'
-import type { BatchEvent, BatchResult, Change, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Settings, StepResult, StoreStats, UpdatePlan } from './types'
+import type { BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, StoreStats, UpdatePlan } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -113,6 +113,32 @@ export async function repoIcons(repos: string[], discover: boolean): Promise<{ r
   return invoke<{ repo: string; dataUrl: string }[]>('repo_icons', { repos, discover })
 }
 
+export async function holds(): Promise<Hold[]> {
+  if (!inTauri) return [...mockHolds]
+  return invoke<Hold[]>('holds')
+}
+
+/** Keeps a package on `line` (`5` for 5.x) in `scope`, a project folder or `*`. Applies at the next check. */
+export async function setHold(ecosystem: Ecosystem, name: string, scope: string, line: string): Promise<Hold[]> {
+  if (!inTauri) {
+    mockHolds = mockHolds.filter((h) => !(h.ecosystem === ecosystem && h.name === name && h.scope.toLowerCase() === scope.toLowerCase()))
+    mockHolds.push({ id: ++mockHoldId, ecosystem, name, scope, line })
+    return [...mockHolds]
+  }
+  return invoke<Hold[]>('set_hold', { ecosystem, name, scope, line })
+}
+
+export async function removeHold(id: number): Promise<Hold[]> {
+  if (!inTauri) {
+    mockHolds = mockHolds.filter((h) => h.id !== id)
+    return [...mockHolds]
+  }
+  return invoke<Hold[]>('remove_hold', { id })
+}
+
+let mockHolds: Hold[] = []
+let mockHoldId = 0
+
 export async function setNotify(notify: boolean): Promise<Settings> {
   if (!inTauri) return mock.setNotify(notify)
   return invoke<Settings>('set_notify', { notify })
@@ -217,10 +243,24 @@ const mock = (() => {
     }
   }
 
+  /** Roughly what the engine does with a hold: the newest release off the line is held back. */
+  function withHolds(project: Project): Project {
+    const scope = project.repo ?? project.dir
+    const dependencies = project.dependencies.map((dep) => {
+      const hold = mockHolds.find((h) => h.ecosystem === dep.ecosystem && h.name === dep.name && (h.scope === '*' || samePath(h.scope, scope)))
+      const best = dep.newest ?? dep.latest
+      if (!hold || !best || !dep.current) return dep
+      const onLine = (v: string) => v.replace(/^v/i, '').startsWith(`${hold.line}.`)
+      if (onLine(best)) return dep
+      return { ...dep, latest: onLine(dep.latest ?? '') ? dep.latest : dep.current, newest: best, blockedReason: `kept on ${hold.line}.x`, status: onLine(dep.latest ?? '') ? dep.status : ('up-to-date' as const) }
+    })
+    return { ...project, dependencies }
+  }
+
   async function filtered(): Promise<Inventory | null> {
     const inv = await load()
     if (!inv) return null
-    const projects = inv.projects.filter((p) => ruleFor(p.manifest, p.dir) === null)
+    const projects = inv.projects.filter((p) => ruleFor(p.manifest, p.dir) === null).map(withHolds)
     const used = new Set(projects.flatMap((p) => p.dependencies.flatMap((d) => d.vulns)))
     return { ...inv, projects, vulnerabilities: inv.vulnerabilities.filter((v) => used.has(v.id)) }
   }

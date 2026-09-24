@@ -4,15 +4,16 @@ import * as api from './api'
 import { AdvisoryDialog } from './components/AdvisoryDialog'
 import { Logo, cx } from './components/bits'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
+import { HeldBackDialog } from './components/HeldBack'
 import { ManageProjects } from './components/ManageProjects'
 import { Queue, type QueueFilters, type ScopedRow } from './components/Queue'
 import { Rail, ScanStatus } from './components/Rail'
 import { SettingsDialog, type SettingsTab } from './components/SettingsDialog'
 import { AddFolderDialog, ExcludeDialog } from './components/SmallDialogs'
 import { UpdateFlow, type UpdateTarget } from './components/UpdateFlow'
-import { RISK_ORDER, folderName, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
+import { RISK_ORDER, folderName, heldBack, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
 import { usePrefs } from './prefs'
-import type { Change, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, VersionPolicies } from './types'
+import type { Change, Hold, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, VersionPolicies } from './types'
 
 const SUGGESTED_ROOT = 'C:\\code'
 
@@ -31,6 +32,7 @@ type Dialog =
   | { kind: 'exclude'; repo: Repo; back: Back }
   | { kind: 'update'; start: 'confirm' | 'preview'; targets: UpdateTarget[] }
   | { kind: 'advisory'; row: QueueRow }
+  | { kind: 'held-back'; packageKey: string | null }
 
 function timeAgo(unixSeconds: number | null | undefined): string {
   if (!unixSeconds) return 'never'
@@ -58,6 +60,7 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [filters, setFilters] = useState<QueueFilters>(() => ({ types: new Set(), ecosystems: new Set(), risk: 'any', riskFirst: prefs.riskFirst }))
   const [policies, setPolicies] = useState<VersionPolicies>({})
+  const [holds, setHolds] = useState<Hold[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [icons, setIcons] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLInputElement>(null)
@@ -79,12 +82,13 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([api.settings(), api.lastInventory(), api.versionPolicy()])
-      .then(([s, inv, p]) => {
+    Promise.all([api.settings(), api.lastInventory(), api.versionPolicy(), api.holds()])
+      .then(([s, inv, p, h]) => {
         if (cancelled) return
         setSettings(s)
         setInventory(inv)
         setPolicies(p)
+        setHolds(h)
         if (prefs.scanOnOpen && s.folders.length && !scannedOnOpen.current) {
           scannedOnOpen.current = true
           run(false)
@@ -286,6 +290,50 @@ export default function App() {
     return { packages, projects, usages, allSelected: usages.every((u) => selected.has(u.key)) }
   }, [rows, inScope, selected])
 
+  const held = useMemo(() => (inventory ? heldBack(inventory.projects.filter((p) => !repo || samePath(repoKey(p), repo.key))) : []), [inventory, repo])
+
+  /** Re-checks only where a hold on `scope` changes anything. */
+  const recheck = (scope: string) => run(false, scope === '*' ? null : [scope])
+
+  const keep = async (row: QueueRow, scope: string, line: string) => {
+    try {
+      const before = holds.find((h) => h.ecosystem === row.ecosystem && h.name === row.name && samePath(h.scope, scope))
+      const next = await api.setHold(row.ecosystem, row.name, scope, line)
+      setHolds(next)
+      const added = next.find((h) => h.ecosystem === row.ecosystem && h.name === row.name && samePath(h.scope, scope))
+      setNotice({
+        text: `Keeping ${row.name} on ${line}.x ${scope === '*' ? 'everywhere' : `in ${nameOf(scope)}`}.`,
+        undo: added
+          ? async () => {
+              setNotice(null)
+              setHolds(before ? await api.setHold(before.ecosystem, before.name, before.scope, before.line) : await api.removeHold(added.id))
+              await recheck(scope)
+            }
+          : undefined,
+      })
+      await recheck(scope)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const release = async (hold: Hold) => {
+    try {
+      setHolds(await api.removeHold(hold.id))
+      setNotice({
+        text: `${hold.name} can move past ${hold.line}.x again.`,
+        undo: async () => {
+          setNotice(null)
+          setHolds(await api.setHold(hold.ecosystem, hold.name, hold.scope, hold.line))
+          await recheck(hold.scope)
+        },
+      })
+      await recheck(hold.scope)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
   const addAll = (usages: QueueUsage[], message: (n: number) => string) => {
     const added = usages.map((u) => u.key).filter((k) => !selected.has(k))
     if (!added.length) return
@@ -472,6 +520,12 @@ export default function App() {
             onAdvisory={(row) => setDialog({ kind: 'advisory', row })}
             searching={!!q}
             onClearSearch={() => setQuery('')}
+            holds={holds}
+            heldBack={held.length}
+            nameOf={nameOf}
+            onKeep={keep}
+            onRelease={release}
+            onWhy={(packageKey) => setDialog({ kind: 'held-back', packageKey })}
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (
@@ -501,6 +555,9 @@ export default function App() {
           inventory={inventory}
           policies={policies}
           onPolicies={setPolicies}
+          holds={holds}
+          nameOf={nameOf}
+          onRelease={release}
           onPrefs={(patch) => {
             setPrefs(patch)
             if (patch.riskFirst !== undefined) setFilters((f) => ({ ...f, riskFirst: patch.riskFirst! }))
@@ -573,6 +630,18 @@ export default function App() {
             )
             setDialog(null)
           }}
+          onClose={() => setDialog(null)}
+        />
+      )}
+
+      {dialog?.kind === 'held-back' && (
+        <HeldBackDialog
+          groups={dialog.packageKey ? held.filter((g) => g.key === dialog.packageKey) : held}
+          holds={holds}
+          icons={icons}
+          nameOf={nameOf}
+          scopeLabel={repo ? repo.name : 'your projects'}
+          onRelease={release}
           onClose={() => setDialog(null)}
         />
       )}

@@ -1,9 +1,9 @@
-import { Asterisk, FileX, FolderMinus, FolderPlus, Plus, RefreshCw, Undo2, X } from 'lucide-react'
+import { Asterisk, FileX, FolderMinus, FolderPlus, Pin, Plus, RefreshCw, Undo2, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import * as api from '../api'
-import { ECOSYSTEM_LABEL, POLICY_LABEL, isWithin, relativePath, type Repo } from '../derive'
+import { ECOSYSTEM_LABEL, POLICY_LABEL, isWithin, relativePath, samePath, type Repo } from '../derive'
 import type { Prefs } from '../prefs'
-import type { CheckCommands, CheckConfig, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, Inventory, Settings, VersionPolicies, VersionPolicy } from '../types'
+import type { CheckCommands, CheckConfig, DiscoveredProject, Ecosystem, Hold, IgnoreKind, IgnoreRule, Inventory, Settings, VersionPolicies, VersionPolicy } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { SectionTitle, Select, SettingRow, Switch, TextInput } from './controls'
@@ -121,6 +121,9 @@ export function SettingsDialog({
   inventory,
   policies,
   onPolicies,
+  holds,
+  nameOf,
+  onRelease,
   onPrefs,
   onSettings,
   onInventory,
@@ -137,6 +140,9 @@ export function SettingsDialog({
   inventory: Inventory | null
   policies: VersionPolicies
   onPolicies: (p: VersionPolicies) => void
+  holds: Hold[]
+  nameOf: (folder: string) => string
+  onRelease: (hold: Hold) => void
   onPrefs: (patch: Partial<Prefs>) => void
   onSettings: (s: Settings) => void
   onInventory: (inv: Inventory) => void
@@ -415,6 +421,7 @@ export function SettingsDialog({
                     ))}
                   </Select>
                 </SettingRow>
+                <KeptList holds={holds} nameOf={nameOf} onRelease={onRelease} />
                 <SectionTitle>Running updates</SectionTitle>
                 <SettingRow title="Run at most" help="Different repositories update side by side. Repositories that need the same tool (npm, cargo, dotnet) always take turns.">
                   <Select
@@ -464,6 +471,8 @@ export function SettingsDialog({
                     ))}
                   </Select>
                 </SettingRow>
+                <KeptList holds={holds.filter((h) => h.scope === '*' || samePath(h.scope, repo.key))} nameOf={nameOf} onRelease={onRelease} />
+                <SectionTitle>Checks</SectionTitle>
                 <SettingRow
                   title={`Use custom checks for ${repo.name}`}
                   help={
@@ -552,3 +561,34 @@ function EcosystemChecks({ ecosystem, commands, onCommands }: { ecosystem: Ecosy
   )
 }
 
+
+/** Packages kept on a release line, each with a way to let it move on. */
+function KeptList({ holds, nameOf, onRelease }: { holds: Hold[]; nameOf: (folder: string) => string; onRelease: (hold: Hold) => void }) {
+  const sorted = [...holds].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }) || a.scope.localeCompare(b.scope))
+  return (
+    <>
+      <SectionTitle>Kept on a release line</SectionTitle>
+      {sorted.length === 0 ? (
+        <p className="py-2 text-[12.5px] text-muted">
+          Nothing is kept back. Use <Pin size={12} className="inline align-[-1px]" /> on a package to keep it on its current release line, such as 5.x.
+        </p>
+      ) : (
+        sorted.map((h) => (
+          <SettingRow
+            key={h.id}
+            title={
+              <span className="flex items-center gap-2">
+                <Pin size={13} className="shrink-0 text-state" />
+                <span className="truncate">{h.name}</span>
+                <code className="font-mono text-[12px] text-muted">{h.line}.x</code>
+              </span>
+            }
+            help={`${ECOSYSTEM_LABEL[h.ecosystem]} · ${h.scope === '*' ? 'every project' : nameOf(h.scope)}`}
+          >
+            <Button onClick={() => onRelease(h)}>Stop keeping</Button>
+          </SettingRow>
+        ))
+      )}
+    </>
+  )
+}

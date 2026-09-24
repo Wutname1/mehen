@@ -235,3 +235,14 @@ export type VersionPolicy = 'any' | 'minor' | 'patch'
 
 /** By scope: a repository path, or `*` for every project. */
 export type VersionPolicies = Record<string, VersionPolicy>
+
+/** A package kept on one release line, everywhere or in one project. */
+export interface Hold {
+  id: number
+  ecosystem: Ecosystem
+  name: string
+  /** A project folder, or `*` for every project. */
+  scope: string
+  /** `5` for 5.x, `0.13` for 0.13.x. */
+  line: string
+}

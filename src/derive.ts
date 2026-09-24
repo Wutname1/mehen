@@ -352,3 +352,37 @@ export function projectTypes(ecosystems: Ecosystem[]): ProjectType[] {
   if (ecosystems.includes('nuget')) types.push('dotnet')
   return types
 }
+
+/** The release line a version sits on: `5` for 5.1.2, `0.13` for 0.13.4 (where minors break). */
+export function holdLine(version: string): string {
+  const parts = version.replace(/^v/i, '').split(/[.-]/)
+  return parts[0] === '0' && parts[1] ? `0.${parts[1]}` : parts[0]
+}
+
+/** The engine's reason, as a sentence: "kept on 5.x" -> "Kept on 5.x". */
+export const reasonText = (reason: string) => reason.charAt(0).toUpperCase() + reason.slice(1)
+
+/** A package with a newer release that does not fit some projects. */
+export interface HeldBack {
+  key: string
+  name: string
+  ecosystem: Ecosystem
+  newest: string
+  entries: { project: Project; current: string; reason: string }[]
+}
+
+export function heldBack(projects: Project[]): HeldBack[] {
+  const map = new Map<string, HeldBack>()
+  for (const project of projects) {
+    for (const dep of project.dependencies) {
+      if (!dep.newest || !dep.blockedReason || !dep.current) continue
+      const key = `${dep.ecosystem}:${dep.name}`
+      const group = map.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, newest: dep.newest, entries: [] }
+      if (compareVersions(dep.newest, group.newest) > 0) group.newest = dep.newest
+      const same = group.entries.some((e) => samePath(repoKey(e.project), repoKey(project)) && e.current === dep.current && e.reason === dep.blockedReason)
+      if (!same) group.entries.push({ project, current: dep.current, reason: dep.blockedReason })
+      map.set(key, group)
+    }
+  }
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+}

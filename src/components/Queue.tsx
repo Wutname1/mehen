@@ -1,9 +1,9 @@
-import { ArrowDownUp, ChevronDown, Plus, ShieldAlert, X } from 'lucide-react'
+import { ArrowDownUp, ChevronDown, Info, Pin, Plus, ShieldAlert, X } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type InputHTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
-import { ECOSYSTEM_LABEL, ECOSYSTEMS, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, relativePath, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
-import type { Ecosystem } from '../types'
+import { ECOSYSTEM_LABEL, ECOSYSTEMS, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, repoKey, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
+import type { Ecosystem, Hold } from '../types'
 import { cx } from './bits'
-import { Menu, MenuCheck, MenuSeparator } from './Menu'
+import { Menu, MenuCheck, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 
 export type RiskFilter = 'any' | 'attention' | 'security'
 export const RISK_FILTER_LABEL: Record<RiskFilter, string> = { any: 'Any risk', attention: 'Needs attention', security: 'Security only' }
@@ -114,6 +114,12 @@ export function Queue({
   onAdvisory,
   searching,
   onClearSearch,
+  holds,
+  heldBack,
+  nameOf,
+  onKeep,
+  onRelease,
+  onWhy,
 }: {
   rows: ScopedRow[]
   repo: Repo | null
@@ -128,7 +134,17 @@ export function Queue({
   onAdvisory: (row: QueueRow) => void
   searching: boolean
   onClearSearch: () => void
+  holds: Hold[]
+  /** Packages in scope with a newer release that does not fit. */
+  heldBack: number
+  nameOf: (folder: string) => string
+  onKeep: (row: QueueRow, scope: string, line: string) => void
+  onRelease: (hold: Hold) => void
+  /** Opens the held-back explanation, for one package or all of them. */
+  onWhy: (packageKey: string | null) => void
 }) {
+  const [keepMenu, setKeepMenu] = useState<{ row: QueueRow; usages: QueueUsage[]; anchor: HTMLElement } | null>(null)
+  const holdsOf = (row: QueueRow) => holds.filter((h) => h.ecosystem === row.ecosystem && h.name === row.name)
   const shown = rows.flatMap((r) => r.usages)
   const shownSelected = shown.filter((u) => selected.has(u.key)).length
   const compatibleLeft = rows.some((r) => r.row.risk !== 'major' && r.usages.some((u) => !selected.has(u.key)))
@@ -313,7 +329,7 @@ export function Queue({
                   role="row"
                   aria-rowindex={i + 2}
                   className={cx(
-                    'grid min-h-[50px] grid-cols-[40px_minmax(170px,1fr)_104px_104px_minmax(96px,150px)_112px] items-center border-b border-line max-[1279px]:grid-cols-[36px_minmax(140px,1fr)_88px_88px_minmax(84px,120px)_104px] max-[1100px]:grid-cols-[32px_minmax(120px,1fr)_76px_76px_minmax(64px,96px)_96px]',
+                    'group grid min-h-[50px] grid-cols-[40px_minmax(170px,1fr)_104px_104px_minmax(96px,150px)_112px] items-center border-b border-line max-[1279px]:grid-cols-[36px_minmax(140px,1fr)_88px_88px_minmax(84px,120px)_104px] max-[1100px]:grid-cols-[32px_minmax(120px,1fr)_76px_76px_minmax(64px,96px)_96px]',
                     vulnerable ? (picked ? 'bg-vuln-selected' : 'bg-vuln-row') : picked ? 'bg-row-selected' : 'hover:bg-row-hover',
                   )}
                 >
@@ -331,6 +347,12 @@ export function Queue({
                     <b className="truncate text-[13px] font-semibold">{row.name}</b>
                     <small className="flex flex-wrap items-center gap-x-2.5 font-mono text-[12px] text-muted">
                       {ECOSYSTEM_LABEL[row.ecosystem]}
+                      {holdsOf(row).map((h) => (
+                        <span key={h.id} className="inline-flex items-center gap-1 font-sans text-[12px] text-state" title={`Kept on ${h.line}.x ${h.scope === '*' ? 'in every project' : `in ${nameOf(h.scope)}`}`}>
+                          <Pin size={12} />
+                          {h.line}.x
+                        </span>
+                      ))}
                       {vulnerable && (
                         <button type="button" onClick={() => onAdvisory(row)} className="inline-flex items-center gap-1 font-sans text-[12px] font-semibold whitespace-nowrap text-risk-security underline underline-offset-2">
                           <ShieldAlert size={13} />
@@ -343,10 +365,29 @@ export function Queue({
                     {installed[0]}
                     {installed.length > 1 && <span className="ml-1 font-sans text-[11px] text-muted">+{installed.length - 1}</span>}
                   </code>
-                  <code role="cell" className="font-mono text-[12.5px] font-semibold" title={targets.join(', ')}>
-                    {targets.length > 1 && <span className="mr-1 font-sans text-[11px] font-normal text-muted">up to</span>}
-                    {targets.at(-1)}
-                  </code>
+                  <span role="cell" className="flex min-w-0 items-center gap-1">
+                    <code className="font-mono text-[12.5px] font-semibold" title={targets.join(', ')}>
+                      {targets.length > 1 && <span className="mr-1 font-sans text-[11px] font-normal text-muted">up to</span>}
+                      {targets.at(-1)}
+                    </code>
+                    {(() => {
+                      const blocked = usages.filter((u) => u.dep.newest && u.dep.blockedReason)
+                      if (!blocked.length) return null
+                      const newest = distinctVersions(blocked.map((u) => u.dep.newest!)).at(-1)
+                      const reasons = [...new Set(blocked.map((u) => reasonText(u.dep.blockedReason!)))]
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => onWhy(row.key)}
+                          aria-label={`Why not ${newest}?`}
+                          title={`${newest} is out. ${reasons.slice(0, 2).join('. ')}${reasons.length > 2 ? ` (+${reasons.length - 2} more)` : ''}.`}
+                          className="grid size-5 shrink-0 place-items-center rounded-[3px] text-faint hover:bg-sunken hover:text-ink"
+                        >
+                          <Info size={13} />
+                        </button>
+                      )
+                    })()}
+                  </span>
                   <span role="cell" className="min-w-0 truncate pr-2.5 text-[12px] text-muted">
                     {repo ? (
                       <code className="font-mono" title={usages.map((u) => u.project.manifest).join('\n')}>
@@ -357,8 +398,21 @@ export function Queue({
                       `${projects} project${projects === 1 ? '' : 's'}`
                     )}
                   </span>
-                  <span role="cell">
+                  <span role="cell" className="flex items-center justify-between pr-1.5">
                     <RiskPill risk={row.risk} />
+                    <button
+                      type="button"
+                      onClick={(e) => setKeepMenu({ row, usages, anchor: e.currentTarget })}
+                      aria-label={`Keep ${row.name} on a release line`}
+                      aria-haspopup="menu"
+                      title="Keep on this release line"
+                      className={cx(
+                        'grid size-6 shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink focus-visible:opacity-100',
+                        keepMenu?.row.key === row.key ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+                      )}
+                    >
+                      <Pin size={14} />
+                    </button>
                   </span>
                 </div>
               )
@@ -389,6 +443,40 @@ export function Queue({
           )}
         </div>
       )}
+      {heldBack > 0 && (
+        <button type="button" onClick={() => onWhy(null)} className="mt-3 inline-flex items-center gap-1.5 text-[12px] text-muted hover:text-ink">
+          <Info size={13} />
+          {heldBack} newer version{heldBack === 1 ? '' : 's'} held back. Why?
+        </button>
+      )}
+      {keepMenu &&
+        (() => {
+          const { row, usages, anchor } = keepMenu
+          const lines = distinctVersions(usages.map((u) => holdLine(displayVersion(u.dep))))
+          const line = lines[0]
+          const repos = [...new Set(usages.map((u) => repoKey(u.project)))]
+          const only = repo ? repo.key : repos.length === 1 ? repos[0] : null
+          const close = () => setKeepMenu(null)
+          return (
+            <Menu anchor={anchor} label={`Keep ${row.name}`} placement="below-end" width={280} onClose={close}>
+              <MenuTitle title={`Keep ${row.name} on ${line}.x`} detail="Updates stay within this release line" />
+              <MenuItem icon={<Pin size={15} />} onSelect={() => (close(), onKeep(row, '*', line))}>
+                In every project
+              </MenuItem>
+              {only && (
+                <MenuItem icon={<Pin size={15} />} onSelect={() => (close(), onKeep(row, only, line))}>
+                  Only in {nameOf(only)}
+                </MenuItem>
+              )}
+              {holdsOf(row).length > 0 && <MenuSeparator />}
+              {holdsOf(row).map((h) => (
+                <MenuItem key={h.id} icon={<X size={15} />} onSelect={() => (close(), onRelease(h))}>
+                  Stop keeping on {h.line}.x {h.scope === '*' ? 'everywhere' : `in ${nameOf(h.scope)}`}
+                </MenuItem>
+              ))}
+            </Menu>
+          )
+        })()}
     </main>
   )
 }
