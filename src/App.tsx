@@ -213,6 +213,10 @@ export default function App() {
   const repoList = useMemo(() => (inventory ? groupRepos(inventory, rows) : []), [inventory, rows])
   const repoByKey = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), r])), [repoList])
   const repo = repoScope ? (repoByKey.get(repoScope.toLowerCase()) ?? null) : null
+  const present = useMemo(
+    () => ({ types: projectTypes(inventory?.projects ?? []), ecosystems: [...new Set((inventory?.projects ?? []).map((p) => p.ecosystem))] }),
+    [inventory],
+  )
   const repoOf = useCallback((u: QueueUsage) => repoByKey.get(repoKey(u.project).toLowerCase()), [repoByKey])
   const nameOf = useCallback((key: string) => repoByKey.get(key.toLowerCase())?.name ?? folderName(key), [repoByKey])
 
@@ -552,6 +556,7 @@ export default function App() {
             onKeep={keep}
             onRelease={release}
             onWhy={(packageKey) => setDialog({ kind: 'held-back', packageKey })}
+            present={present}
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (

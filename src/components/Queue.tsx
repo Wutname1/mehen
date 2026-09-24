@@ -121,6 +121,7 @@ export function Queue({
   onKeep,
   onRelease,
   onWhy,
+  present,
 }: {
   rows: ScopedRow[]
   repo: Repo | null
@@ -143,6 +144,8 @@ export function Queue({
   onRelease: (hold: Hold) => void
   /** Opens the held-back explanation, for one package or all of them. */
   onWhy: (packageKey: string | null) => void
+  /** Project and dependency types the watched projects actually have; only those are offered. */
+  present: { types: ProjectType[]; ecosystems: Ecosystem[] }
 }) {
   const [keepMenu, setKeepMenu] = useState<{ row: QueueRow; usages: QueueUsage[]; anchor: HTMLElement } | null>(null)
   const holdsOf = (row: QueueRow) => holds.filter((h) => h.ecosystem === row.ecosystem && h.name === row.name)
@@ -188,7 +191,7 @@ export function Queue({
                     All project types
                   </MenuCheck>
                   <MenuSeparator />
-                  {(Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).map((t) => (
+                  {(Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).filter((t) => present.types.includes(t) || filters.types.has(t)).map((t) => (
                     <MenuCheck key={t} checked={filters.types.has(t)} onSelect={() => onFilters({ ...filters, types: toggle(filters.types, t) })} icon={<ProjectTypeIcon type={t} size={15} />}>
                       {PROJECT_TYPE_LABEL[t]}
                     </MenuCheck>
@@ -207,7 +210,7 @@ export function Queue({
                   All dependency types
                 </MenuCheck>
                 <MenuSeparator />
-                {ECOSYSTEMS.map((e) => (
+                {ECOSYSTEMS.filter((e) => present.ecosystems.includes(e) || filters.ecosystems.has(e)).map((e) => (
                   <MenuCheck key={e} checked={filters.ecosystems.has(e)} onSelect={() => onFilters({ ...filters, ecosystems: toggle(filters.ecosystems, e) })} icon={<EcoIcon ecosystem={e} size={15} />}>
                     {ECOSYSTEM_LABEL[e]}
                   </MenuCheck>
