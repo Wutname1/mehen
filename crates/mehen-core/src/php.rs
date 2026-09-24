@@ -49,7 +49,7 @@ pub fn rewrite(constraint: &str, to: &str) -> String {
     }
     let Some(target) = release(to) else { return constraint.to_string() };
     let to = to.trim_start_matches(['v', 'V']);
-    let last = body.split('|').filter(|a| !a.trim().is_empty()).next_back().unwrap_or(body).trim();
+    let last = body.split('|').rfind(|a| !a.trim().is_empty()).unwrap_or(body).trim();
     let sep = if last.contains(',') { "," } else { " " };
     let clauses: Vec<String> = last
         .split([',', ' '])

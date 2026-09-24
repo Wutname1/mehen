@@ -144,18 +144,19 @@ pub fn set_constraint(source: &str, name: &str, to: &str) -> Option<(String, Str
         };
         if in_deps && indent > 0 && entry_indent.is_none_or(|i| indent <= i) {
             entry_indent = content.split_once(':').filter(|(k, _)| k.trim() == name).map(|_| indent);
-            if entry_indent.is_some() {
-                if let Some(next) = rewrite_value(name) {
-                    out.push_str(&next);
-                    entry_indent = None;
-                    continue;
-                }
-            }
-        } else if in_deps && entry_indent.is_some_and(|i| indent > i) {
-            if let Some(next) = rewrite_value("version") {
+            if entry_indent.is_some()
+                && let Some(next) = rewrite_value(name)
+            {
                 out.push_str(&next);
+                entry_indent = None;
                 continue;
             }
+        } else if in_deps
+            && entry_indent.is_some_and(|i| indent > i)
+            && let Some(next) = rewrite_value("version")
+        {
+            out.push_str(&next);
+            continue;
         }
         out.push_str(raw);
     }

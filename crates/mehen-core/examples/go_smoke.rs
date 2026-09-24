@@ -34,7 +34,7 @@ async fn main() {
     copy_tree(&source, &dir);
 
     for (label, version) in [("real version", to.as_str()), ("missing version", "v9.9.9")] {
-        let inventory = scan(&[dir.clone()], &IgnoreSet::default());
+        let inventory = scan(std::slice::from_ref(&dir), &IgnoreSet::default());
         let project = inventory.projects.iter().find(|p| p.ecosystem == Ecosystem::Go).expect("a Go project");
         let dep = project.dependencies.iter().find(|d| &d.name == module).expect("the module");
         let mut dep_project = project.clone();

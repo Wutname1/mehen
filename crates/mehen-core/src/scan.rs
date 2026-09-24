@@ -880,7 +880,7 @@ mod tests {
         fs::write(root.join("uv.lock"), "version = 1\n\n[[package]]\nname = \"httpx\"\nversion = \"0.27.2\"\n\n[[package]]\nname = \"typing-extensions\"\nversion = \"4.12.2\"\n").unwrap();
         fs::write(root.join("requirements-dev.txt"), "pytest==8.0.2\nblack\n").unwrap();
 
-        let inventory = scan(&[root.clone()], &IgnoreSet::default());
+        let inventory = scan(std::slice::from_ref(&root), &IgnoreSet::default());
         let api = inventory.projects.iter().find(|p| p.name == "api").expect("pyproject project");
         assert_eq!(api.ecosystem, Ecosystem::Pypi);
         assert_eq!(api.python_version.as_deref(), Some("3.11"));

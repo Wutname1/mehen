@@ -78,10 +78,10 @@ pub fn parse(text: &str) -> GoMod {
             }
         }
         Block::Replace => {
-            if let Some(arrow) = line.words.iter().position(|w| *w == "=>") {
-                if let Some(from) = line.words.first() {
-                    replaced.push((from.to_string(), line.words[arrow + 1..].join(" ")));
-                }
+            if let Some(arrow) = line.words.iter().position(|w| *w == "=>")
+                && let Some(from) = line.words.first()
+            {
+                replaced.push((from.to_string(), line.words[arrow + 1..].join(" ")));
             }
         }
         Block::Other => {}
