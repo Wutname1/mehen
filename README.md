@@ -4,7 +4,7 @@
 
 # Mehen
 
-A desktop app that watches every project on your machine and keeps their dependencies current and safe.
+A desktop app you open when you want to check every project on your machine for outdated and unsafe dependencies, and update them.
 
 Point it at a folder like `C:\code` and Mehen finds every npm, Cargo, NuGet and GitHub Actions project inside, checks each package against its registry and the [OSV](https://osv.dev) vulnerability database, and shows you three things no single-project tool can:
 
@@ -24,7 +24,7 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
 
 ### Find
 
-- Walks one or more **watched folders**, skipping `node_modules`, `target`, `bin`, `obj`, build output and linked git worktrees, so nothing is counted twice
+- Walks one or more **project folders** you choose, skipping `node_modules`, `target`, `bin`, `obj`, build output and linked git worktrees, so nothing is counted twice
 - Reads:
 
   | Ecosystem | Manifests | Installed versions from |
@@ -57,9 +57,9 @@ Early and moving fast. Windows is the primary target; the engine is cross-platfo
 - **Rollback**: the manifest and lockfile are saved first. If any step fails they are restored byte for byte. If the files changed since you reviewed the update, nothing is written.
 - **Optional git commit** of exactly the files the update touched (default message `chore(deps): update X to Y`, editable), on the current branch. Other staged work is left alone, hooks run, nothing is pushed. Not offered when those files already had uncommitted edits.
 
-### Watch
+### Scheduled checks (optional, off by default)
 
-- **Check automatically** every 6 or 12 hours or once a day (Folders panel). Mehen then lives in the tray: closing the window hides it, and the tray menu has Open, Check now and Quit
+- **Check automatically** every 6 or 12 hours or once a day (Settings > General). Mehen then lives in the tray: closing the window hides it, and the tray menu has Open, Check now and Quit
 - Background checks run from the cache, and a Windows notification names any vulnerability that is new since the previous result
 
 ### Cache
@@ -75,7 +75,7 @@ Every network answer is kept in a local SQLite database so repeat checks only as
 
 A warm check of ~170 projects and ~740 packages takes about 4 seconds. **Refresh all** ignores the cache. A registry that keeps answering "too many requests" is skipped for the rest of the run instead of stalling it.
 
-The database lives at `%APPDATA%\dev.mehen.app\mehen.db` and also holds your watched folders, ignore rules, settings and the last 30 results.
+The database lives at `%APPDATA%\dev.mehen.app\mehen.db` and also holds your project folders, ignore rules, settings and the last 30 results.
 
 ## How it's built
 
@@ -97,7 +97,7 @@ Key modules in `mehen-core`:
 | `registry.rs` | Latest versions and version lists per ecosystem, with retry and backoff |
 | `osv.rs` | OSV batch queries and advisory details |
 | `check.rs` | Works out current, latest, safe and status for every dependency, through the cache |
-| `store.rs` | SQLite: cache, watched folders, ignore rules, saved results |
+| `store.rs` | SQLite: cache, project folders, ignore rules, saved results |
 | `ignore.rs` | Folder, project and pattern rules |
 | `update.rs` | Update plans (edits + steps), apply, rollback |
 | `compat.rs` | Which versions a project can use: .NET target frameworks (ported from nuget-compass), Rust `rust-version`, npm `engines.node` |

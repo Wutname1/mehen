@@ -766,7 +766,7 @@ unsafe fn paint_install(hdc: HDC, s: &AppState) {
 
     draw_text_wrap(
         hdc,
-        "Mehen watches every project on your machine and keeps their dependencies current and safe.",
+        "Mehen checks every project on your machine for outdated and unsafe dependencies, and updates them for you.",
         l.content_x,
         250,
         l.content_w,

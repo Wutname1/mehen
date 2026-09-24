@@ -129,7 +129,7 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
     emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
     let roots = state.roots();
     if roots.is_empty() {
-        return Err("Add a folder to watch first".into());
+        return Err("Add a folder with your projects first".into());
     }
     let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
     let previous = only.as_ref().and_then(|_| state.store.last_inventory());

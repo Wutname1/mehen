@@ -153,7 +153,7 @@ export function ManageProjects({
   return (
     <Dialog
       title="Manage projects"
-      description="The folders Mehen watches and the projects found in them, including ones you excluded."
+      description="The folders Mehen checks and the projects found in them, including ones you excluded."
       icon={<ListChecks size={22} />}
       size="wide"
       onClose={onClose}
@@ -266,7 +266,7 @@ export function ManageProjects({
                         <RefreshCw size={14} className={cx(scanning && 'animate-spin')} />
                         {scanning ? 'Scanning…' : 'Scan'}
                       </Button>
-                      <Button variant="ghost" onClick={() => onRemoveFolder(folder)} aria-label={`Stop watching ${folder}`}>
+                      <Button variant="ghost" onClick={() => onRemoveFolder(folder)} aria-label={`Remove ${folder}`}>
                         Remove
                       </Button>
                     </span>

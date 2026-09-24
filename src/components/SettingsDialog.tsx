@@ -12,8 +12,8 @@ import { SectionTitle, Select, SettingRow, Switch, TextInput } from './controls'
 export type SettingsTab = 'general' | 'scanning' | 'updates' | 'security'
 
 const TABS: Record<SettingsTab, [string, string]> = {
-  general: ['General', 'How Mehen looks, starts, and checks in the background.'],
-  scanning: ['Scanning', 'The folders Mehen watches and what it skips.'],
+  general: ['General', 'How Mehen looks and when it checks.'],
+  scanning: ['Scanning', 'The folders Mehen checks and what it skips.'],
   updates: ['Updates and checks', 'How far updates go, how they run, and what proves they worked.'],
   security: ['Security', 'Vulnerability alerts and where advisories come from.'],
 }
@@ -356,7 +356,7 @@ export function SettingsDialog({
 
             {tab === 'scanning' && (
               <>
-                <SectionTitle>Watched folders</SectionTitle>
+                <SectionTitle>Project folders</SectionTitle>
                 {settings.folders.length === 0 && <p className="py-2 text-[12.5px] text-muted">No folders yet. Add the folder that holds your projects.</p>}
                 {settings.folders.map((folder) => (
                   <SettingRow key={folder} title={<span className="font-mono text-[12.5px]">{folder}</span>} help={`${projectsIn(folder)} projects, including subfolders`}>
@@ -375,7 +375,7 @@ export function SettingsDialog({
                         <RefreshCw size={14} className={cx(scanning === folder && 'animate-spin')} />
                         {scanning === folder ? 'Scanning…' : 'Scan'}
                       </Button>
-                      <Button onClick={() => onRemoveFolder(folder)} aria-label={`Stop watching ${folder}`}>
+                      <Button onClick={() => onRemoveFolder(folder)} aria-label={`Remove ${folder}`}>
                         Remove
                       </Button>
                     </div>

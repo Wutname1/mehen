@@ -238,8 +238,8 @@ export async function onProgress(handler: (p: Progress) => void): Promise<Unlist
 }
 
 export async function pickFolder(): Promise<string | null> {
-  if (!inTauri) return window.prompt('Folder to watch', 'C:\\code')
-  const picked = await open({ directory: true, title: 'Choose a folder to watch' })
+  if (!inTauri) return window.prompt('Folder with your projects', 'C:\\code')
+  const picked = await open({ directory: true, title: 'Choose a folder with your projects' })
   return typeof picked === 'string' ? picked : null
 }
 

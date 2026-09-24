@@ -135,7 +135,7 @@ export default function App() {
   const watchFolder = async (path: string) => {
     try {
       setSettings(await api.addFolder(path))
-      setNotice({ text: `Watching ${path}. Checking it now.` })
+      setNotice({ text: `Added ${path}. Checking it now.` })
       await run(false, [path])
     } catch (e) {
       setError(String(e))
@@ -148,7 +148,7 @@ export default function App() {
       setInventory((inv) => inv && { ...inv, projects: inv.projects.filter((p) => !isWithin(p.dir, folder)) })
       const count = inventory?.projects.filter((p) => isWithin(p.dir, folder)).length ?? 0
       setNotice({
-        text: `Stopped watching ${folder}.${count ? ` Its projects will no longer be checked.` : ''}`,
+        text: `Removed ${folder}.${count ? ` Its projects will no longer be checked.` : ''}`,
         undo: async () => {
           setNotice(null)
           setSettings(await api.addFolder(folder))
@@ -757,7 +757,7 @@ function Welcome({
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 bg-paper px-6 text-center">
       <Logo size={72} />
-      <h1 className="font-display text-[22px] font-semibold tracking-[-0.015em]">Every project, guarded every night</h1>
+      <h1 className="font-display text-[22px] font-semibold tracking-[-0.015em]">Every project, checked in one place</h1>
       <p className="max-w-lg leading-relaxed text-muted">
         Mehen finds every npm, Cargo, NuGet and GitHub Actions project in the folders you choose, checks each package for newer versions and known
         vulnerabilities, and shows where your projects have drifted apart.
@@ -769,7 +769,7 @@ function Welcome({
       ) : (
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => onWatch(SUGGESTED_ROOT)} disabled={running} className={primary}>
-            Watch <span className="font-mono">{SUGGESTED_ROOT}</span>
+            Check <span className="font-mono">{SUGGESTED_ROOT}</span>
           </button>
           <button type="button" onClick={onChoose} disabled={running} className="h-9 rounded-[3px] border border-line-strong bg-surface px-4 text-ink hover:border-muted">
             Choose a folder…

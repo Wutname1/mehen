@@ -1,7 +1,7 @@
 [package]
 name = "mehen"
 version = "0.1.0"
-description = "Mehen - keeps every project's dependencies current and safe"
+description = "Mehen - checks every project's dependencies and updates them for you"
 authors = ["Jeremy"]
 edition = "2024"
 
