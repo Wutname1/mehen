@@ -1,4 +1,4 @@
-import { Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
+import { ArrowDownAZ, ArrowDownWideNarrow, ArrowDownZA, Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, type Repo } from '../derive'
 import type { Ecosystem } from '../types'
@@ -7,6 +7,23 @@ import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 import { RepoAvatar } from './RepoAvatar'
 
 const ECO_SHORT: Record<Ecosystem, string> = { npm: 'npm', cargo: 'Rs', nuget: 'Nu', 'github-actions': 'GA' }
+
+export type RailSort = 'az' | 'za' | 'updates'
+
+const SORTS: { id: RailSort; label: string; Icon: typeof ArrowDownAZ }[] = [
+  { id: 'az', label: 'Name, A to Z', Icon: ArrowDownAZ },
+  { id: 'za', label: 'Name, Z to A', Icon: ArrowDownZA },
+  { id: 'updates', label: 'Most updates first, vulnerable projects on top', Icon: ArrowDownWideNarrow },
+]
+
+const byName = (a: Repo, b: Repo) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+
+function sortRepos(list: Repo[], sort: RailSort): Repo[] {
+  const sorted = [...list]
+  if (sort === 'za') return sorted.sort((a, b) => byName(b, a))
+  if (sort === 'updates') return sorted.sort((a, b) => b.vulnerable - a.vulnerable || b.updates - a.updates || byName(a, b))
+  return sorted.sort(byName)
+}
 
 export function ScanStatus({ running, phase, checkedAgo, detail, hint, onScan }: { running: boolean; phase: string | null; checkedAgo: string; detail: string; hint?: string; onScan: () => void }) {
   return (
@@ -45,6 +62,8 @@ export function Rail({
   icons,
   selected,
   query,
+  sort,
+  onSort,
   excludedCount,
   onSelect,
   onManage,
@@ -63,6 +82,8 @@ export function Rail({
   icons: Record<string, string>
   selected: string | null
   query: string
+  sort: RailSort
+  onSort: (sort: RailSort) => void
   excludedCount: number
   onSelect: (key: string | null) => void
   onManage: () => void
@@ -150,9 +171,33 @@ export function Rail({
         </Menu>
       )}
 
+      <div className="mx-3 mb-2 flex items-center justify-between">
+        <span className="font-mono text-[11px] tracking-[0.04em] text-rail-muted uppercase" id="rail-sort-label">
+          Sort
+        </span>
+        <div role="group" aria-labelledby="rail-sort-label" className="flex gap-px rounded-[3px] border border-rail-border p-[2px]">
+          {SORTS.map(({ id, label, Icon }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => onSort(id)}
+              aria-pressed={sort === id}
+              aria-label={label}
+              title={label}
+              className={cx(
+                'grid h-6 w-7 place-items-center rounded-[2px]',
+                sort === id ? 'bg-rail-active text-rail-ink shadow-[inset_0_0_0_1px_var(--rail-active-line)]' : 'text-rail-muted hover:bg-rail-hover hover:text-rail-ink',
+              )}
+            >
+              <Icon size={15} />
+            </button>
+          ))}
+        </div>
+      </div>
+
       <div className="min-h-0 flex-1 overflow-y-auto pb-2">
         {groups.map(({ root, repos: list }) => {
-          const shown = list.filter(matches)
+          const shown = sortRepos(list.filter(matches), sort)
           return (
             <div key={root ?? 'other'}>
               <div className="sticky top-0 z-[1] flex h-[30px] items-center gap-2 border-y border-rail-line bg-rail-sunken px-3.5 font-mono text-[11px] text-rail-muted">

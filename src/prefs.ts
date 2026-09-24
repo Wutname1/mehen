@@ -14,9 +14,11 @@ export interface Prefs {
   stopOnFailure: boolean
   /** List security fixes and bigger jumps first. */
   riskFirst: boolean
+  /** Order of the project list. */
+  railSort: 'az' | 'za' | 'updates'
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
 
 /** Bumped when a default changes and older saved choices should pick it up. */
 const VERSION = 2

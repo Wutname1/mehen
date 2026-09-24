@@ -426,6 +426,8 @@ export default function App() {
             icons={icons}
             selected={repo?.key ?? null}
             query={query}
+            sort={prefs.railSort}
+            onSort={(railSort) => setPrefs({ railSort })}
             excludedCount={excludedCount}
             onSelect={setRepoScope}
             onManage={() => setDialog({ kind: 'manage' })}
