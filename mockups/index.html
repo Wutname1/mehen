@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-palette="faience">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mehen</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Geist+Mono:wght@400..700&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <svg class="svg-defs" aria-hidden="true">
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 9m2 6a7 7 0 0 0 12 2.5L20 15"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/></symbol>
+    <symbol id="i-folder-plus" viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/><path d="M12 12v5M9.5 14.5h5"/></symbol>
+    <symbol id="i-box" viewBox="0 0 24 24"><path d="m4 7 8-4 8 4-8 4zM4 7v10l8 4 8-4V7M12 11v10"/></symbol>
+    <symbol id="i-stack" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></symbol>
+    <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="18" cy="7" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M8 11h4a6 6 0 0 0 6-2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 20 6v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="M12 8v5M12 17h.01"/></symbol>
+    <symbol id="i-shield-check" viewBox="0 0 24 24"><path d="M12 3 20 6v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/><path d="m8.5 12 2.5 2.5 4.5-5"/></symbol>
+    <symbol id="i-eyeoff" viewBox="0 0 24 24"><path d="m3 3 18 18M10.5 10.5a2 2 0 0 0 3 3M9.5 5.2A10 10 0 0 1 12 5c5 0 9 7 9 7a16 16 0 0 1-2.1 2.7M6.2 6.2C4.3 7.5 3 9.4 3 12c0 0 4 7 9 7 1 0 2-.3 2.8-.7"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><path d="m5 7 4 5-4 5M11 17h8"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.6-.8-1.9 1-1.8-2.1-2.1-1.8 1-1.9-.8-.6-2h-3l-.6 2-1.9.8-1.8-1-2.1 2.1 1 1.8-.8 1.9-2 .6v3l2 .6.8 1.9-1 1.8 2.1 2.1 1.8-1 1.9.8.6 2h3l.6-2 1.9-.8 1.8 1 2.1-2.1-1-1.8.8-1.9z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 21 20H3z"/><path d="M12 10v4M12 17h.01"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 7 4 12l5 5"/><path d="M4 12h11a5 5 0 0 1 0 10h-2"/></symbol>
+    <symbol id="i-git" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h6M15 12h6"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+    <symbol id="i-sort" viewBox="0 0 24 24"><path d="M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 15.5A8 8 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5z"/></symbol>
+  </svg>
+
+  <div class="app-shell" id="app-shell">
+    <header class="titlebar">
+      <div class="brand"><img src="logo.svg" alt=""><strong>Mehen</strong></div>
+      <label class="global-search">
+        <svg aria-hidden="true"><use href="#i-search"/></svg>
+        <span class="sr-only">Search projects and packages</span>
+        <input id="search" type="search" placeholder="Search projects and packages" autocomplete="off" spellcheck="false">
+        <kbd aria-hidden="true">Ctrl K</kbd>
+      </label>
+      <div class="title-actions">
+        <button class="bar-button" id="theme-toggle" type="button"><svg aria-hidden="true"><use href="#i-moon"/></svg><span>Dark</span></button>
+        <button class="bar-button icon-only" id="open-settings" type="button" aria-label="Settings" data-tooltip="Settings"><svg aria-hidden="true"><use href="#i-settings"/></svg></button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="rail" aria-label="Projects">
+        <div class="scope-split" role="group" aria-label="All projects">
+          <button class="scope-main" id="all-projects" type="button">
+            <svg aria-hidden="true"><use href="#i-stack"/></svg>
+            <span><b>All projects</b><small id="all-summary"></small></span>
+          </button>
+          <button class="scope-manage" id="manage-trigger" type="button" aria-label="Manage projects" aria-haspopup="menu" aria-expanded="false" aria-controls="manage-menu" data-tooltip="Manage projects, folders, and exclusions">
+            <svg aria-hidden="true"><use href="#i-sliders"/></svg>
+          </button>
+          <div class="menu manage-menu" id="manage-menu" role="menu" aria-label="Manage projects" hidden>
+            <button role="menuitem" type="button" data-action="open-manager"><svg aria-hidden="true"><use href="#i-box"/></svg><span>Manage projects…</span></button>
+            <button role="menuitem" type="button" data-action="add-root"><svg aria-hidden="true"><use href="#i-folder-plus"/></svg><span>Add a folder to scan…</span></button>
+            <button role="menuitem" type="button" data-action="open-exclusions"><svg aria-hidden="true"><use href="#i-eyeoff"/></svg><span>Excluded projects &amp; folders…</span><em id="exclusion-count"></em></button>
+          </div>
+        </div>
+        <div class="rail-scroll" id="rail-list"></div>
+        <div class="rail-status">
+          <div class="scan-status" id="scan-status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span><b id="scan-label">Checked 4 min ago</b><small id="scan-detail">7 projects · 2 folders</small></span>
+          </div>
+          <button class="scan-button" id="scan" type="button" aria-label="Scan now" data-tooltip="Look for new versions and advisories now">
+            <svg aria-hidden="true"><use href="#i-refresh"/></svg><span>Scan</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="stage" id="stage">
+        <div class="command-bar">
+          <div class="scope-chip" id="scope-chip" hidden></div>
+          <div class="filters" id="filters"></div>
+          <button class="button outline" id="prepare-compatible" type="button" aria-label="Select compatible updates" data-tooltip="Select every patch, minor, and security update. Major versions stay unselected.">
+            <svg aria-hidden="true"><use href="#i-plus"/></svg><span>Select compatible</span>
+          </button>
+        </div>
+
+        <div class="security-banner" id="security-banner" hidden></div>
+
+        <div class="table-heading">
+          <b id="result-count" aria-live="polite"></b>
+          <button class="text-toggle" id="sort-risk" type="button" aria-pressed="false"><svg aria-hidden="true"><use href="#i-sort"/></svg>Risk first</button>
+        </div>
+
+        <div class="dep-table" role="table" aria-label="Dependency updates" aria-rowcount="-1" id="dep-table">
+          <div class="dep-head" role="rowgroup">
+            <div class="dep-row head" role="row">
+              <span role="columnheader" class="cell-check"><input id="select-visible" class="check" type="checkbox" aria-label="Select all shown packages"></span>
+              <span role="columnheader">Package</span>
+              <span role="columnheader">Installed</span>
+              <span role="columnheader">Target</span>
+              <span role="columnheader" id="usage-head">Used by</span>
+              <span role="columnheader">Risk</span>
+            </div>
+          </div>
+          <div role="rowgroup" id="dep-rows"></div>
+        </div>
+        <div class="empty-state" id="empty-state" hidden></div>
+      </main>
+
+      <aside class="inspector" aria-label="Project and selected updates">
+        <section class="project-record" id="project-record" hidden></section>
+        <section class="tray" id="tray" aria-labelledby="tray-title"></section>
+      </aside>
+    </div>
+  </div>
+
+  <div class="menu context-menu" id="context-menu" role="menu" hidden></div>
+  <div class="menu filter-menu" id="filter-menu" role="menu" hidden></div>
+  <div class="menu run-menu" id="run-menu" role="menu" aria-label="Update options" hidden></div>
+
+  <div class="dialog-backdrop" id="dialog-backdrop" hidden>
+    <section class="dialog" id="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"></section>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden>
+    <span class="toast-icon" id="toast-icon" aria-hidden="true"></span>
+    <span id="toast-message"></span>
+    <button type="button" id="toast-action" hidden><svg aria-hidden="true"><use href="#i-undo"/></svg>Undo</button>
+    <button type="button" id="toast-close" aria-label="Dismiss"><svg aria-hidden="true"><use href="#i-x"/></svg></button>
+  </div>
+  <div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

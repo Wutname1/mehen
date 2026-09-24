@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Palette comparison</title>
+  <style>
+    :root {
+      --bg: #0d0f0e;
+      --panel: #151816;
+      --line: #2a2f2c;
+      --ink: #ecefe9;
+      --muted: #a4aca6;
+      --accent: #e8ab36;
+      color-scheme: dark;
+      font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--bg); }
+    header { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+    h1 { margin: 0; font-size: 15px; font-weight: 600; }
+    header p { flex: 1; min-width: 240px; margin: 0; color: var(--muted); }
+    .segments { display: flex; flex-wrap: wrap; gap: 4px; padding: 3px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; }
+    .segments button { height: 30px; padding: 0 12px; color: var(--muted); background: none; border: 0; border-radius: 3px; font: inherit; cursor: pointer; }
+    .segments button:hover { color: var(--ink); }
+    .segments button[aria-pressed="true"] { color: #1d1506; background: var(--accent); font-weight: 600; }
+    button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    main { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; padding: 20px; }
+    figure { margin: 0; min-width: 0; }
+    figcaption { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    figcaption b { font-size: 13px; font-weight: 600; }
+    figcaption span { color: var(--muted); }
+    figcaption em { padding: 1px 6px; color: #1d1506; background: var(--accent); border-radius: 2px; font-size: 11px; font-style: normal; font-weight: 600; }
+    figcaption a { margin-left: auto; color: var(--accent); text-underline-offset: 2px; }
+    .frame { position: relative; aspect-ratio: 16 / 10; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; background: #000; }
+    .frame iframe { position: absolute; top: 0; left: 0; width: 1280px; height: 800px; border: 0; transform-origin: 0 0; transform: scale(var(--s, .5)); }
+    @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 16px; } header { padding: 12px 16px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Palette comparison</h1>
+    <p>Same layout and data, rendered at 1280 × 800. Each frame is live: click around in any of them.</p>
+    <div class="segments" role="group" aria-label="Theme">
+      <button type="button" data-theme="dark" aria-pressed="true">Dark</button>
+      <button type="button" data-theme="light" aria-pressed="false">Light</button>
+    </div>
+    <div class="segments" role="group" aria-label="Screen to compare">
+      <button type="button" data-screen="" aria-pressed="true">All projects</button>
+      <button type="button" data-screen="project=billing">One project</button>
+      <button type="button" data-screen="update=1">Update</button>
+      <button type="button" data-screen="manage=1">Manage projects</button>
+      <button type="button" data-screen="settings=1">Settings</button>
+    </div>
+  </header>
+  <main id="grid"></main>
+  <script>
+    const palettes = [
+      { id: 'faience', name: 'Sun and serpent', note: 'Default' },
+      { id: 'parchment', name: 'Parchment and copper' },
+    ]
+    const grid = document.getElementById('grid')
+    let theme = 'dark'
+    let screen = ''
+    const url = (p) => `index.html?palette=${p.id}&theme=${theme}${screen ? `&${screen}` : ''}`
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) entry.target.style.setProperty('--s', entry.contentRect.width / 1280)
+    })
+
+    function render() {
+      grid.innerHTML = palettes.map((p) => `
+        <figure>
+          <figcaption><b>${p.name}</b>${p.note ? `<em>${p.note}</em>` : ''}<span>${theme === 'dark' ? 'Dark' : 'Light'}</span><a href="${url(p)}" target="_blank" rel="noopener">Open full size</a></figcaption>
+          <div class="frame"><iframe src="${url(p)}" title="${p.name}, ${theme} theme"></iframe></div>
+        </figure>`).join('')
+      grid.querySelectorAll('.frame').forEach((frame) => observer.observe(frame))
+    }
+
+    document.querySelector('header').addEventListener('click', (e) => {
+      const button = e.target.closest('[data-screen], [data-theme]')
+      if (!button) return
+      const attr = 'theme' in button.dataset ? 'data-theme' : 'data-screen'
+      document.querySelectorAll(`[${attr}]`).forEach((b) => b.setAttribute('aria-pressed', String(b === button)))
+      if (attr === 'data-theme') theme = button.dataset.theme
+      else screen = button.dataset.screen
+      render()
+    })
+
+    render()
+  </script>
+</body>
+</html>
