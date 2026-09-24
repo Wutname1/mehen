@@ -161,7 +161,7 @@ pub struct FixedIn {
     pub versions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     /// Watched folders this result covers.

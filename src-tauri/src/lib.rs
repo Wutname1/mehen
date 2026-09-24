@@ -140,6 +140,17 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
             state.store.replace_last_inventory(&merged).map_err(err)?;
             Ok(merged)
         }
+        (None, _) => {
+            // Only a full check knows everything still in use.
+            let app = app.clone();
+            let snapshot = checked.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = app.state::<AppState>().store.prune(&snapshot) {
+                    eprintln!("Cleaning the cache failed: {e:#}");
+                }
+            });
+            Ok(checked)
+        }
         _ => Ok(checked),
     }
 }

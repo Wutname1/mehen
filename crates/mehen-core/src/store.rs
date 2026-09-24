@@ -2,6 +2,7 @@
 //! tags, OSV) is cached here so repeat checks only ask for what is stale, and
 //! each scan is kept so the app can open on the last results.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::ignore::{IgnoreKind, IgnoreRule};
 use crate::model::{Ecosystem, Inventory, Vulnerability};
 use crate::registry::PackageInfo;
+use crate::version::Version;
 
 /// How long each kind of answer stays fresh.
 pub const PACKAGE_TTL: Duration = Duration::from_secs(6 * 3600);
@@ -55,6 +57,17 @@ pub struct StoreStats {
     pub osv_queries: i64,
     pub advisories: i64,
     pub scans: i64,
+}
+
+/// What one `prune` removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    pub packages: usize,
+    /// Packages whose old versions were dropped.
+    pub trimmed: usize,
+    pub osv_queries: usize,
+    pub advisories: usize,
+    pub icons: usize,
 }
 
 fn now() -> i64 {
@@ -175,6 +188,14 @@ impl Store {
                 DELETE FROM package WHERE ecosystem = 'npm';
                 PRAGMA user_version = 7;",
             )?;
+        }
+        if version < 8 {
+            // The version a row was trimmed below, so an unchanged row is not rewritten.
+            conn.execute_batch("ALTER TABLE package ADD COLUMN kept_from TEXT; PRAGMA user_version = 8;")?;
+        }
+        if version < 9 {
+            // Lets `prune` hand freed pages back to the disk; takes effect after one VACUUM.
+            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM; PRAGMA user_version = 9;")?;
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -429,6 +450,110 @@ impl Store {
         );
     }
 
+    /// Drops what no project needs any more: packages nothing uses (unless
+    /// kept on a line), versions older than the oldest one in use, advisory
+    /// lookups for versions nobody has, advisories nothing points to, and
+    /// logos of folders that are gone. Only call it with a full inventory.
+    pub fn prune(&self, inventory: &Inventory) -> anyhow::Result<Pruned> {
+        // The oldest version in use per package; `None` when some project's
+        // version is unknown or not comparable, so nothing is trimmed.
+        let mut lowest: HashMap<(String, String), Option<(Version, String)>> = HashMap::new();
+        let mut osv_in_use: HashSet<(String, String, String)> = HashSet::new();
+        for dep in inventory.projects.iter().flat_map(|p| &p.dependencies) {
+            let key = (eco_key(dep.ecosystem).to_string(), dep.name.clone());
+            if let Some(v) = crate::check::osv_version(dep) {
+                osv_in_use.insert((key.0.clone(), key.1.clone(), v));
+            }
+            // Action tags name commits for SHA pins, so they are never trimmed.
+            let version = dep.current.as_deref().filter(|_| dep.ecosystem != Ecosystem::GithubActions).and_then(|c| Version::parse(c).map(|v| (v, c.to_string())));
+            match lowest.get_mut(&key) {
+                None => {
+                    lowest.insert(key, version);
+                }
+                Some(slot) => {
+                    *slot = match (slot.take(), version) {
+                        (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+                        _ => None,
+                    }
+                }
+            }
+        }
+        let held: HashSet<(String, String)> = self.holds().into_iter().map(|h| (eco_key(h.ecosystem).to_string(), h.name)).collect();
+        let repos: HashSet<String> = inventory.projects.iter().map(|p| repo_key(p.repo.as_deref().unwrap_or(&p.dir))).collect();
+
+        let mut pruned = Pruned::default();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows: Vec<(String, String, Option<String>)> =
+            tx.prepare("SELECT ecosystem, name, kept_from FROM package")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        for (ecosystem, name, kept_from) in rows {
+            let key = (ecosystem, name);
+            match lowest.get(&key) {
+                None if held.contains(&key) => {}
+                None => {
+                    tx.execute("DELETE FROM package WHERE ecosystem = ?1 AND name = ?2", params![key.0, key.1])?;
+                    pruned.packages += 1;
+                }
+                Some(Some((min, min_raw))) if kept_from.as_deref() != Some(min_raw.as_str()) => {
+                    let (versions_json, requirements_json): (Option<String>, Option<String>) = tx.query_row(
+                        "SELECT versions_json, requirements_json FROM package WHERE ecosystem = ?1 AND name = ?2",
+                        params![key.0, key.1],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
+                    let keep = |v: &str| Version::parse(v).is_none_or(|v| v >= *min);
+                    let versions: Option<Vec<String>> = versions_json.as_deref().and_then(|j| serde_json::from_str(j).ok());
+                    let requirements: Option<Vec<(String, serde_json::Value)>> = requirements_json.as_deref().and_then(|j| serde_json::from_str(j).ok());
+                    let before = versions.as_ref().map_or(0, Vec::len) + requirements.as_ref().map_or(0, Vec::len);
+                    let versions = versions.map(|list| list.into_iter().filter(|v| keep(v)).collect::<Vec<_>>());
+                    let requirements = requirements.map(|list| list.into_iter().filter(|(v, _)| keep(v)).collect::<Vec<_>>());
+                    let after = versions.as_ref().map_or(0, Vec::len) + requirements.as_ref().map_or(0, Vec::len);
+                    tx.execute(
+                        "UPDATE package SET versions_json = COALESCE(?3, versions_json), requirements_json = COALESCE(?4, requirements_json), kept_from = ?5 WHERE ecosystem = ?1 AND name = ?2",
+                        params![
+                            key.0,
+                            key.1,
+                            versions.map(|v| serde_json::to_string(&v).unwrap_or_default()),
+                            requirements.map(|r| serde_json::to_string(&r).unwrap_or_default()),
+                            min_raw
+                        ],
+                    )?;
+                    if after < before {
+                        pruned.trimmed += 1;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+
+        let queries: Vec<(String, String, String)> =
+            tx.prepare("SELECT ecosystem, name, version FROM osv_query")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        for q in queries.into_iter().filter(|q| !osv_in_use.contains(q)) {
+            tx.execute("DELETE FROM osv_query WHERE ecosystem = ?1 AND name = ?2 AND version = ?3", params![q.0, q.1, q.2])?;
+            pruned.osv_queries += 1;
+        }
+        let referenced: HashSet<String> = tx
+            .prepare("SELECT vuln_ids_json FROM osv_query")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+            .flat_map(|j| serde_json::from_str::<Vec<String>>(&j).unwrap_or_default())
+            .chain(inventory.vulnerabilities.iter().map(|v| v.id.clone()))
+            .collect();
+        let advisories: Vec<String> = tx.prepare("SELECT id FROM advisory")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for id in advisories.into_iter().filter(|id| !referenced.contains(id)) {
+            tx.execute("DELETE FROM advisory WHERE id = ?1", params![id])?;
+            pruned.advisories += 1;
+        }
+
+        let icons: Vec<String> = tx.prepare("SELECT repo FROM repo_icon")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        for repo in icons.into_iter().filter(|r| !repos.contains(r)) {
+            tx.execute("DELETE FROM repo_icon WHERE repo = ?1", params![repo])?;
+            pruned.icons += 1;
+        }
+        tx.commit()?;
+        conn.execute_batch("PRAGMA incremental_vacuum;")?;
+        Ok(pruned)
+    }
+
     pub fn stats(&self) -> anyhow::Result<StoreStats> {
         let conn = self.conn.lock().unwrap();
         let count = |table: &str| -> rusqlite::Result<i64> { conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)) };
@@ -485,5 +610,79 @@ mod tests {
         assert!(eslint.allows("9.4.0") && !eslint.allows("10.0.0"));
         store.remove_hold(eslint.id).unwrap();
         assert_eq!(store.holds().len(), 1);
+    }
+
+    #[test]
+    fn prune_drops_what_no_project_needs() {
+        use crate::compat::Requirement;
+        use crate::model::{DepKind, Dependency, Project};
+        let store = Store::open_in_memory().unwrap();
+        let info = |versions: &[&str]| PackageInfo {
+            latest: versions.last().map(|v| v.to_string()),
+            versions: versions.iter().map(|v| v.to_string()).collect(),
+            tags: Vec::new(),
+            requirements: versions.iter().map(|v| (v.to_string(), Requirement::Peers { peers: vec![("react".into(), "^18".into())] })).collect(),
+        };
+        store.put_package(Ecosystem::Npm, "@mui/material", &info(&["5.0.0", "5.1.2", "6.0.0", "7.0.0"]));
+        store.put_package(Ecosystem::Npm, "left-pad", &info(&["1.0.0"]));
+        store.put_package(Ecosystem::Npm, "kept", &info(&["2.0.0"]));
+        store.put_hold(Ecosystem::Npm, "kept", "*", "2").unwrap();
+        store.put_osv_hits(&[
+            (Ecosystem::Npm, "@mui/material".into(), "5.1.2".into(), vec!["GHSA-old".into()]),
+            (Ecosystem::Npm, "@mui/material".into(), "6.0.0".into(), vec!["GHSA-now".into()]),
+        ]);
+        for id in ["GHSA-old", "GHSA-now"] {
+            store.put_advisory(&Vulnerability { id: id.into(), aliases: Vec::new(), summary: String::new(), severity: None, url: String::new(), fixed: Vec::new() });
+        }
+        store.put_repo_icon("C:/gone", Some("C:/gone/logo.png"));
+
+        let mut mui = Dependency::new("@mui/material", Ecosystem::Npm, DepKind::Normal, "^6.0.0");
+        mui.current = Some("6.0.0".into());
+        let project = Project {
+            id: "C:/app/package.json".into(),
+            name: "app".into(),
+            ecosystem: Ecosystem::Npm,
+            dir: "C:/app".into(),
+            manifest: "C:/app/package.json".into(),
+            repo: None,
+            frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
+            dependencies: vec![mui],
+        };
+        let inventory = Inventory { roots: vec!["C:\\".into()], projects: vec![project], ..Default::default() };
+
+        let pruned = store.prune(&inventory).unwrap();
+        assert_eq!(pruned, Pruned { packages: 1, trimmed: 1, osv_queries: 1, advisories: 1, icons: 1 });
+        let mui = store.package(Ecosystem::Npm, "@mui/material", PACKAGE_TTL).unwrap().unwrap();
+        assert_eq!(mui.versions, ["6.0.0", "7.0.0"]);
+        assert_eq!(mui.requirements.len(), 2);
+        assert!(store.package(Ecosystem::Npm, "left-pad", PACKAGE_TTL).is_none());
+        assert!(store.package(Ecosystem::Npm, "kept", PACKAGE_TTL).is_some(), "a held package stays");
+        assert!(store.advisory("GHSA-now").is_some() && store.advisory("GHSA-old").is_none());
+        assert_eq!(store.prune(&inventory).unwrap(), Pruned::default(), "a second pass has nothing to do");
+    }
+}
+
+#[cfg(test)]
+mod prune_real {
+    use super::*;
+
+    /// `MEHEN_DB=<copy of mehen.db> cargo test -p mehen-core prune_real -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn prune_a_copy_of_a_real_database() {
+        let path = std::env::var("MEHEN_DB").expect("MEHEN_DB");
+        let store = Store::open(Path::new(&path)).unwrap();
+        let inventory = store.last_inventory().unwrap();
+        println!("before: {:?}", store.stats().unwrap());
+        let started = std::time::Instant::now();
+        let first = store.prune(&inventory).unwrap();
+        let first_ms = started.elapsed().as_millis();
+        let started = std::time::Instant::now();
+        let second = store.prune(&inventory).unwrap();
+        println!("first: {first:?} in {first_ms} ms; second: {second:?} in {} ms", started.elapsed().as_millis());
+        println!("after: {:?}", store.stats().unwrap());
     }
 }

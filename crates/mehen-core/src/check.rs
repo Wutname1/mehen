@@ -375,7 +375,7 @@ async fn find_vulnerabilities(
     Ok(vulns)
 }
 
-fn osv_version(dep: &Dependency) -> Option<String> {
+pub(crate) fn osv_version(dep: &Dependency) -> Option<String> {
     let current = dep.current.as_deref()?;
     let parsed = Version::parse(current)?;
     (parsed.parts.len() >= 3 || dep.ecosystem == Ecosystem::Nuget).then(|| current.trim_start_matches(['v', 'V']).to_string())
