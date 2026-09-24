@@ -62,6 +62,7 @@ pub fn ecosystem_of(program: &str) -> Option<Ecosystem> {
         "npm" | "pnpm" | "yarn" | "bun" | "npx" => Some(Ecosystem::Npm),
         "cargo" => Some(Ecosystem::Cargo),
         "dotnet" => Some(Ecosystem::Nuget),
+        "go" => Some(Ecosystem::Go),
         _ => None,
     }
 }
@@ -73,7 +74,7 @@ pub fn diagnose(output: &str, ok: bool, ecosystem: Ecosystem, changes: &[Planned
         Ecosystem::Npm => [npm(output), pnpm(output), yarn(output)].concat(),
         Ecosystem::Nuget => nuget(output),
         Ecosystem::Cargo => cargo(output),
-        Ecosystem::GithubActions => Vec::new(),
+        Ecosystem::GithubActions | Ecosystem::Go => Vec::new(),
     };
     let mut conflicts: Vec<Conflict> = Vec::new();
     for f in findings {

@@ -89,6 +89,7 @@ fn eco_key(ecosystem: Ecosystem) -> &'static str {
         Ecosystem::Cargo => "cargo",
         Ecosystem::Nuget => "nuget",
         Ecosystem::GithubActions => "github-actions",
+        Ecosystem::Go => "go",
     }
 }
 

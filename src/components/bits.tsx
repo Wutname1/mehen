@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
-import { ECOSYSTEM_LABEL, STATUS_LABEL, normalizeSeverity } from '../derive'
-import type { Ecosystem, Status } from '../types'
+import { STATUS_LABEL, normalizeSeverity } from '../derive'
+import type { Status } from '../types'
 
 const cx = (...parts: (string | false | null | undefined)[]) => parts.filter(Boolean).join(' ')
 export { cx }
@@ -18,21 +18,6 @@ export function Logo({ size = 22 }: { size?: number }) {
       <path d="M 676 250 A 322 322 0 1 1 398 227" fill="none" stroke="#45c2a6" strokeWidth="86" strokeLinecap="round" />
       <ellipse cx="700" cy="232" rx="84" ry="62" transform="rotate(-28 700 232)" fill="#45c2a6" />
     </svg>
-  )
-}
-
-const ECO_STYLE: Record<Ecosystem, string> = {
-  npm: 'text-[#f0826f] bg-[#3a1914] border-[#5a261d]',
-  cargo: 'text-[#e8b48a] bg-[#35241a] border-[#533827]',
-  nuget: 'text-[#a996f0] bg-[#221c3a] border-[#382d5c]',
-  'github-actions': 'text-lapis bg-lapis-soft border-[#2a3b5e]',
-}
-
-export function EcoBadge({ ecosystem }: { ecosystem: Ecosystem }) {
-  return (
-    <span className={cx('inline-flex h-[18px] items-center rounded border px-1.5 text-[10.5px] font-medium tracking-wide', ECO_STYLE[ecosystem])}>
-      {ECOSYSTEM_LABEL[ecosystem]}
-    </span>
   )
 }
 

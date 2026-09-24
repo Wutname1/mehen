@@ -185,6 +185,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         Ecosystem::Npm => plan_npm(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Cargo => plan_cargo(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
         Ecosystem::Nuget => plan_nuget(&mut plan, &manifest, &dir, repo.as_deref(), &deps)?,
+        Ecosystem::Go => plan_go(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
     for edit in &mut plan.edits {
@@ -480,6 +481,31 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
     push_step(plan, StepKind::Install, "cargo update (only the selected crates)", "cargo", &args, dir);
     push_step(plan, StepKind::Verify, "cargo check", "cargo", &["check", "--quiet"], dir);
     push_step(plan, StepKind::Test, "cargo test", "cargo", &["test", "--quiet"], dir);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- Go
+
+/// Moves each `require` line, then `go mod tidy` settles `go.sum` (and any
+/// modules the new versions need in turn).
+fn plan_go(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
+    let before = read(manifest)?;
+    let mut text = before.clone();
+    for (dep, change) in deps {
+        let from = dep.current.clone().unwrap_or_else(|| dep.requested.clone());
+        // The proxy lists versions with their `v`; a target typed without one still works.
+        let to = if change.to.starts_with('v') { change.to.clone() } else { format!("v{}", change.to) };
+        text = crate::golang::set_version(&text, &dep.name, &from, &to).ok_or_else(|| anyhow!("{}: no require line for {from} in go.mod", dep.name))?;
+        plan.changes.push(PlannedChange { name: dep.name.clone(), from: from.clone(), to: to.clone(), written_before: from, written_after: to });
+    }
+    push_edit(plan, manifest, before, text);
+    let sum = dir.join("go.sum");
+    if sum.is_file() {
+        plan.snapshots.push(sum.display().to_string());
+    }
+    push_step(plan, StepKind::Install, "go mod tidy", "go", &["mod", "tidy"], dir);
+    push_step(plan, StepKind::Verify, "go build ./...", "go", &["build", "./..."], dir);
+    push_step(plan, StepKind::Test, "go test ./...", "go", &["test", "./..."], dir);
     Ok(())
 }
 
@@ -867,6 +893,20 @@ mod tests {
         assert!(plan.edits[0].after.contains("\"left-pad\": \"~1.0.0\""));
         assert!(plan.edits[0].after.contains("\r\n"));
         assert_eq!(plan.changes[0].written_after, "^19.1.0");
+    }
+
+    #[test]
+    fn go_moves_the_require_line_and_tidies() {
+        let dir = temp("go");
+        std::fs::write(dir.join("go.mod"), "module example.com/app\n\ngo 1.26\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n\tgithub.com/google/uuid v1.6.0\n)\n").unwrap();
+        std::fs::write(dir.join("go.sum"), "").unwrap();
+        let p = project(&dir, "go.mod", Ecosystem::Go, vec![dep("github.com/gin-gonic/gin", Ecosystem::Go, "v1.10.0", "v1.10.0")]);
+        let plan = plan(&p, &[Change { from: None, name: "github.com/gin-gonic/gin".into(), to: "v1.12.0".into() }], |_| None).unwrap();
+        assert!(plan.edits[0].after.contains("\tgithub.com/gin-gonic/gin v1.12.0\n"));
+        assert!(plan.edits[0].after.contains("\tgithub.com/google/uuid v1.6.0\n"));
+        assert!(plan.snapshots.iter().any(|s| s.ends_with("go.sum")), "go.sum is put back if a step fails");
+        let steps: Vec<String> = plan.steps.iter().map(|s| format!("{} {}", s.program, s.args.join(" "))).collect();
+        assert_eq!(steps, ["go mod tidy", "go build ./...", "go test ./..."]);
     }
 
     #[test]

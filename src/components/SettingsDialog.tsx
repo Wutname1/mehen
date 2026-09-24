@@ -35,6 +35,7 @@ export const DEFAULT_CHECKS: Partial<Record<Ecosystem, string>> = {
   npm: 'npm run build and npm run test, when the project has them',
   cargo: 'cargo check and cargo test',
   nuget: 'dotnet build, then dotnet test on the solution',
+  go: 'go build ./... and go test ./...',
 }
 
 export const ecosystemScope = (e: Ecosystem) => `ecosystem:${e}`
@@ -453,7 +454,7 @@ export function SettingsDialog({
                 </SettingRow>
                 <SectionTitle>Checks by dependency type</SectionTitle>
                 <p className="mb-1 text-[12.5px] text-muted">Change what counts as a passing update for every project of a kind. A project's own settings win over these.</p>
-                {(['npm', 'cargo', 'nuget'] as Ecosystem[]).map((e) => (
+                {(['npm', 'cargo', 'nuget', 'go'] as Ecosystem[]).map((e) => (
                   <EcosystemChecks key={e} ecosystem={e} commands={commands} onCommands={setCommands} />
                 ))}
               </>

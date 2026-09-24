@@ -7,6 +7,7 @@ pub mod check;
 pub mod compat;
 pub mod diagnose;
 pub mod icons;
+pub mod golang;
 pub mod ignore;
 pub mod lockfiles;
 pub mod model;

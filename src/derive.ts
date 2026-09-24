@@ -1,12 +1,13 @@
 import type { Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
 
-export const ECOSYSTEMS: Ecosystem[] = ['npm', 'cargo', 'nuget', 'github-actions']
+export const ECOSYSTEMS: Ecosystem[] = ['npm', 'cargo', 'nuget', 'go', 'github-actions']
 
 export const ECOSYSTEM_LABEL: Record<Ecosystem, string> = {
   npm: 'npm',
   cargo: 'Cargo',
   nuget: 'NuGet',
   'github-actions': 'Actions',
+  go: 'Go',
 }
 
 const STATUS_RANK: Record<Status, number> = {
@@ -342,9 +343,9 @@ export function repos(inventory: Inventory, rows: QueueRow[]): Repo[] {
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
 }
 
-export type ProjectType = 'web' | 'rust' | 'dotnet' | 'dotnet-framework'
+export type ProjectType = 'web' | 'rust' | 'dotnet' | 'dotnet-framework' | 'go'
 
-export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', rust: 'Rust', dotnet: '.NET', 'dotnet-framework': '.NET Framework' }
+export const PROJECT_TYPE_LABEL: Record<ProjectType, string> = { web: 'JavaScript / Web', rust: 'Rust', dotnet: '.NET', 'dotnet-framework': '.NET Framework', go: 'Go' }
 
 /** `net48`, `net472`, `v4.7.2`: the Windows-only .NET Framework, not modern .NET (`net8.0`, `netstandard2.0`). */
 const isFrameworkTarget = (tfm: string) => /^net\d{2,3}$/i.test(tfm) || /^v[1-4](\.|$)/i.test(tfm)
@@ -355,6 +356,7 @@ export function projectTypes(projects: Project[]): ProjectType[] {
   for (const p of projects) {
     if (p.ecosystem === 'npm') types.add('web')
     if (p.ecosystem === 'cargo') types.add('rust')
+    if (p.ecosystem === 'go') types.add('go')
     if (p.ecosystem !== 'nuget') continue
     // packages.config belongs to .NET Framework projects.
     if (p.frameworks.length === 0) types.add(/packages\.config$/i.test(p.manifest) ? 'dotnet-framework' : 'dotnet')

@@ -171,6 +171,7 @@ fn from_osv_name(name: &str) -> Option<Ecosystem> {
         "crates.io" => Some(Ecosystem::Cargo),
         "NuGet" => Some(Ecosystem::Nuget),
         "GitHub Actions" => Some(Ecosystem::GithubActions),
+        "Go" => Some(Ecosystem::Go),
         _ => None,
     }
 }

@@ -105,6 +105,7 @@ pub fn scan(roots: &[PathBuf], ignore: &IgnoreSet) -> Inventory {
         let result = match file_name.as_ref() {
             "package.json" => scanner.package_json(path),
             "Cargo.toml" => scanner.cargo_toml(path),
+            "go.mod" => scanner.go_mod(path),
             "packages.config" => scanner.packages_config(path),
             "Directory.Packages.props" => scanner.central_packages(path),
             _ if matches!(ext.as_str(), "csproj" | "fsproj" | "vbproj") => scanner.msbuild_project(path),
@@ -155,7 +156,7 @@ pub fn discover(roots: &[PathBuf], rules: &[crate::ignore::IgnoreRule]) -> Vec<c
 }
 
 fn is_manifest(file_name: &str, ext: &str) -> bool {
-    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props")
+    matches!(file_name, "package.json" | "Cargo.toml" | "packages.config" | "Directory.Packages.props" | "go.mod")
         || matches!(ext, "csproj" | "fsproj" | "vbproj" | "yml" | "yaml")
 }
 
@@ -382,6 +383,32 @@ impl Scanner {
             Some(v) => Some((v, "node_modules")),
             None => self.npm_locks.npm_version(&root, dir, name),
         }
+    }
+
+    /// Direct requirements only: `// indirect` ones come along with them, as
+    /// npm's nested packages do. A replaced module is local, since updating
+    /// the original would change nothing.
+    fn go_mod(&mut self, path: &Path) -> anyhow::Result<()> {
+        let parsed = crate::golang::parse(&read_text(path)?);
+        let dir = path.parent().unwrap_or(path);
+        let mut deps = Vec::new();
+        for require in parsed.requires.iter().filter(|r| !r.indirect) {
+            let mut dep = Dependency::new(&require.path, Ecosystem::Go, DepKind::Normal, &require.version);
+            match parsed.replaced.iter().find(|(from, _)| *from == require.path) {
+                Some((_, to)) => {
+                    dep.status = Status::Local;
+                    dep.note = Some(format!("replaced by {to}"));
+                }
+                None => {
+                    dep.installed = Some(require.version.clone());
+                    dep.installed_from = Some("go.mod".into());
+                }
+            }
+            deps.push(dep);
+        }
+        let name = parsed.module.as_deref().map(crate::golang::module_name).unwrap_or_else(|| dir_name(dir));
+        self.push(path, name, Ecosystem::Go, Vec::new(), deps);
+        Ok(())
     }
 
     fn cargo_toml(&mut self, path: &Path) -> anyhow::Result<()> {

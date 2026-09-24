@@ -73,6 +73,7 @@ pub async fn lookup(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) ->
         Ecosystem::Cargo => crates(http, name).await,
         Ecosystem::Nuget => nuget(http, name).await,
         Ecosystem::GithubActions => github_tags(http, name).await,
+        Ecosystem::Go => go_module(http, name).await,
     }
 }
 
@@ -111,6 +112,27 @@ async fn npm(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> 
         }
     }
     Ok(PackageInfo { latest: doc.dist_tags.get("latest").cloned(), versions: doc.versions.into_keys().collect(), requirements, ..Default::default() })
+}
+
+/// The Go module proxy's list of tagged versions. A module with only
+/// commit-based pseudo-versions lists nothing, so `@latest` fills in. The
+/// proxy answers 410 as well as 404 for a module it cannot serve (a private
+/// one, for example).
+async fn go_module(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInfo> {
+    let base = format!("https://proxy.golang.org/{}", crate::golang::proxy_escape(name));
+    let not_found = |e: anyhow::Error| if e.to_string().contains("410") { anyhow!("404: {name} is not on the Go module proxy") } else { e };
+    let list = get(http, &format!("{base}/@v/list"), None).await.map_err(not_found)?.text().await?;
+    let mut versions: Vec<String> = list.lines().map(str::trim).filter(|v| !v.is_empty()).map(str::to_string).collect();
+    if versions.is_empty() {
+        #[derive(Deserialize)]
+        struct Latest {
+            #[serde(rename = "Version")]
+            version: String,
+        }
+        let latest: Latest = get(http, &format!("{base}/@latest"), None).await.map_err(not_found)?.json().await?;
+        versions.push(latest.version);
+    }
+    Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, ..Default::default() })
 }
 
 /// Uses the sparse index (static files behind a CDN) rather than the crates.io
