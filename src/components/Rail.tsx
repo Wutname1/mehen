@@ -1,5 +1,5 @@
 import { ArrowDownAZ, ArrowDownWideNarrow, ArrowDownZA, Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, type Repo } from '../derive'
 import type { Ecosystem } from '../types'
 import { cx } from './bits'
@@ -26,7 +26,42 @@ function sortRepos(list: Repo[], sort: RailSort): Repo[] {
   return sorted.sort(byName)
 }
 
-export function ScanStatus({ running, phase, checkedAgo, detail, hint, onScan }: { running: boolean; phase: string | null; checkedAgo: string; detail: string; hint?: string; onScan: () => void }) {
+function timeAgo(unixSeconds: number, nowMs: number): string {
+  const s = Math.max(0, Math.floor(nowMs / 1000 - unixSeconds))
+  if (s < 60) return 'just now'
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`
+  return `${Math.floor(s / 86400)} d ago`
+}
+
+/** The current time, refreshed every `everyMs` so relative labels stay true. */
+function useNow(everyMs: number): number {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), everyMs)
+    return () => window.clearInterval(id)
+  }, [everyMs])
+  return now
+}
+
+export function ScanStatus({
+  running,
+  phase,
+  checkedAt,
+  detail,
+  hint,
+  onScan,
+}: {
+  running: boolean
+  phase: string | null
+  /** Unix seconds of the last finished check. */
+  checkedAt: number | null | undefined
+  detail: string
+  hint?: string
+  onScan: () => void
+}) {
+  const now = useNow(30_000)
+  const checked = checkedAt ? `Checked ${timeAgo(checkedAt, now)}` : 'Not checked yet'
   return (
     <div className="flex shrink-0 items-center gap-2.5 border-t border-rail-line bg-rail-sunken px-3.5 pt-2.5 pb-3">
       <div className="flex min-w-0 flex-1 items-center gap-2.5" aria-live="polite">
@@ -36,7 +71,9 @@ export function ScanStatus({ running, phase, checkedAgo, detail, hint, onScan }:
           style={{ boxShadow: `0 0 0 3px color-mix(in oklab, var(${running ? '--rail-busy' : '--rail-ok'}) 20%, transparent)` }}
         />
         <span className="flex min-w-0 flex-col">
-          <b className="truncate text-[12px] font-semibold">{running ? (phase ?? 'Checking…') : `Checked ${checkedAgo}`}</b>
+          <b className="truncate text-[12px] font-semibold" title={checkedAt ? new Date(checkedAt * 1000).toLocaleString() : undefined}>
+            {running ? (phase ?? 'Checking…') : checked}
+          </b>
           <small className={hint ? "truncate text-[12px] text-rail-busy" : "truncate text-[12px] text-rail-muted"} title={hint}>
             {detail}
           </small>

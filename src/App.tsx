@@ -34,15 +34,6 @@ type Dialog =
   | { kind: 'advisory'; row: QueueRow }
   | { kind: 'held-back'; packageKey: string | null }
 
-function timeAgo(unixSeconds: number | null | undefined): string {
-  if (!unixSeconds) return 'never'
-  const s = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds))
-  if (s < 60) return 'just now'
-  if (s < 3600) return `${Math.round(s / 60)} min ago`
-  if (s < 86400) return `${Math.round(s / 3600)} h ago`
-  return `${Math.round(s / 86400)} d ago`
-}
-
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 export default function App() {
@@ -493,7 +484,7 @@ export default function App() {
               <ScanStatus
                 running={running}
                 phase={progress?.phase ?? null}
-                checkedAgo={timeAgo(inventory.checkedAt)}
+                checkedAt={inventory.checkedAt}
                 detail={warnings.length ? plural(warnings.length, 'warning') : `${plural(repoCount, 'project')} · ${plural(folderCount, 'folder')}`}
                 hint={warnings.length ? warnings.join('\n') : undefined}
                 onScan={() => run(false)}
