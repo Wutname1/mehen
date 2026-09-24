@@ -59,7 +59,12 @@ export function AdvisoryDialog({
   const [pick, setPick] = useState<Pick>(() => (hasChoice && affected.every((u) => chosenTarget(u) === targetFor(u, 'fix')) ? 'fix' : 'newest'))
   const picked = pick === 'fix' ? smallest : newest
   const alreadySelected = affected.every((u) => chosenTarget(u) === targetFor(u, pick))
-  const them = vulns.length === 1 ? 'it' : 'them'
+  const rangesOf = (v: (typeof vulns)[number]) => v.fixed.filter((f) => f.ecosystem === row.ecosystem && f.name.toLowerCase() === row.name.toLowerCase()).flatMap((f) => f.ranges ?? [])
+  // Every version affected and nothing fixed yet: no update helps.
+  const unfixed = new Set(vulns.filter((v) => rangesOf(v).some((r) => !r.fixed && !r.lastAffected)).map((v) => v.id))
+  const fixable = vulns.length - unfixed.size
+  const them = fixable === 1 ? 'it' : 'them'
+  const noFix = unfixed.size ? ` ${unfixed.size === vulns.length ? (unfixed.size === 1 ? 'It has' : 'They have') : `${unfixed.size} ${unfixed.size === 1 ? 'has' : 'have'}`} no fix yet.` : ''
 
   const option = (value: Pick, versions: string[], detail: string) => (
     <label
@@ -79,7 +84,7 @@ export function AdvisoryDialog({
   return (
     <Dialog
       title={`${row.name} advisories`}
-      description={`You have ${installed.join(', ')} in ${projects} project${projects === 1 ? '' : 's'}.${hasChoice ? '' : ` Updating to ${newest.at(-1)} fixes ${them}.`}`}
+      description={`You have ${installed.join(', ')} in ${projects} project${projects === 1 ? '' : 's'}.${hasChoice || !fixable ? '' : ` Updating to ${newest.at(-1)} fixes ${unfixed.size ? `${fixable} of them` : them}.`}${noFix}`}
       icon={<ShieldAlert size={22} />}
       tone="danger"
       onClose={onClose}
@@ -109,10 +114,7 @@ export function AdvisoryDialog({
       )}
       <div className="grid gap-2">
         {vulns.map((v) => {
-          const ranges = v.fixed
-            .filter((f) => f.ecosystem === row.ecosystem && f.name.toLowerCase() === row.name.toLowerCase())
-            .flatMap((f) => f.ranges ?? [])
-            .sort((a, b) => (a.introduced ? (b.introduced ? compareVersions(a.introduced, b.introduced) : 1) : b.introduced ? -1 : 0))
+          const ranges = rangesOf(v).sort((a, b) => (a.introduced ? (b.introduced ? compareVersions(a.introduced, b.introduced) : 1) : b.introduced ? -1 : 0))
           return (
             <a
               key={v.id}
@@ -126,7 +128,8 @@ export function AdvisoryDialog({
               <span className="min-w-0">
                 <b className="block font-mono text-[12.5px] font-semibold">{v.aliases.find((a) => a.startsWith('CVE-')) ?? v.id}</b>
                 <small className="text-[12.5px] text-muted">{v.summary}</small>
-                {ranges.length > 0 && (
+                {unfixed.has(v.id) && <small className="mt-0.5 block text-[12px] font-semibold text-risk-review">No fixed version yet</small>}
+                {ranges.length > 0 && !unfixed.has(v.id) && (
                   <small className="mt-0.5 block text-[12px] text-muted">
                     Affects{' '}
                     {ranges.map((r, i) => {

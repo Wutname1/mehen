@@ -400,11 +400,81 @@ async fn find_vulnerabilities(
         }
     }
 
-    let (mut vulns, fetched) = osv::details(http, store, ids.into_iter().collect()).await;
+    let (vulns, fetched) = osv::details(http, store, ids.into_iter().collect()).await;
     stats.advisories_fetched += fetched;
     stats.advisories_cached = vulns.len().saturating_sub(stats.advisories_fetched);
+    let mut vulns = merge_aliases(vulns, inventory);
     vulns.sort_by(|a, b| severity_rank(&b.severity).cmp(&severity_rank(&a.severity)).then(a.id.cmp(&b.id)));
     Ok(vulns)
+}
+
+/// One vulnerability can come back as several records that alias each other
+/// (GHSA-... and GO-... for the same Go bug). They become one, keeping the
+/// GitHub record since it carries the severity, and each dependency's list
+/// is renamed to match.
+fn merge_aliases(vulns: Vec<Vulnerability>, inventory: &mut Inventory) -> Vec<Vulnerability> {
+    let ids: HashSet<&str> = vulns.iter().map(|v| v.id.as_str()).collect();
+    // Union-find over ids that name each other.
+    let mut parent: HashMap<String, String> = vulns.iter().map(|v| (v.id.clone(), v.id.clone())).collect();
+    fn root(parent: &mut HashMap<String, String>, id: &str) -> String {
+        let next = parent[id].clone();
+        if next == id {
+            return next;
+        }
+        let top = root(parent, &next);
+        parent.insert(id.to_string(), top.clone());
+        top
+    }
+    let rank = |id: &str| (!id.starts_with("GHSA-"), id.to_string());
+    for v in &vulns {
+        for alias in v.aliases.iter().filter(|a| ids.contains(a.as_str())) {
+            let (a, b) = (root(&mut parent, &v.id), root(&mut parent, alias));
+            if a != b {
+                let (keep, drop) = if rank(&a) <= rank(&b) { (a, b) } else { (b, a) };
+                parent.insert(drop, keep);
+            }
+        }
+    }
+    let canonical: HashMap<String, String> = vulns.iter().map(|v| (v.id.clone(), root(&mut parent, &v.id))).collect();
+    if canonical.iter().all(|(id, top)| id == top) {
+        return vulns;
+    }
+
+    let mut merged: Vec<Vulnerability> = Vec::new();
+    let mut extra: Vec<Vulnerability> = Vec::new();
+    for v in vulns {
+        if canonical[&v.id] == v.id { merged.push(v) } else { extra.push(v) }
+    }
+    for other in extra {
+        let Some(keep) = merged.iter_mut().find(|m| m.id == canonical[&other.id]) else { continue };
+        if keep.severity.is_none() {
+            keep.severity = other.severity;
+        }
+        if !keep.aliases.contains(&other.id) {
+            keep.aliases.push(other.id);
+        }
+        for alias in other.aliases {
+            if alias != keep.id && !keep.aliases.contains(&alias) {
+                keep.aliases.push(alias);
+            }
+        }
+        for fixed in other.fixed {
+            if !keep.fixed.iter().any(|f| f.ecosystem == fixed.ecosystem && f.name == fixed.name) {
+                keep.fixed.push(fixed);
+            }
+        }
+    }
+    for dep in all_deps(inventory).filter(|d| !d.vulns.is_empty()) {
+        let mut renamed: Vec<String> = Vec::new();
+        for id in &dep.vulns {
+            let top = canonical.get(id).cloned().unwrap_or_else(|| id.clone());
+            if !renamed.contains(&top) {
+                renamed.push(top);
+            }
+        }
+        dep.vulns = renamed;
+    }
+    merged
 }
 
 fn set_fix_targets(inventory: &mut Inventory, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, vulns: &[Vulnerability]) {
@@ -438,7 +508,8 @@ fn fix_target(current: Option<&str>, latest: Option<&str>, versions: &[String], 
         .filter_map(|s| Version::parse(s).map(|v| (v, s)))
         .filter(|(v, _)| *v > current && (current.prerelease || !v.prerelease))
         .filter(|(v, _)| cap.as_ref().is_none_or(|c| v <= c))
-        .filter(|(v, _)| !ranges.iter().any(|r| covers(r, v)))
+        // A range with no end has no fix yet; no update escapes it, so it cannot decide which one to pick.
+        .filter(|(v, _)| !ranges.iter().filter(|r| r.fixed.is_some() || r.last_affected.is_some()).any(|r| covers(r, v)))
         .collect();
     let lowest = safe.iter().map(|(v, _)| line(v)).min()?;
     safe.into_iter().filter(|(v, _)| line(v) == lowest).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, s)| s.clone())
@@ -512,6 +583,41 @@ mod tests {
     }
 
     #[test]
+    fn aliased_records_become_one_vulnerability() {
+        let vuln = |id: &str, aliases: &[&str], severity: Option<&str>| Vulnerability {
+            id: id.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            summary: String::new(),
+            severity: severity.map(Into::into),
+            url: String::new(),
+            fixed: Vec::new(),
+        };
+        let mut dep = Dependency::new("golang.org/x/crypto", Ecosystem::Go, DepKind::Normal, "v0.51.0");
+        dep.vulns = vec!["GO-2026-5014".into(), "GHSA-45gg".into(), "GO-2026-5099".into()];
+        let project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            ecosystem: Ecosystem::Go,
+            dir: "C:/app".into(),
+            manifest: "C:/app/go.mod".into(),
+            repo: None,
+            frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
+            dependencies: vec![dep],
+        };
+        let mut inventory = Inventory { projects: vec![project], ..Default::default() };
+        let vulns = vec![vuln("GO-2026-5014", &["GHSA-45gg", "CVE-2026-1"], None), vuln("GHSA-45gg", &["GO-2026-5014", "CVE-2026-1"], Some("HIGH")), vuln("GO-2026-5099", &[], None)];
+        let merged = merge_aliases(vulns, &mut inventory);
+        let ids: Vec<&str> = merged.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["GHSA-45gg", "GO-2026-5099"]);
+        assert_eq!(merged[0].severity.as_deref(), Some("HIGH"));
+        assert!(merged[0].aliases.contains(&"GO-2026-5014".to_string()));
+        assert_eq!(inventory.projects[0].dependencies[0].vulns, ["GHSA-45gg", "GO-2026-5099"]);
+    }
+
+    #[test]
     fn smallest_fix_is_the_newest_release_on_the_lowest_safe_line() {
         let range = |introduced: Option<&str>, fixed: &str| AffectedRange { introduced: introduced.map(Into::into), fixed: Some(fixed.into()), last_affected: None };
         let ranges = [range(None, "15.1.1"), range(Some("16.0.0"), "16.1.1")];
@@ -521,6 +627,9 @@ mod tests {
         assert_eq!(fix_target(Some("16.0.0"), Some("16.2.0"), &versions, &ranges).as_deref(), Some("16.2.0"), "on 16.x the fix stays on 16.x");
         assert_eq!(fix_target(Some("12.0.1"), Some("15.1.0"), &versions, &ranges), None, "nothing safe the project can use");
         assert_eq!(fix_target(Some("12.0.1"), Some("16.2.0"), &versions, &[]), None, "no range data, no guess");
+        let unfixed = AffectedRange::default();
+        let with_unfixed: Vec<&AffectedRange> = ranges.iter().copied().chain([&unfixed]).collect();
+        assert_eq!(fix_target(Some("12.0.1"), Some("16.2.0"), &versions, &with_unfixed).as_deref(), Some("15.1.3"), "an advisory nothing fixes is set aside");
     }
 
     #[test]
