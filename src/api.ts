@@ -306,11 +306,15 @@ const mock = (() => {
         ecosystem: project.ecosystem,
         changes: planned,
         edits: [{ path: project.manifest, before: '', after: '', diff }],
-        steps: [
-          { kind: 'install', label: 'npm install', program: 'npm', args: ['install'], cwd: project.dir },
-          { kind: 'verify', label: 'npm run build', program: 'npm', args: ['run', 'build'], cwd: project.dir },
-          { kind: 'test', label: 'npm run test', program: 'npm', args: ['run', 'test'], cwd: project.dir },
-        ],
+        // Like the real planner: workflow edits have nothing to run.
+        steps:
+          project.ecosystem === 'github-actions'
+            ? []
+            : [
+                { kind: 'install', label: 'npm install', program: 'npm', args: ['install'], cwd: project.dir },
+                { kind: 'verify', label: 'npm run build', program: 'npm', args: ['run', 'build'], cwd: project.dir },
+                { kind: 'test', label: 'npm run test', program: 'npm', args: ['run', 'test'], cwd: project.dir },
+              ],
         snapshots: [],
         warnings: [],
         repo: project.repo,

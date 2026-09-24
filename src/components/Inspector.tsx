@@ -1,4 +1,4 @@
-import { ChevronDown, Code2, FolderOpen, GitCommitHorizontal, Play, Settings2, Terminal, X } from 'lucide-react'
+import { ChevronDown, Code2, FileText, FolderOpen, GitCommitHorizontal, Play, Settings2, Terminal, X } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo } from '../derive'
 import { cx } from './bits'
@@ -78,6 +78,8 @@ export function Tray({
   const [menu, setMenu] = useState<HTMLElement | null>(null)
   const usages = groups.flatMap((g) => g.usages)
   const repos = new Set(usages.map((u) => repoKey(u.project).toLowerCase()))
+  // Workflow edits have nothing to install, build or test.
+  const filesOnly = usages.length > 0 && usages.every((u) => u.dep.ecosystem === 'github-actions')
   const inRepo = (g: TrayGroup) => !!repo && g.usages.some((u) => samePath(repoKey(u.project), repo.key))
   const here = repo ? groups.filter(inRepo) : groups
   const other = repo ? groups.filter((g) => !inRepo(g)) : []
@@ -148,8 +150,12 @@ export function Tray({
         )}
         {groups.length > 0 && (
           <p className="m-0 mb-0.5 flex items-center gap-1.5 text-[12px] text-muted">
-            {commit ? <GitCommitHorizontal size={14} className="shrink-0" /> : <Terminal size={14} className="shrink-0" />}
-            {checks && commit
+            {commit ? <GitCommitHorizontal size={14} className="shrink-0" /> : filesOnly ? <FileText size={14} className="shrink-0" /> : <Terminal size={14} className="shrink-0" />}
+            {filesOnly
+              ? commit
+                ? 'Edits the workflow files, then commits each project. Nothing to install or test.'
+                : 'Edits the workflow files only. Nothing to install or test.'
+              : checks && commit
               ? 'Then builds, tests, and commits each project.'
               : checks
                 ? 'Then builds and tests. You commit afterwards.'
@@ -164,8 +170,8 @@ export function Tray({
           disabled={groups.length === 0}
           className="inline-flex h-[38px] items-center justify-center gap-2 rounded-[3px] border border-line-strong bg-surface px-3 text-[12.5px] font-semibold hover:border-muted disabled:opacity-45"
         >
-          <Terminal size={15} />
-          Review files &amp; commands
+          {filesOnly ? <FileText size={15} /> : <Terminal size={15} />}
+          {filesOnly ? 'Review file changes' : 'Review files & commands'}
         </button>
         <div className="flex">
           <button
@@ -175,7 +181,7 @@ export function Tray({
             className="inline-flex h-[38px] flex-1 items-center justify-center gap-2 rounded-l-[3px] bg-accent px-3 text-[12.5px] font-semibold text-accent-ink hover:bg-accent-hover disabled:opacity-45"
           >
             <Play size={15} />
-            {checks ? 'Update & run checks' : 'Update & install only'}
+            {filesOnly ? 'Update workflow files' : checks ? 'Update & run checks' : 'Update & install only'}
           </button>
           <button
             type="button"
@@ -194,14 +200,18 @@ export function Tray({
         </div>
         {menu && (
           <Menu anchor={menu} label="Update options" placement="above-end" width={320} onClose={() => setMenu(null)}>
-            <MenuTitle title="When you update" detail="Applies to every selected project" />
-            <MenuCheck radio checked={checks} onSelect={() => (onOptions({ checks: true }), setMenu(null))} detail="Install, then build and test each project. A project whose checks fail is put back.">
-              Update and run checks
-            </MenuCheck>
-            <MenuCheck radio checked={!checks} onSelect={() => (onOptions({ checks: false }), setMenu(null))} detail="Skip build and test. Useful when CI runs your tests.">
-              Update and install only
-            </MenuCheck>
-            <MenuSeparator />
+            <MenuTitle title="When you update" detail={filesOnly ? 'Workflow files have nothing to install or test' : 'Applies to every selected project'} />
+            {!filesOnly && (
+              <>
+                <MenuCheck radio checked={checks} onSelect={() => (onOptions({ checks: true }), setMenu(null))} detail="Install, then build and test each project. A project whose checks fail is put back.">
+                  Update and run checks
+                </MenuCheck>
+                <MenuCheck radio checked={!checks} onSelect={() => (onOptions({ checks: false }), setMenu(null))} detail="Skip build and test. Useful when CI runs your tests.">
+                  Update and install only
+                </MenuCheck>
+                <MenuSeparator />
+              </>
+            )}
             <MenuCheck checked={commit} onSelect={() => onOptions({ commit: !commit })} detail="Commits only the files Mehen changed, once that project is done. Never pushes.">
               Commit each repository
             </MenuCheck>

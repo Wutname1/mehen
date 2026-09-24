@@ -269,15 +269,19 @@ export function UpdateFlow({
       })
       .join('\n\n')
 
-  const label = checks ? 'Update & run checks' : 'Update & install only'
+  // Nothing to install, build or test: only workflow files change.
+  const filesOnly = plans.length > 0 && plans.every((p) => p.steps.length === 0)
+  const label = filesOnly ? 'Update workflow files' : checks ? 'Update & run checks' : 'Update & install only'
   const total = jobs.length
 
   const options = (
     <div className="mr-auto flex flex-wrap gap-x-[18px] gap-y-1.5" role="group" aria-label="When updating">
-      <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
-        <Checkbox checked={checks} onChange={() => onOptions({ checks: !checks })} label="Run build and test checks" />
-        Run build and test checks
-      </label>
+      {!filesOnly && (
+        <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
+          <Checkbox checked={checks} onChange={() => onOptions({ checks: !checks })} label="Run build and test checks" />
+          Run build and test checks
+        </label>
+      )}
       <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
         <Checkbox checked={commit} onChange={() => onOptions({ commit: !commit })} label="Commit each repository" />
         Commit each repository
@@ -298,25 +302,29 @@ export function UpdateFlow({
   if (stage === 'preview') {
     return (
       <Dialog
-        title="Files and commands"
-        description="Exactly what Mehen will change and run in each project. Reviewing changes nothing on disk."
-        icon={<Terminal size={22} />}
+        title={filesOnly ? 'File changes' : 'Files and commands'}
+        description={filesOnly ? 'Exactly what Mehen will change in each project. Nothing runs, and reviewing changes nothing on disk.' : 'Exactly what Mehen will change and run in each project. Reviewing changes nothing on disk.'}
+        icon={filesOnly ? <FileText size={22} /> : <Terminal size={22} />}
         size="wide"
         onClose={close}
         footer={
           <>
-            <Button
-              variant="ghost"
-              className="mr-auto"
-              onClick={async () => {
-                await navigator.clipboard?.writeText(commands())
-                setCopied(true)
-              }}
-            >
-              {copied ? <Check size={15} /> : <Copy size={15} />}
-              {copied ? 'Copied' : 'Copy commands'}
+            {!filesOnly && (
+              <Button
+                variant="ghost"
+                className="mr-auto"
+                onClick={async () => {
+                  await navigator.clipboard?.writeText(commands())
+                  setCopied(true)
+                }}
+              >
+                {copied ? <Check size={15} /> : <Copy size={15} />}
+                {copied ? 'Copied' : 'Copy commands'}
+              </Button>
+            )}
+            <Button onClick={close} className={cx(filesOnly && 'ml-auto')}>
+              Close
             </Button>
-            <Button onClick={close}>Close</Button>
             <Button variant="primary" onClick={() => setStage('confirm')} disabled={!jobs.length}>
               <Play size={15} />
               Continue to update
@@ -341,9 +349,11 @@ export function UpdateFlow({
               {job.plans.flatMap((p) => p.edits).map((e) => (
                 <Diff key={e.path} diff={e.diff} />
               ))}
-              <pre className="overflow-x-auto rounded-[3px] bg-bar px-3.5 py-3 font-mono text-[12.5px] leading-[1.65] text-rail-ink">
-                {[...install, ...steps].map((s) => [s.program, ...s.args].join(' ')).join('\n') || '# Files are edited only; nothing to run.'}
-              </pre>
+              {install.length + steps.length > 0 && (
+                <pre className="overflow-x-auto rounded-[3px] bg-bar px-3.5 py-3 font-mono text-[12.5px] leading-[1.65] text-rail-ink">
+                  {[...install, ...steps].map((s) => [s.program, ...s.args].join(' ')).join('\n')}
+                </pre>
+              )}
             </section>
           )
         })}
@@ -357,7 +367,7 @@ export function UpdateFlow({
     return (
       <Dialog
         title={`Update ${total} project${total === 1 ? '' : 's'}`}
-        description={`${packages} package${packages === 1 ? '' : 's'} will change. Mehen edits the files below and refreshes lockfiles${checks ? ", then runs each project's checks" : ''}${commit ? ', then commits' : ''}.`}
+        description={`${packages} package${packages === 1 ? '' : 's'} will change. Mehen edits the files below${filesOnly ? '' : ` and refreshes lockfiles${checks ? ", then runs each project's checks" : ''}`}${commit ? ', then commits' : ''}.`}
         icon={<Play size={22} />}
         size="wide"
         onClose={close}
@@ -410,7 +420,9 @@ export function UpdateFlow({
                   </li>
                   <li className="flex items-center gap-2 text-muted">
                     <Terminal size={14} className="shrink-0" />
-                    {checks
+                    {!install.length && !job.plans.some((p) => p.steps.length)
+                      ? 'Only files change; nothing to install or run.'
+                      : checks
                       ? steps.length
                         ? `Checks: ${labels(steps)}`
                         : `No checks for this project${install.length ? `. Install: ${labels(install)}` : ''}`
@@ -447,8 +459,9 @@ export function UpdateFlow({
           })}
         </div>
         <p className="mt-3 border-l-2 border-line-strong pl-3 text-[12.5px] leading-relaxed text-muted">
-          {checks ? (stopOnFailure ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : "If a check fails, the remaining checks still run so you see every failure, then Mehen puts that project's files back.") : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
-          {commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'} Different projects update side by side; projects that need the same tool take turns.
+          {filesOnly ? 'Workflow files have nothing to install or test here; your CI runs them next time it starts.' : checks ? (stopOnFailure ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : "If a check fails, the remaining checks still run so you see every failure, then Mehen puts that project's files back.") : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
+          {commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'}
+          {!filesOnly && ' Different projects update side by side; projects that need the same tool take turns.'}
         </p>
       </Dialog>
     )
@@ -458,7 +471,7 @@ export function UpdateFlow({
     return (
       <Dialog
         title={outcomes.length ? 'Committing' : 'Updating'}
-        description={outcomes.length ? 'Committing the files Mehen changed.' : `Each project is updated${ran.checks ? ' and checked' : ''}${ran.commit ? ' and committed' : ''}. Projects that need the same tool take turns.`}
+        description={outcomes.length ? 'Committing the files Mehen changed.' : filesOnly ? `Each project's workflow files are updated${ran.commit ? ' and committed' : ''}.` : `Each project is updated${ran.checks ? ' and checked' : ''}${ran.commit ? ' and committed' : ''}. Projects that need the same tool take turns.`}
         icon={<RefreshCw size={22} className="animate-spin" />}
         size="wide"
         busy
@@ -571,10 +584,10 @@ export function UpdateFlow({
         <div
           className={cx(
             'mb-2 flex items-center gap-3 rounded-[3px] px-3.5 py-3',
-            broke.length || !ran.checks ? 'bg-[color-mix(in_oklab,var(--risk-review)_12%,transparent)]' : 'bg-[color-mix(in_oklab,var(--ok)_12%,transparent)]',
+            broke.length || (!ran.checks && !filesOnly) ? 'bg-[color-mix(in_oklab,var(--risk-review)_12%,transparent)]' : 'bg-[color-mix(in_oklab,var(--ok)_12%,transparent)]',
           )}
         >
-          {broke.length || !ran.checks ? <AlertTriangle size={22} className="shrink-0 text-risk-review" /> : <ShieldCheck size={22} className="shrink-0 text-ok" />}
+          {broke.length || (!ran.checks && !filesOnly) ? <AlertTriangle size={22} className="shrink-0 text-risk-review" /> : <ShieldCheck size={22} className="shrink-0 text-ok" />}
           <div>
             <b className="block text-[14px]">
               {broke.length ? `${passed.length} of ${total} projects updated` : `${total} project${total === 1 ? '' : 's'} updated${anyCommitted ? ' and committed' : ''}`}
@@ -582,7 +595,9 @@ export function UpdateFlow({
             <span className="text-[12.5px] text-muted">
               {broke.length
                 ? `${broke.map((j) => j.name).join(', ')} could not be updated and ${broke.length === 1 ? 'was' : 'were'} put back as ${broke.length === 1 ? 'it was' : 'they were'}.`
-                : ran.checks
+                : filesOnly
+                  ? 'Workflow files updated. They take effect the next time your CI runs.'
+                  : ran.checks
                   ? 'Every build and test passed.'
                   : 'Checks were skipped. Run your tests or let CI check before merging.'}
             </span>
