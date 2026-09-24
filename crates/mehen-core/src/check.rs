@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use futures::{StreamExt, stream};
 
 use crate::compat::{self, ProjectEnv, Requirement};
-use crate::model::{CheckStats, Dependency, Ecosystem, Inventory, Progress, Project, Status, Vulnerability};
+use crate::model::{AffectedRange, CheckStats, Dependency, Ecosystem, Inventory, Progress, Project, Status, Vulnerability};
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Hold, Store};
@@ -162,7 +162,10 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
         Err(_) => HashMap::new(),
     };
     match find_vulnerabilities(&http, store, options, &mut inventory, &mut stats, early).await {
-        Ok(vulns) => inventory.vulnerabilities = vulns,
+        Ok(vulns) => {
+            set_fix_targets(&mut inventory, &infos, &vulns);
+            inventory.vulnerabilities = vulns;
+        }
         Err(e) => inventory.warnings.push(format!("Vulnerability check failed: {e}")),
     }
     progress(Progress { phase: "Done".into(), done: 1, total: 1 });
@@ -242,6 +245,7 @@ fn reset(dep: &mut Dependency) {
     dep.safe_latest = None;
     dep.newest = None;
     dep.blocked_reason = None;
+    dep.fix_target = None;
     dep.vulns.clear();
     dep.approximate = false;
     if dep.status == Status::Local {
@@ -403,6 +407,55 @@ async fn find_vulnerabilities(
     Ok(vulns)
 }
 
+fn set_fix_targets(inventory: &mut Inventory, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, vulns: &[Vulnerability]) {
+    let by_id: HashMap<&str, &Vulnerability> = vulns.iter().map(|v| (v.id.as_str(), v)).collect();
+    for dep in all_deps(inventory).filter(|d| !d.vulns.is_empty()) {
+        let Some(Ok(info)) = infos.get(&(dep.ecosystem, dep.name.clone())) else { continue };
+        let ranges: Vec<&AffectedRange> = dep
+            .vulns
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()))
+            .flat_map(|v| v.fixed.iter())
+            .filter(|f| f.ecosystem == dep.ecosystem && f.name.eq_ignore_ascii_case(&dep.name))
+            .flat_map(|f| f.ranges.iter())
+            .collect();
+        dep.fix_target = fix_target(dep.current.as_deref(), dep.latest.as_deref(), &info.versions, &ranges);
+    }
+}
+
+/// The newest release on the lowest line above `current` that none of the
+/// ranges cover, no newer than `latest` (the newest the project can use).
+fn fix_target(current: Option<&str>, latest: Option<&str>, versions: &[String], ranges: &[&AffectedRange]) -> Option<String> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let current = Version::parse(current?)?;
+    let cap = latest.and_then(Version::parse);
+    // Where minor releases break (0.x), the minor is the line.
+    let line = |v: &Version| if v.part(0) == 0 { (0, v.part(1)) } else { (v.part(0), 0) };
+    let safe: Vec<(Version, &String)> = versions
+        .iter()
+        .filter_map(|s| Version::parse(s).map(|v| (v, s)))
+        .filter(|(v, _)| *v > current && (current.prerelease || !v.prerelease))
+        .filter(|(v, _)| cap.as_ref().is_none_or(|c| v <= c))
+        .filter(|(v, _)| !ranges.iter().any(|r| covers(r, v)))
+        .collect();
+    let lowest = safe.iter().map(|(v, _)| line(v)).min()?;
+    safe.into_iter().filter(|(v, _)| line(v) == lowest).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, s)| s.clone())
+}
+
+/// Whether an advisory range includes `v`. An unreadable bound counts as
+/// covered, so a doubtful version is never offered as the fix.
+fn covers(range: &AffectedRange, v: &Version) -> bool {
+    let started = range.introduced.as_deref().is_none_or(|i| Version::parse(i).is_none_or(|i| *v >= i));
+    let not_ended = match (range.fixed.as_deref(), range.last_affected.as_deref()) {
+        (Some(fixed), _) => Version::parse(fixed).is_none_or(|f| *v < f),
+        (None, Some(last)) => Version::parse(last).is_none_or(|l| *v <= l),
+        (None, None) => true,
+    };
+    started && not_ended
+}
+
 struct OsvFound {
     hits: HashMap<(Ecosystem, String, String), Vec<String>>,
     cached: usize,
@@ -456,6 +509,18 @@ mod tests {
             tags: Vec::new(),
             requirements: versions.iter().filter_map(|(v, fw)| fw.map(|f| (v.to_string(), Requirement::Frameworks { frameworks: vec![f.to_string()] }))).collect(),
         }
+    }
+
+    #[test]
+    fn smallest_fix_is_the_newest_release_on_the_lowest_safe_line() {
+        let range = |introduced: Option<&str>, fixed: &str| AffectedRange { introduced: introduced.map(Into::into), fixed: Some(fixed.into()), last_affected: None };
+        let ranges = [range(None, "15.1.1"), range(Some("16.0.0"), "16.1.1")];
+        let ranges: Vec<&AffectedRange> = ranges.iter().collect();
+        let versions: Vec<String> = ["12.0.1", "14.0.0", "15.0.0", "15.1.0", "15.1.1", "15.1.3", "16.0.0", "16.1.0", "16.1.1", "16.2.0"].iter().map(|v| v.to_string()).collect();
+        assert_eq!(fix_target(Some("12.0.1"), Some("16.2.0"), &versions, &ranges).as_deref(), Some("15.1.3"));
+        assert_eq!(fix_target(Some("16.0.0"), Some("16.2.0"), &versions, &ranges).as_deref(), Some("16.2.0"), "on 16.x the fix stays on 16.x");
+        assert_eq!(fix_target(Some("12.0.1"), Some("15.1.0"), &versions, &ranges), None, "nothing safe the project can use");
+        assert_eq!(fix_target(Some("12.0.1"), Some("16.2.0"), &versions, &[]), None, "no range data, no guess");
     }
 
     #[test]

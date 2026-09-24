@@ -11,7 +11,7 @@ import { Rail, ScanStatus } from './components/Rail'
 import { SettingsDialog, type SettingsTab } from './components/SettingsDialog'
 import { AddFolderDialog, ExcludeDialog } from './components/SmallDialogs'
 import { UpdateFlow, type UpdateTarget } from './components/UpdateFlow'
-import { RISK_ORDER, folderName, heldBack, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
+import { RISK_ORDER, distinctVersions, folderName, heldBack, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
 import { usePrefs } from './prefs'
 import type { Change, Hold, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, VersionPolicies } from './types'
 
@@ -53,6 +53,8 @@ export default function App() {
   const [policies, setPolicies] = useState<VersionPolicies>({})
   const [holds, setHolds] = useState<Hold[]>([])
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  /** Selected usages moving somewhere other than their usual target, like a smaller security fix. */
+  const [chosen, setChosen] = useState<Map<string, string>>(new Map())
   const [icons, setIcons] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLInputElement>(null)
   const scannedOnOpen = useRef(false)
@@ -331,6 +333,7 @@ export default function App() {
     const added = usages.map((u) => u.key).filter((k) => !selected.has(k))
     if (!added.length) return
     setSelected((prev) => new Set([...prev, ...added]))
+    setChosen((prev) => (added.some((k) => prev.has(k)) ? new Map([...prev].filter(([k]) => !added.includes(k))) : prev))
     const packages = new Set(usages.filter((u) => added.includes(u.key)).map((u) => `${u.dep.ecosystem}:${u.dep.name}`)).size
     setNotice({
       text: message(packages),
@@ -341,7 +344,33 @@ export default function App() {
     })
   }
 
-  const toggleUsages = (usages: QueueUsage[]) =>
+  /** Selects a vulnerable package's usages, moving each to the newest version or to its smallest fix. */
+  const selectFix = (row: QueueRow, pick: 'newest' | 'fix') => {
+    const usages = row.usages.filter((u) => u.dep.vulns.length > 0)
+    const [before, beforeChosen] = [selected, chosen]
+    setSelected((prev) => new Set([...prev, ...usages.map((u) => u.key)]))
+    setChosen((prev) => {
+      const next = new Map(prev)
+      for (const u of usages) {
+        if (pick === 'fix' && u.dep.fixTarget && u.dep.fixTarget !== u.target) next.set(u.key, u.dep.fixTarget)
+        else next.delete(u.key)
+      }
+      return next
+    })
+    const to = distinctVersions(usages.map((u) => (pick === 'fix' && u.dep.fixTarget) || u.target))
+    setNotice({
+      text: `${row.name} ${to.join(', ')} selected.`,
+      undo: () => (setNotice(null), setSelected(before), setChosen(beforeChosen)),
+    })
+  }
+
+  const toggleUsages = (usages: QueueUsage[]) => {
+    setChosen((prev) => {
+      if (!usages.some((u) => prev.has(u.key))) return prev
+      const next = new Map(prev)
+      for (const u of usages) next.delete(u.key)
+      return next
+    })
     setSelected((prev) => {
       const next = new Set(prev)
       const all = usages.every((u) => next.has(u.key))
@@ -351,10 +380,14 @@ export default function App() {
       }
       return next
     })
+  }
 
   const trayGroups: TrayGroup[] = useMemo(
-    () => rows.map((row) => ({ key: row.key, name: row.name, usages: row.usages.filter((u) => selected.has(u.key)) })).filter((g) => g.usages.length > 0),
-    [rows, selected],
+    () =>
+      rows
+        .map((row) => ({ key: row.key, name: row.name, usages: row.usages.filter((u) => selected.has(u.key)).map((u) => ({ ...u, target: chosen.get(u.key) ?? u.target })) }))
+        .filter((g) => g.usages.length > 0),
+    [rows, selected, chosen],
   )
 
   const removeGroup = (g: TrayGroup) => {
@@ -615,12 +648,9 @@ export default function App() {
         <AdvisoryDialog
           row={dialog.row}
           inventory={inventory}
-          allSelected={dialog.row.usages.filter((u) => u.dep.vulns.length > 0).every((u) => selected.has(u.key))}
-          onSelect={() => {
-            addAll(
-              dialog.row.usages.filter((u) => u.dep.vulns.length > 0),
-              () => `${dialog.row.name} fix selected.`,
-            )
+          chosenTarget={(u) => (selected.has(u.key) ? (chosen.get(u.key) ?? u.target) : null)}
+          onSelect={(pick) => {
+            selectFix(dialog.row, pick)
             setDialog(null)
           }}
           onClose={() => setDialog(null)}

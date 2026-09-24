@@ -197,6 +197,10 @@ impl Store {
             // Lets `prune` hand freed pages back to the disk; takes effect after one VACUUM.
             conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM; PRAGMA user_version = 9;")?;
         }
+        if version < 10 {
+            // Advisories saved before affected ranges were kept are fetched again.
+            conn.execute_batch("DELETE FROM advisory; PRAGMA user_version = 10;")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 

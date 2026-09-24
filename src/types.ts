@@ -21,6 +21,8 @@ export interface Dependency {
   /** Newest published version when this project can't use it; `latest` is then the newest it can. */
   newest: string | null
   blockedReason: string | null
+  /** For a vulnerable package: the smallest safe update, on the lowest line no advisory covers. */
+  fixTarget?: string | null
   status: Status
   vulns: string[]
   note: string | null
@@ -40,10 +42,19 @@ export interface Project {
   dependencies: Dependency[]
 }
 
+export interface AffectedRange {
+  /** Null for "every version before". */
+  introduced: string | null
+  fixed: string | null
+  lastAffected: string | null
+}
+
 export interface FixedIn {
   ecosystem: Ecosystem
   name: string
   versions: string[]
+  /** Which versions the advisory covers; missing on advisories saved before ranges were kept. */
+  ranges?: AffectedRange[]
 }
 
 export interface Vulnerability {

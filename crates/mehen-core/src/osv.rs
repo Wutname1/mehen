@@ -4,7 +4,7 @@ use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::model::{Ecosystem, FixedIn, Vulnerability};
+use crate::model::{AffectedRange, Ecosystem, FixedIn, Vulnerability};
 use crate::store::Store;
 
 const BATCH: usize = 500;
@@ -95,6 +95,8 @@ async fn detail(http: &reqwest::Client, id: &str) -> anyhow::Result<Vulnerabilit
     }
     #[derive(Deserialize)]
     struct Range {
+        #[serde(rename = "type", default)]
+        kind: String,
         #[serde(default)]
         events: Vec<serde_json::Value>,
     }
@@ -111,15 +113,45 @@ async fn detail(http: &reqwest::Client, id: &str) -> anyhow::Result<Vulnerabilit
     for affected in osv.affected {
         let Some(pkg) = affected.package else { continue };
         let Some(ecosystem) = from_osv_name(&pkg.ecosystem) else { continue };
-        let versions: Vec<String> =
-            affected.ranges.iter().flat_map(|r| r.events.iter()).filter_map(|e| e["fixed"].as_str().map(str::to_string)).collect();
+        // Git ranges name commits, not versions a project can have.
+        let ranges: Vec<&Range> = affected.ranges.iter().filter(|r| r.kind != "GIT").collect();
+        let versions: Vec<String> = ranges.iter().flat_map(|r| r.events.iter()).filter_map(|e| e["fixed"].as_str().map(str::to_string)).collect();
+        let spans: Vec<AffectedRange> = ranges.iter().flat_map(|r| affected_ranges(&r.events)).collect();
         match fixed.iter_mut().find(|f| f.ecosystem == ecosystem && f.name == pkg.name) {
-            Some(f) => f.versions.extend(versions),
-            None => fixed.push(FixedIn { ecosystem, name: pkg.name, versions }),
+            Some(f) => {
+                f.versions.extend(versions);
+                f.ranges.extend(spans);
+            }
+            None => fixed.push(FixedIn { ecosystem, name: pkg.name, versions, ranges: spans }),
         }
     }
 
     Ok(Vulnerability { url: format!("https://osv.dev/vulnerability/{}", osv.id), id: osv.id, aliases: osv.aliases, summary, severity, fixed })
+}
+
+/// OSV events, in order, as spans: each `introduced` opens one, and the next
+/// `fixed` or `last_affected` closes it.
+fn affected_ranges(events: &[serde_json::Value]) -> Vec<AffectedRange> {
+    let mut spans = Vec::new();
+    let mut open: Option<AffectedRange> = None;
+    for event in events {
+        if let Some(v) = event["introduced"].as_str() {
+            if let Some(unclosed) = open.take() {
+                spans.push(unclosed);
+            }
+            open = Some(AffectedRange { introduced: (v != "0").then(|| v.to_string()), ..Default::default() });
+        } else if let Some(v) = event["fixed"].as_str() {
+            let mut span = open.take().unwrap_or_default();
+            span.fixed = Some(v.to_string());
+            spans.push(span);
+        } else if let Some(v) = event["last_affected"].as_str() {
+            let mut span = open.take().unwrap_or_default();
+            span.last_affected = Some(v.to_string());
+            spans.push(span);
+        }
+    }
+    spans.extend(open);
+    spans
 }
 
 fn placeholder(id: &str) -> Vulnerability {
@@ -140,5 +172,27 @@ fn from_osv_name(name: &str) -> Option<Ecosystem> {
         "NuGet" => Some(Ecosystem::Nuget),
         "GitHub Actions" => Some(Ecosystem::GithubActions),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn events_become_spans() {
+        let spans = affected_ranges(&[json!({"introduced": "0"}), json!({"fixed": "15.1.1"}), json!({"introduced": "16.0.0"}), json!({"fixed": "16.1.1"})]);
+        assert_eq!(
+            spans,
+            vec![
+                AffectedRange { introduced: None, fixed: Some("15.1.1".into()), last_affected: None },
+                AffectedRange { introduced: Some("16.0.0".into()), fixed: Some("16.1.1".into()), last_affected: None },
+            ]
+        );
+        let open = affected_ranges(&[json!({"introduced": "2.0.0"})]);
+        assert_eq!(open, vec![AffectedRange { introduced: Some("2.0.0".into()), ..Default::default() }], "no fix yet");
+        let last = affected_ranges(&[json!({"introduced": "0"}), json!({"last_affected": "3.4.0"})]);
+        assert_eq!(last[0].last_affected.as_deref(), Some("3.4.0"));
     }
 }

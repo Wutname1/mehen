@@ -89,6 +89,10 @@ pub struct Dependency {
     pub newest: Option<String>,
     #[serde(default)]
     pub blocked_reason: Option<String>,
+    /// For a vulnerable package: the smallest safe move, the newest release on
+    /// the lowest line no advisory covers (15.1.3 when 16.x is also safe).
+    #[serde(default)]
+    pub fix_target: Option<String>,
     pub status: Status,
     pub vulns: Vec<String>,
     pub note: Option<String>,
@@ -111,6 +115,7 @@ impl Dependency {
             patch_latest: None,
             newest: None,
             blocked_reason: None,
+            fix_target: None,
             status: Status::Pending,
             vulns: Vec::new(),
             note: None,
@@ -159,6 +164,21 @@ pub struct FixedIn {
     pub ecosystem: Ecosystem,
     pub name: String,
     pub versions: Vec<String>,
+    /// Which versions the advisory covers. One advisory can hit several
+    /// separate lines, like "before 15.1.1" and "16.0.0 up to 16.1.1".
+    #[serde(default)]
+    pub ranges: Vec<AffectedRange>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AffectedRange {
+    /// `None` or `0` for "every version before".
+    pub introduced: Option<String>,
+    /// First version without the problem.
+    pub fixed: Option<String>,
+    /// Last version with the problem, when no fix is named.
+    pub last_affected: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
