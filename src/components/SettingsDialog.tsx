@@ -478,8 +478,11 @@ export function SettingsDialog({
                     <option value={4}>4 at once</option>
                   </Select>
                 </SettingRow>
-                <SettingRow title="Build and test when updating" help="Your usual choice for the update button. A project whose checks fail is put back.">
-                  <Switch checked={prefs.checks} onChange={(v) => onPrefs({ checks: v })} label="Build and test when updating" />
+                <SettingRow title="Build when updating" help="Your usual choice for the update button. A project that fails to build is put back.">
+                  <Switch checked={prefs.build} onChange={(v) => onPrefs({ build: v })} label="Build when updating" />
+                </SettingRow>
+                <SettingRow title="Run tests when updating" help="Leave off when CI runs your tests. Installs still run, so lockfiles stay current.">
+                  <Switch checked={prefs.test} onChange={(v) => onPrefs({ test: v })} label="Run tests when updating" />
                 </SettingRow>
                 <SettingRow title="Stop at the first failed check" help="When off, the remaining checks still run so you see every failure at once. The project is put back either way.">
                   <Switch checked={prefs.stopOnFailure} onChange={(v) => onPrefs({ stopOnFailure: v })} label="Stop at the first failed check" />

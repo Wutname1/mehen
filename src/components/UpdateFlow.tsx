@@ -1,7 +1,7 @@
 import { AlertTriangle, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import { bumpOf, folderName, relativePath } from '../derive'
+import { bumpOf, folderName, relativePath, runLabel } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
@@ -55,7 +55,7 @@ function changesOf(job: Job) {
 
 export const commitSubject = (n: number) => `Updated ${n} ${n === 1 ? 'Dependency' : 'Dependencies'}`
 
-function stepsOf(job: Job, checks: boolean) {
+function stepsOf(job: Job, build: boolean, test: boolean) {
   const seen = new Set<string>()
   const pick = (kind: string) =>
     job.plans
@@ -66,7 +66,7 @@ function stepsOf(job: Job, checks: boolean) {
         return !seen.has(k) && !!seen.add(k)
       })
   const install = pick('install')
-  return { install, checks: checks ? [...pick('verify'), ...pick('test')] : [] }
+  return { install, checks: [...(build ? pick('verify') : []), ...(test ? pick('test') : [])] }
 }
 
 /** Labels once each, with a count when several folders run the same thing. */
@@ -133,7 +133,8 @@ export function UpdateFlow({
   targets,
   start,
   roots,
-  checks,
+  build,
+  test,
   commit,
   stopOnFailure,
   onOptions,
@@ -146,10 +147,11 @@ export function UpdateFlow({
   targets: UpdateTarget[]
   start: 'confirm' | 'preview'
   roots: string[]
-  checks: boolean
+  build: boolean
+  test: boolean
   commit: boolean
   stopOnFailure: boolean
-  onOptions: (patch: { checks?: boolean; commit?: boolean }) => void
+  onOptions: (patch: { build?: boolean; test?: boolean; commit?: boolean }) => void
   nameOf: (key: string) => string
   icons: Record<string, string>
   /** Keeps a package on its line in `scope` (a repository) from now on. */
@@ -168,6 +170,7 @@ export function UpdateFlow({
   const [outcomes, setOutcomes] = useState<JobOutcome[]>([])
   const [commits, setCommits] = useState<CommitOutcome[]>([])
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
+  const checks = build || test
   const [ran, setRan] = useState({ checks, commit })
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
@@ -214,7 +217,7 @@ export function UpdateFlow({
     setStage('running')
     setError(null)
     try {
-      const result = await api.applyBatch(plans, checks, commit, stopOnFailure)
+      const result = await api.applyBatch(plans, { build, test }, commit, stopOnFailure)
       setOutcomes(result.outcomes)
       if (result.inventory) setRefreshed(result.inventory)
     } catch (e) {
@@ -265,7 +268,7 @@ export function UpdateFlow({
   const commands = () =>
     jobs
       .map((job) => {
-        const { install, checks: steps } = stepsOf(job, checks)
+        const { install, checks: steps } = stepsOf(job, build, test)
         const lines = [`# ${job.name}${job.branch ? ` (${job.branch})` : ''}`, `cd ${job.key}`, ...[...install, ...steps].map((s) => [s.program, ...s.args].join(' '))]
         if (commit && !job.blocked) lines.push(`git commit -m "${commitSubject(changesOf(job).length)}" -- <changed files>`)
         return lines.join('\n')
@@ -274,16 +277,22 @@ export function UpdateFlow({
 
   // Nothing to install, build or test: only workflow files change.
   const filesOnly = plans.length > 0 && plans.every((p) => p.steps.length === 0)
-  const label = filesOnly ? 'Update workflow files' : checks ? 'Update & run checks' : 'Update & install only'
+  const label = filesOnly ? 'Update workflow files' : runLabel(build, test)
   const total = jobs.length
 
   const options = (
     <div className="mr-auto flex flex-wrap gap-x-[18px] gap-y-1.5" role="group" aria-label="When updating">
       {!filesOnly && (
-        <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
-          <Checkbox checked={checks} onChange={() => onOptions({ checks: !checks })} label="Run build and test checks" />
-          Run build and test checks
-        </label>
+        <>
+          <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
+            <Checkbox checked={build} onChange={() => onOptions({ build: !build })} label="Build" />
+            Build
+          </label>
+          <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
+            <Checkbox checked={test} onChange={() => onOptions({ test: !test })} label="Run tests" />
+            Run tests
+          </label>
+        </>
       )}
       <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
         <Checkbox checked={commit} onChange={() => onOptions({ commit: !commit })} label="Commit each repository" />
@@ -336,7 +345,7 @@ export function UpdateFlow({
         }
       >
         {jobs.map((job) => {
-          const { install, checks: steps } = stepsOf(job, checks)
+          const { install, checks: steps } = stepsOf(job, build, test)
           return (
             <section key={job.key} className="mb-5">
               <h3 className="mb-2 flex items-center gap-2 text-[13px] font-semibold">
@@ -391,7 +400,7 @@ export function UpdateFlow({
             const changes = changesOf(job)
             const edited = new Set(job.plans.flatMap((p) => p.edits.map((e) => e.path.toLowerCase())))
             const lockfiles = [...new Set(job.plans.flatMap((p) => p.snapshots).filter((f) => !edited.has(f.toLowerCase())))].map((f) => relativePath([job.key], f))
-            const { install, checks: steps } = stepsOf(job, checks)
+            const { install, checks: steps } = stepsOf(job, build, test)
             const warnings = [...new Set(job.plans.flatMap((p) => p.warnings))]
             return (
               <section key={job.key} className="rounded-[3px] border border-line bg-paper">

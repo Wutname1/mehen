@@ -510,9 +510,9 @@ struct BatchResult {
 /// side by side except where two need the same tool. Progress arrives as
 /// `mehen://batch` events; results are re-checked once at the end.
 #[tauri::command]
-async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commit: bool, stop_on_failure: Option<bool>) -> Result<BatchResult, String> {
+async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: bool, commit: bool, stop_on_failure: Option<bool>) -> Result<BatchResult, String> {
     let parallel = app.state::<AppState>().update_parallel();
-    let options = BatchOptions { checks, commit, parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
+    let options = BatchOptions { build, test, commit, parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
     let outcomes = batch::run(plans, options, |step| async move { update::run_step(&step).await }, |e: BatchEvent| {
         let _ = app.emit("mehen://batch", e);
     })

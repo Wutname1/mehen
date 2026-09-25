@@ -1,6 +1,6 @@
 import { ChevronDown, Code2, FileText, FolderOpen, GitCommitHorizontal, Play, Settings2, Terminal, X } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
-import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo } from '../derive'
+import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo, runLabel } from '../derive'
 import { GitWyrmMark, cx } from './bits'
 import { Menu, MenuCheck, MenuSeparator, MenuTitle } from './Menu'
 import { RepoAvatar } from './RepoAvatar'
@@ -83,7 +83,8 @@ export function Tray({
   onClear,
   onUpdate,
   onPreview,
-  checks,
+  build,
+  test,
   commit,
   onOptions,
 }: {
@@ -93,9 +94,10 @@ export function Tray({
   onClear: () => void
   onUpdate: () => void
   onPreview: () => void
-  checks: boolean
+  build: boolean
+  test: boolean
   commit: boolean
-  onOptions: (patch: { checks?: boolean; commit?: boolean }) => void
+  onOptions: (patch: { build?: boolean; test?: boolean; commit?: boolean }) => void
 }) {
   const [menu, setMenu] = useState<HTMLElement | null>(null)
   const usages = groups.flatMap((g) => g.usages)
@@ -177,10 +179,8 @@ export function Tray({
               ? commit
                 ? 'Edits the workflow files, then commits each project. Nothing to install or test.'
                 : 'Edits the workflow files only. Nothing to install or test.'
-              : checks && commit
-              ? 'Then builds, tests, and commits each project.'
-              : checks
-                ? 'Then builds and tests. You commit afterwards.'
+              : build || test
+                ? `Then ${build && test ? 'builds and tests' : build ? 'builds (no tests)' : 'tests (no build)'}${commit ? ', then commits each project.' : '. You commit afterwards.'}`
                 : commit
                   ? 'Installs only, then commits each project. No build or test.'
                   : 'Installs only. No build or test, nothing committed.'}
@@ -203,7 +203,7 @@ export function Tray({
             className="inline-flex h-[38px] flex-1 items-center justify-center gap-2 rounded-l-[3px] bg-accent px-3 text-[12.5px] font-semibold text-accent-ink hover:bg-accent-hover disabled:opacity-45"
           >
             <Play size={15} />
-            {filesOnly ? 'Update workflow files' : checks ? 'Update & run checks' : 'Update & install only'}
+            {filesOnly ? 'Update workflow files' : runLabel(build, test)}
           </button>
           <button
             type="button"
@@ -225,11 +225,11 @@ export function Tray({
             <MenuTitle title="When you update" detail={filesOnly ? 'Workflow files have nothing to install or test' : 'Applies to every selected project'} />
             {!filesOnly && (
               <>
-                <MenuCheck radio checked={checks} onSelect={() => (onOptions({ checks: true }), setMenu(null))} detail="Install, then build and test each project. A project whose checks fail is put back.">
-                  Update and run checks
+                <MenuCheck checked={build} onSelect={() => onOptions({ build: !build })} detail="Build each project after installing. A project that fails to build is put back.">
+                  Build
                 </MenuCheck>
-                <MenuCheck radio checked={!checks} onSelect={() => (onOptions({ checks: false }), setMenu(null))} detail="Skip build and test. Useful when CI runs your tests.">
-                  Update and install only
+                <MenuCheck checked={test} onSelect={() => onOptions({ test: !test })} detail="Run each project's tests. Leave off when CI runs them; the install still refreshes lockfiles.">
+                  Run tests
                 </MenuCheck>
                 <MenuSeparator />
               </>

@@ -436,3 +436,11 @@ export function heldBack(projects: Project[]): HeldBack[] {
   }
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
 }
+
+/** The update button's words for what runs after the install. */
+export function runLabel(build: boolean, test: boolean): string {
+  if (build && test) return 'Update, build & test'
+  if (build) return 'Update & build'
+  if (test) return 'Update & test'
+  return 'Update & install only'
+}

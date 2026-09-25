@@ -752,7 +752,8 @@ export default function App() {
               onClear={clearSelection}
               onUpdate={() => startUpdate('confirm')}
               onPreview={() => startUpdate('preview')}
-              checks={prefs.checks}
+              build={prefs.build}
+              test={prefs.test}
               commit={prefs.commit}
               onOptions={setPrefs}
             />
@@ -883,7 +884,8 @@ export default function App() {
           targets={dialog.targets}
           start={dialog.start}
           roots={inventory.roots}
-          checks={prefs.checks}
+          build={prefs.build}
+              test={prefs.test}
           commit={prefs.commit}
           stopOnFailure={prefs.stopOnFailure}
           onOptions={setPrefs}

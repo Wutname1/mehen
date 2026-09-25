@@ -227,8 +227,17 @@ pub fn use_check_commands(plan: &mut UpdatePlan, commands: &[String], cwd: &str)
     for command in commands.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
         let mut parts = command.split_whitespace();
         let program = parts.next().unwrap_or_default().to_string();
-        plan.steps.push(Step { kind: StepKind::Test, label: command.to_string(), program, args: parts.map(str::to_string).collect(), cwd: cwd.to_string() });
+        plan.steps.push(Step { kind: check_kind(command), label: command.to_string(), program, args: parts.map(str::to_string).collect(), cwd: cwd.to_string() });
     }
+}
+
+/// A custom check that runs tests counts as a test, so it can be skipped on
+/// its own; anything else (a build, a lint, a type check) counts as the build.
+fn check_kind(command: &str) -> StepKind {
+    const TEST_WORDS: &[&str] = &["test", "tests", "vitest", "jest", "pytest", "mocha", "playwright", "rspec", "phpunit", "pest", "nextest"];
+    let words = command.to_ascii_lowercase();
+    let is_test = words.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|w| TEST_WORDS.contains(&w) || w.starts_with("test:"));
+    if is_test { StepKind::Test } else { StepKind::Verify }
 }
 
 /// Every file an update writes: the edits plus lockfiles the steps rewrite.
@@ -1138,6 +1147,16 @@ pub async fn apply(plan: &UpdatePlan, run_verify: bool, commit_message: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_checks_are_sorted_into_build_and_test() {
+        for c in ["npm test", "npm run test", "cargo test --quiet", "npx vitest run", "go test ./...", "dotnet test", "pytest -q", "bundle exec rspec", "cargo nextest run"] {
+            assert_eq!(check_kind(c), StepKind::Test, "{c}");
+        }
+        for c in ["npm run build", "cargo build", "npx tsc --noEmit", "npm run lint", "dotnet build", "npm run testing-docs-build"] {
+            assert_eq!(check_kind(c), StepKind::Verify, "{c}");
+        }
+    }
 
     fn dep(name: &str, eco: Ecosystem, requested: &str, current: &str) -> Dependency {
         let mut d = Dependency::new(name, eco, crate::model::DepKind::Normal, requested);

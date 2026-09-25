@@ -25,8 +25,10 @@ pub fn auto_parallel() -> usize {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BatchOptions {
-    /// Run build and test steps, not just installs.
-    pub checks: bool,
+    /// Run build steps after installing.
+    pub build: bool,
+    /// Run test steps after building.
+    pub test: bool,
     /// Commit each repository once its work succeeds.
     pub commit: bool,
     /// Steps running at once across every repository; at least 1.
@@ -110,11 +112,11 @@ impl Job {
     /// Installs first (every manifest is edited before anything builds), then
     /// builds, then tests. A step two projects share (one lockfile at the
     /// repository root) runs once.
-    fn steps(&self, checks: bool) -> Vec<Step> {
+    fn steps(&self, build: bool, test: bool) -> Vec<Step> {
         let mut seen = HashSet::new();
         let mut steps = Vec::new();
         for kind in [StepKind::Install, StepKind::Verify, StepKind::Test] {
-            if kind.is_check() && !checks {
+            if kind == StepKind::Verify && !build || kind == StepKind::Test && !test {
                 continue;
             }
             for step in self.plans.iter().flat_map(|p| &p.steps).filter(|s| s.kind == kind) {
@@ -268,7 +270,7 @@ where
     E: Fn(BatchEvent),
 {
     let jobs = group(plans);
-    let steps: Vec<Vec<Step>> = jobs.iter().map(|j| j.steps(options.checks)).collect();
+    let steps: Vec<Vec<Step>> = jobs.iter().map(|j| j.steps(options.build, options.test)).collect();
     let lanes: HashMap<String, Mutex<()>> = steps.iter().flatten().map(|s| (lane(s), Mutex::new(()))).collect();
     let limit = Semaphore::new(options.parallel.max(1));
     for job in &jobs {
@@ -496,7 +498,7 @@ mod tests {
         };
 
         let log = Log::default();
-        let opts = BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans(), opts, recorder(&log, ""), |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok));
         let runs = log.borrow();
@@ -530,7 +532,7 @@ mod tests {
                 let first = calls.get() == 1;
                 async move { if first { (false, "npm error code ERESOLVE".to_string()) } else { (retry_works, "done".to_string()) } }
             };
-            let opts = BatchOptions { checks: false, commit: false, parallel: 1, stop_on_failure: true };
+            let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
             let outcome = run(vec![p], opts, fake, |_| {}).await.remove(0);
             assert_eq!(calls.get(), 2, "one retry");
             assert_eq!(outcome.ok, retry_works);
@@ -550,7 +552,7 @@ mod tests {
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)])];
         let output = "npm error Could not resolve dependency:
 npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
-        let opts = BatchOptions { checks: false, commit: false, parallel: 1, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
         let outcomes = run(plans, opts, |_| async move { (false, output.to_string()) }, |_| {}).await;
         let conflicts = &outcomes[0].conflicts;
         assert!(outcomes[0].rolled_back);
@@ -572,12 +574,15 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         ];
         let jobs = group(plans.clone());
         assert_eq!(jobs.len(), 1);
-        let order: Vec<(String, StepKind)> = jobs[0].steps(true).iter().map(|s| (s.program.clone(), s.kind)).collect();
+        let order: Vec<(String, StepKind)> = jobs[0].steps(true, true).iter().map(|s| (s.program.clone(), s.kind)).collect();
         assert_eq!(order, vec![("npm".into(), StepKind::Install), ("cargo".into(), StepKind::Install), ("npm".into(), StepKind::Verify), ("cargo".into(), StepKind::Test)]);
-        assert_eq!(jobs[0].steps(false).len(), 2, "checks off keeps only installs");
+        assert_eq!(jobs[0].steps(false, false).len(), 2, "checks off keeps only installs");
+        let kinds = |build, test| jobs[0].steps(build, test).iter().map(|s| s.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(false, true), [StepKind::Install, StepKind::Install, StepKind::Test], "tests without the build");
+        assert_eq!(kinds(true, false), [StepKind::Install, StepKind::Install, StepKind::Verify], "the build without tests");
 
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { checks: false, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, ""), |_| {}).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(log.borrow().len(), 2);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "after");
@@ -596,7 +601,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         ];
         let events = RefCell::new(Vec::new());
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
         let bad_outcome = outcomes.iter().find(|o| o.name == "bad").unwrap();
         assert!(!bad_outcome.ok && bad_outcome.rolled_back, "{:?}", bad_outcome.error);
         assert_eq!(std::fs::read_to_string(bad.join("Cargo.toml")).unwrap(), "before");
@@ -619,7 +624,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         git(&["commit", "-q", "-m", "init"]);
 
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![]), plan(&dir, "app.csproj", Some(&dir), vec![])];
-        let outcomes = run(plans, BatchOptions { checks: true, commit: true, parallel: 2, stop_on_failure: true }, |_| async { (true, String::new()) }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, parallel: 2, stop_on_failure: true }, |_| async { (true, String::new()) }, |_| {}).await;
         assert!(outcomes[0].committed.is_some(), "{:?}", outcomes[0].commit_error);
         let log = String::from_utf8(git(&["log", "-1", "--format=%s%n%b"]).stdout).unwrap();
         assert!(log.starts_with("Updated 2 Dependencies"), "{log}");
@@ -633,7 +638,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let dir = temp("keep-going");
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("vitest", StepKind::Verify, &dir), step("npm", StepKind::Test, &dir)])];
         let log = Log::default();
-        let opts = BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: false };
+        let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: false };
         let outcomes = run(plans, opts, recorder(&log, "vitest"), |_| {}).await;
         assert_eq!(log.borrow().len(), 3, "the test step still ran after the build failed");
         assert!(!outcomes[0].ok && outcomes[0].rolled_back);
@@ -657,7 +662,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let npm = Step { kind: StepKind::Install, label: "npm version".into(), program: "npm".into(), args: vec!["--version".into()], cwd: d.display().to_string() };
         let plans = vec![plan(&a, "package.json", None, vec![sleep(&a)]), plan(&b, "package.json", None, vec![sleep(&b)]), plan(&c, "x.csproj", None, vec![git]), plan(&d, "y.csproj", None, vec![npm])];
         let started = Instant::now();
-        let outcomes = run(plans, BatchOptions { checks: true, commit: false, parallel: 2, stop_on_failure: true }, |s| async move { update::run_step(&s).await }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, |s| async move { update::run_step(&s).await }, |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok), "{:?}", outcomes.iter().map(|o| &o.error).collect::<Vec<_>>());
         assert!(started.elapsed() >= Duration::from_millis(1500), "the two node steps overlapped: {:?}", started.elapsed());
     }

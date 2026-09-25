@@ -44,7 +44,7 @@ async fn main() {
         let before = std::fs::read_to_string(dir.join("go.mod")).unwrap();
         let plan = plan(&dep_project, &[Change { from: None, name: dep.name.clone(), to: version.into() }], |_| None).unwrap();
         println!("== {label}: {} {} -> {version}", dep.name, dep.requested);
-        let options = BatchOptions { checks: !args.iter().any(|a| a == "--no-checks"), commit: false, parallel: 1, stop_on_failure: true };
+        let options = BatchOptions { build: !args.iter().any(|a| a == "--no-checks"), test: !args.iter().any(|a| a == "--no-checks"), commit: false, parallel: 1, stop_on_failure: true };
         let outcomes = run(vec![plan], options, |s| async move { update::run_step(&s).await }, |e| println!("   [{:?}] {}", e.state, e.label.unwrap_or_default())).await;
         let o = &outcomes[0];
         for s in &o.steps {

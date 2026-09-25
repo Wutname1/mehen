@@ -233,12 +233,12 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
 
 /**
  * Updates many projects at once: one job per repository, side by side except
- * where two need the same tool. `checks` runs builds and tests; `commit`
+ * where two need the same tool. `run` picks the builds and tests; `commit`
  * commits each repository that succeeds.
  */
-export async function applyBatch(plans: UpdatePlan[], checks: boolean, commit: boolean, stopOnFailure = true): Promise<BatchResult> {
-  if (!inTauri) return mock.applyBatch(plans, checks, commit)
-  return invoke<BatchResult>('apply_batch', { plans, checks, commit, stopOnFailure })
+export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true): Promise<BatchResult> {
+  if (!inTauri) return mock.applyBatch(plans, run, commit)
+  return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure })
 }
 
 export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {
@@ -476,7 +476,7 @@ const mock = (() => {
       }
     },
     // Mirrors the Rust runner: one job per repository, one step per tool at a time.
-    applyBatch: async (plans: UpdatePlan[], checks: boolean, commit: boolean): Promise<BatchResult> => {
+    applyBatch: async (plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean): Promise<BatchResult> => {
       const emit = (e: BatchEvent) => mockBatchListeners.forEach((l) => l(e))
       const jobs = new Map<string, UpdatePlan[]>()
       for (const p of plans) {
@@ -523,7 +523,7 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
             ],
           }
         }
-        for (const step of list.flatMap((p) => p.steps).filter((s) => checks || s.kind === 'install')) {
+        for (const step of list.flatMap((p) => p.steps).filter((s) => s.kind === 'install' || (s.kind === 'verify' ? run.build : run.test))) {
           const previous = lanes.get(step.program) ?? Promise.resolve()
           let release = () => {}
           lanes.set(step.program, previous.then(() => new Promise<void>((r) => (release = r))))

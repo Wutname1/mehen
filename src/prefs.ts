@@ -4,8 +4,10 @@ import { useEffect, useState } from 'react'
 export interface Prefs {
   palette: 'faience' | 'parchment'
   theme: 'dark' | 'light' | 'system'
-  /** Run build and test steps when updating. */
-  checks: boolean
+  /** Build each project after installing. */
+  build: boolean
+  /** Run each project's tests after installing. */
+  test: boolean
   /** Commit each repository once its update succeeds. */
   commit: boolean
   /** Check every project when Mehen opens. */
@@ -18,7 +20,7 @@ export interface Prefs {
   railSort: 'az' | 'za' | 'updates'
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', checks: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', build: true, test: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
 
 /** Bumped when a default changes and older saved choices should pick it up. */
 const VERSION = 2
@@ -29,6 +31,12 @@ function load(): Prefs {
     const saved = JSON.parse(localStorage.getItem(KEY) ?? '{}')
     // Version 2 turned on checking at launch for everyone.
     if ((saved.version ?? 1) < 2) delete saved.scanOnOpen
+    // Build and test used to be one switch.
+    if (typeof saved.checks === 'boolean') {
+      saved.build ??= saved.checks
+      saved.test ??= saved.checks
+      delete saved.checks
+    }
     return { ...DEFAULTS, ...saved }
   } catch {
     return DEFAULTS
