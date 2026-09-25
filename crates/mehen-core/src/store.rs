@@ -110,6 +110,10 @@ impl Store {
     }
 
     fn init(conn: Connection) -> anyhow::Result<Self> {
+        // The app and a background check (from GitWyrm or the daily task) can
+        // have the database open at once; wait for the other writer rather
+        // than failing straight away.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { compareVersions, isWithin, samePath } from './derive'
-import type { AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move } from './types'
+import type { OpenRepoRequest, AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -305,16 +305,22 @@ export async function gitwyrmFolders(): Promise<string[]> {
   return invoke<string[]>('gitwyrm_folders')
 }
 
-/** The repository folder Mehen was started with, if any. Returns it once. */
-export async function launchRepo(): Promise<string | null> {
+/** The repository Mehen was started to show, if any. Returns it once. */
+export async function launchRepo(): Promise<OpenRepoRequest | null> {
   if (!inTauri) return null
-  return invoke<string | null>('launch_repo')
+  return invoke<OpenRepoRequest | null>('launch_repo')
 }
 
-/** A repository folder passed to Mehen while it was already running. */
-export async function onOpenRepo(handler: (path: string) => void): Promise<UnlistenFn> {
+/** A repository passed to Mehen while it was already running. */
+export async function onOpenRepo(handler: (request: OpenRepoRequest) => void): Promise<UnlistenFn> {
   if (!inTauri) return () => {}
-  return listen<string>('mehen://open-repo', (e) => handler(e.payload))
+  return listen<OpenRepoRequest>('mehen://open-repo', (e) => handler(e.payload))
+}
+
+/** Creates or removes the Windows task that checks daily with Mehen closed. */
+export async function setScheduledCheck(enabled: boolean): Promise<Settings> {
+  if (!inTauri) return mock.setScheduledCheck(enabled)
+  return invoke<Settings>('set_scheduled_check', { enabled })
 }
 
 export async function openLink(url: string) {
@@ -326,7 +332,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true, appUpdateCheck: true }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true, appUpdateCheck: true, scheduledCheck: false, scheduledCheckSupported: true }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -382,6 +388,7 @@ const mock = (() => {
     setUpdateParallel: async (parallel: number) => (state = { ...state, updateParallel: Math.min(8, Math.max(0, parallel)) }),
     setNotify: async (notify: boolean) => (state = { ...state, notify }),
     setAppUpdateCheck: async (appUpdateCheck: boolean) => (state = { ...state, appUpdateCheck }),
+    setScheduledCheck: async (scheduledCheck: boolean) => (state = { ...state, scheduledCheck }),
     appUpdate: {
       version: '0.2.0',
       listeners: new Set<(p: AppUpdateProgress) => void>(),

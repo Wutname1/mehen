@@ -5,31 +5,44 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// A repository folder passed at launch, held until the window asks for it.
-static PENDING: Mutex<Option<String>> = Mutex::new(None);
+/// With a folder: select that repository's security fixes, ready to update.
+const FIX_FLAG: &str = "--fix";
 
-/// The first argument that is an existing folder. Flags are skipped, and so is
-/// argv[0], which is Mehen itself.
-pub fn repo_from_args<I, S>(args: I) -> Option<String>
+/// A repository someone asked Mehen to show.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpenRequest {
+    pub path: String,
+    /// Select its security fixes too, so updating is one click away.
+    pub fix: bool,
+}
+
+/// A request passed at launch, held until the window asks for it.
+static PENDING: Mutex<Option<OpenRequest>> = Mutex::new(None);
+
+/// The first argument that is an existing folder, and whether `--fix` came
+/// with it. Other flags are skipped, and so is argv[0], which is Mehen itself.
+pub fn request_from_args<I, S>(args: I) -> Option<OpenRequest>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    args.into_iter().skip(1).map(|a| a.as_ref().to_string()).find(|a| !a.starts_with('-') && Path::new(a).is_dir())
+    let args: Vec<String> = args.into_iter().skip(1).map(|a| a.as_ref().to_string()).collect();
+    let path = args.iter().find(|a| !a.starts_with('-') && Path::new(a).is_dir())?.clone();
+    Some(OpenRequest { path, fix: args.iter().any(|a| a == FIX_FLAG) })
 }
 
-pub fn set_pending(path: Option<String>) {
-    if let (Some(path), Ok(mut slot)) = (path, PENDING.lock()) {
-        *slot = Some(path);
+pub fn set_pending(request: Option<OpenRequest>) {
+    if let (Some(request), Ok(mut slot)) = (request, PENDING.lock()) {
+        *slot = Some(request);
     }
 }
 
-/// The folder Mehen was started with, once. Taken rather than read so a
-/// reload of the window does not jump back to it.
+/// What Mehen was started to show, once. Taken rather than read so a reload
+/// of the window does not jump back to it.
 #[tauri::command]
-pub fn launch_repo() -> Option<String> {
+pub fn launch_repo() -> Option<OpenRequest> {
     PENDING.lock().ok()?.take()
 }
 
@@ -126,8 +139,9 @@ mod tests {
     #[test]
     fn takes_the_first_folder_argument() {
         let dir = std::env::temp_dir().display().to_string();
-        assert_eq!(repo_from_args(["mehen.exe", "--flag", "not-a-folder-xyz", dir.as_str()]), Some(dir.clone()));
-        assert_eq!(repo_from_args(["mehen.exe"]), None);
-        assert_eq!(repo_from_args([dir.as_str()]), None);
+        assert_eq!(request_from_args(["mehen.exe", "--flag", "not-a-folder-xyz", dir.as_str()]), Some(OpenRequest { path: dir.clone(), fix: false }));
+        assert_eq!(request_from_args(["mehen.exe", dir.as_str(), "--fix"]), Some(OpenRequest { path: dir.clone(), fix: true }));
+        assert_eq!(request_from_args(["mehen.exe"]), None);
+        assert_eq!(request_from_args([dir.as_str()]), None);
     }
 }

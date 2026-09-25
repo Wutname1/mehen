@@ -132,6 +132,17 @@ export interface Settings {
   notify: boolean
   /** Check for new versions of Mehen itself. */
   appUpdateCheck: boolean
+  /** Windows runs a quick check at sign-in and daily, with Mehen closed. */
+  scheduledCheck: boolean
+  /** Whether this computer can run that check (Windows only for now). */
+  scheduledCheckSupported: boolean
+}
+
+/** A repository someone asked Mehen to show, from GitWyrm or the command line. */
+export interface OpenRepoRequest {
+  path: string
+  /** Select its security fixes too, so updating is one click away. */
+  fix: boolean
 }
 
 /** One line of a Mehen release's notes. `section` is feature, fix, change, docs, or breaking. */

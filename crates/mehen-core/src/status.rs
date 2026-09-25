@@ -29,6 +29,16 @@ pub struct StatusFile {
     pub exe: Option<String>,
     /// Unix seconds.
     pub written_at: u64,
+    /// Unix seconds when every watched folder was last checked. Checks of a
+    /// single folder leave it alone, so readers can tell when a full check is due.
+    #[serde(default)]
+    pub full_check_at: Option<u64>,
+    /// `exe` can run a check with no window (`--background-check`). Always
+    /// true from this version on; a reader must not start background checks
+    /// through a copy of Mehen that did not say so, or an older one would
+    /// open its window instead.
+    #[serde(default)]
+    pub background_check: bool,
     pub repos: Vec<RepoStatus>,
 }
 
@@ -149,6 +159,7 @@ fn is_sha(s: &str) -> bool {
 /// repository are left out: nothing that reads this file can open them.
 pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>, written_by: &str, exe: Option<&str>) -> StatusFile {
     let advisories: HashMap<&str, _> = inventory.vulnerabilities.iter().map(|v| (v.id.as_str(), v)).collect();
+    let full_check_at = if matches!(fresh, Fresh::All) { inventory.checked_at } else { previous.and_then(|p| p.full_check_at) };
     let before: HashMap<String, &RepoStatus> = previous.map(|p| p.repos.iter().map(|r| (key(&r.path), r)).collect()).unwrap_or_default();
 
     // Repository -> package (ecosystem, name) -> the usages found in it.
@@ -225,7 +236,7 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
         })
         .collect();
 
-    StatusFile { format: FORMAT, written_by: written_by.to_string(), exe: exe.map(str::to_string), written_at: now(), repos }
+    StatusFile { format: FORMAT, written_by: written_by.to_string(), exe: exe.map(str::to_string), written_at: now(), full_check_at, background_check: true, repos }
 }
 
 /// The file in `dir`, when there is one Mehen can read.
@@ -338,6 +349,8 @@ mod tests {
             written_by: String::new(),
             exe: None,
             written_at: 0,
+            full_check_at: Some(40),
+            background_check: true,
             repos: vec![RepoStatus {
                 path: "c:/code/b".into(),
                 checked_at: Some(50),
@@ -360,6 +373,7 @@ mod tests {
         let a = file.repos.iter().find(|r| r.path == "C:\\code\\a").unwrap();
         assert_eq!(a.checked_at, Some(100));
 
+        assert_eq!(file.full_check_at, Some(40), "a partial check keeps the last full check's time");
         let unchanged = build(&inv, Fresh::None, Some(&previous), "Mehen test", None);
         let a = unchanged.repos.iter().find(|r| r.path == "C:\\code\\a").unwrap();
         assert_eq!((a.checked_at, a.checked_commit.as_deref()), (Some(100), None));

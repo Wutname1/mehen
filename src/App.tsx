@@ -30,6 +30,8 @@ interface OpenRequest {
   path: string
   /** Already checked once for this request, so a folder with no projects does not loop. */
   checked: boolean
+  /** Select its security fixes too, so updating is one click away. */
+  fix: boolean
 }
 
 /** Where a dialog goes back to when a nested one closes. */
@@ -117,12 +119,26 @@ export default function App() {
 
   useEffect(() => {
     api.gitwyrmInstalled().then(setGitwyrm).catch(() => {})
-    api.launchRepo().then((path) => path && setOpenRequest({ path, checked: false })).catch(() => {})
-    const unlisten = api.onOpenRepo((path) => setOpenRequest({ path, checked: false }))
+    api.launchRepo().then((request) => request && setOpenRequest({ ...request, checked: false })).catch(() => {})
+    const unlisten = api.onOpenRepo((request) => setOpenRequest({ ...request, checked: false }))
     return () => {
       unlisten.then((fn) => fn())
     }
   }, [])
+
+  // A check that ran with Mehen closed (from GitWyrm or the daily task) saves
+  // its result without telling this window. Pick it up on the way back in.
+  useEffect(() => {
+    const onFocus = () => {
+      if (running) return
+      api
+        .lastInventory()
+        .then((latest) => latest && setInventory((current) => ((latest.checkedAt ?? 0) > (current?.checkedAt ?? 0) ? latest : current)))
+        .catch(() => {})
+    }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [running])
 
   // Offered on the welcome screen only, so asked for only while it shows.
   const firstRun = !loading && !inventory && settings?.folders.length === 0
@@ -323,17 +339,34 @@ export default function App() {
   // offer to start checking it.
   useEffect(() => {
     if (!openRequest || loading || running) return
-    const { path, checked } = openRequest
+    const { path, checked, fix } = openRequest
     const match = repoList.find((r) => samePath(r.key, path)) ?? repoList.find((r) => isWithin(path, r.key))
     if (match) {
       setOpenRequest(null)
       setRepoScope(match.key)
       setQuery('')
-      setNotice({ text: `Showing ${match.name}.` })
+      // Only packages with a known fix, each moved to its smallest fix: the
+      // same choice as "Select fixes", for this repository alone.
+      const fixes = fix ? rows.flatMap((r) => r.usages).filter((u) => u.dep.vulns.length > 0 && u.dep.fixTarget && samePath(repoKey(u.project), match.key)) : []
+      if (fixes.length) {
+        setSelected((prev) => new Set([...prev, ...fixes.map((u) => u.key)]))
+        setChosen((prev) => {
+          const next = new Map(prev)
+          for (const u of fixes) {
+            if (u.dep.fixTarget !== u.target) next.set(u.key, u.dep.fixTarget!)
+            else next.delete(u.key)
+          }
+          return next
+        })
+        const packages = new Set(fixes.map((u) => `${u.dep.ecosystem}:${u.dep.name}`)).size
+        setNotice({ text: `${packages} security fix${packages === 1 ? '' : 'es'} selected in ${match.name}. Review, then update.` })
+      } else {
+        setNotice({ text: fix ? `${match.name} has no security fixes waiting.` : `Showing ${match.name}.` })
+      }
       return
     }
     if (!checked && settings?.folders.some((f) => isWithin(path, f))) {
-      setOpenRequest({ path, checked: true })
+      setOpenRequest({ path, checked: true, fix })
       run(false, [path])
       return
     }
@@ -342,7 +375,7 @@ export default function App() {
     if (checked) setNotice({ text: `${name} has no projects Mehen can check, or they are excluded.` })
     else setNotice({ text: `Mehen does not check ${name} yet.`, action: { label: 'Check it', run: () => (setNotice(null), watchFolder(path)) } })
     // Keyed on the request and what it is matched against; watchFolder is recreated every render.
-  }, [openRequest, loading, running, repoList, settings, run])
+  }, [openRequest, loading, running, repoList, rows, settings, run])
 
   /** Usages the scope, project-type and dependency-type filters allow. */
   const typesByRepo = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), new Set(projectTypes(r.projects))])), [repoList])

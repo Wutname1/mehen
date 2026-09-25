@@ -7,18 +7,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mehen_core::cancel::Cancels;
 use mehen_core::check;
 use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
-use mehen_core::status::{self, Fresh};
+use mehen_core::status::Fresh;
 use mehen_core::store::{Hold, StoreStats};
 use mehen_core::update::{self, Change, UpdatePlan};
-use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
+use mehen_core::{DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+mod background;
 mod gitwyrm;
 mod self_update;
+
+pub use background::requested as background_check_requested;
+pub use background::run as run_background_check;
 
 /// Setting key: hours between background checks; 0 or missing means off.
 const BACKGROUND_HOURS: &str = "background_hours";
@@ -62,6 +66,9 @@ struct Settings {
     update_parallel_auto: usize,
     notify: bool,
     app_update_check: bool,
+    /// Windows runs a quick check at sign-in and daily, with Mehen closed.
+    scheduled_check: bool,
+    scheduled_check_supported: bool,
 }
 
 /// The user's own build and test commands for one scope, and where to run them.
@@ -84,7 +91,14 @@ impl AppState {
             update_parallel_auto: batch::auto_parallel(),
             notify: self.notify(),
             app_update_check: self.store.setting(APP_UPDATE_CHECK).is_none_or(|v| v != "false"),
+            scheduled_check: self.scheduled_check(),
+            scheduled_check_supported: background::schedule_supported(),
         }
+    }
+
+    /// Off unless turned on in settings.
+    fn scheduled_check(&self) -> bool {
+        self.store.setting(background::SCHEDULED_CHECK).as_deref() == Some("true")
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -130,57 +144,35 @@ impl AppState {
 /// With `only`, scans just those folders and folds the result into the last one.
 async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) -> Result<Inventory, String> {
     let state = app.state::<AppState>();
+    let dir = app.path().app_data_dir().map_err(err)?;
+    // A background run (started by GitWyrm or the daily task) may hold it.
+    let _lock = background::CheckLock::take(&dir, Duration::from_secs(30)).await.ok_or("A check is already running")?;
     let emit = |p: Progress| {
         let _ = app.emit("mehen://progress", p);
     };
-    emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
-    let roots = state.roots();
-    if roots.is_empty() {
-        return Err("Add a folder with your projects first".into());
+    let full = only.is_none();
+    let checked = background::run_check(&state.store, &dir, refresh, only, emit).await?;
+    if full {
+        // Only a full check knows everything still in use. Awaited, so the
+        // cleanup finishes while this check still holds the lock and no
+        // background run is writing at the same time.
+        let app = app.clone();
+        let snapshot = checked.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = app.state::<AppState>().store.prune(&snapshot) {
+                eprintln!("Cleaning the cache failed: {e:#}");
+            }
+        })
+        .await;
     }
-    let ignore = IgnoreSet::new(&state.store.ignore_rules(), &roots);
-    let previous = only.as_ref().and_then(|_| state.store.last_inventory());
-    let scan_roots: Vec<PathBuf> = match &only {
-        Some(folders) => folders.iter().map(PathBuf::from).collect(),
-        None => roots,
-    };
-    let inventory = tauri::async_runtime::spawn_blocking(move || mehen_core::scan(&scan_roots, &ignore)).await.map_err(err)?;
-    let options = if refresh { CheckOptions::refresh() } else { CheckOptions::default() };
-    let checked = mehen_core::check(inventory, &state.store, options, emit).await;
-    match (only, previous) {
-        (Some(folders), Some(previous)) => {
-            let merged = previous.merge_partial(checked, &folders);
-            state.store.replace_last_inventory(&merged).map_err(err)?;
-            publish_status(app, &merged, Fresh::Only(&folders));
-            Ok(merged)
-        }
-        (None, _) => {
-            publish_status(app, &checked, Fresh::All);
-            // Only a full check knows everything still in use.
-            let app = app.clone();
-            let snapshot = checked.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                if let Err(e) = app.state::<AppState>().store.prune(&snapshot) {
-                    eprintln!("Cleaning the cache failed: {e:#}");
-                }
-            });
-            Ok(checked)
-        }
-        (Some(folders), None) => {
-            publish_status(app, &checked, Fresh::Only(&folders));
-            Ok(checked)
-        }
-    }
+    Ok(checked)
 }
 
 /// Rewrites the per-repository summary other apps read, such as GitWyrm's
 /// dependency status. Failing to write it never fails the check.
 fn publish_status(app: &AppHandle, inventory: &Inventory, fresh: Fresh) {
-    let Ok(dir) = app.path().app_data_dir() else { return };
-    let written_by = format!("Mehen {}", app.package_info().version);
-    let exe = std::env::current_exe().ok().map(|p| p.display().to_string());
-    if let Err(e) = status::write(&dir, inventory, fresh, &written_by, exe.as_deref()) {
-        eprintln!("Writing {} failed: {e:#}", status::FILE_NAME);
+    if let Ok(dir) = app.path().app_data_dir() {
+        background::publish(&dir, inventory, fresh);
     }
 }
 
@@ -324,6 +316,14 @@ fn set_update_parallel(state: State<'_, AppState>, parallel: usize) -> Result<Se
 #[tauri::command]
 fn set_notify(state: State<'_, AppState>, notify: bool) -> Result<Settings, String> {
     state.store.set_setting(NOTIFY, if notify { "true" } else { "false" }).map_err(err)?;
+    Ok(state.settings())
+}
+
+/// Creates or removes the Windows scheduled task, then remembers the choice.
+#[tauri::command]
+async fn set_scheduled_check(state: State<'_, AppState>, enabled: bool) -> Result<Settings, String> {
+    tauri::async_runtime::spawn_blocking(move || background::set_scheduled(enabled)).await.map_err(err)??;
+    state.store.set_setting(background::SCHEDULED_CHECK, if enabled { "true" } else { "false" }).map_err(err)?;
     Ok(state.settings())
 }
 
@@ -597,8 +597,8 @@ pub fn run() {
         // asking to show a repository, say) hands its folder to this window
         // instead of starting another Mehen.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(path) = gitwyrm::repo_from_args(argv) {
-                let _ = app.emit("mehen://open-repo", path);
+            if let Some(request) = gitwyrm::request_from_args(argv) {
+                let _ = app.emit("mehen://open-repo", request);
             }
             show_window(app);
         }))
@@ -613,7 +613,16 @@ pub fn run() {
             app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default() });
             build_tray(app)?;
             start_background_loop(app.handle().clone());
-            gitwyrm::set_pending(gitwyrm::repo_from_args(std::env::args()));
+            // Re-created on every start, so the task follows Mehen when it is
+            // updated or moved. Off the main thread: it runs schtasks.
+            if app.state::<AppState>().scheduled_check() {
+                std::thread::spawn(|| {
+                    if let Err(e) = background::set_scheduled(true) {
+                        eprintln!("{e}");
+                    }
+                });
+            }
+            gitwyrm::set_pending(gitwyrm::request_from_args(std::env::args()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -633,6 +642,7 @@ pub fn run() {
             set_update_parallel,
             set_notify,
             set_app_update_check,
+            set_scheduled_check,
             add_ignore,
             remove_ignore,
             discover,

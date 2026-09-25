@@ -326,6 +326,23 @@ export function SettingsDialog({
                     ))}
                   </Select>
                 </SettingRow>
+                {settings.scheduledCheckSupported && (
+                  <SettingRow
+                    title="Check once a day, even when Mehen is closed"
+                    help="Windows runs a quick check when you sign in and once a day, then Mehen closes again. Nothing stays running. GitWyrm shows the results, and you get at most one notification a day, only for new security fixes."
+                  >
+                    <Switch
+                      checked={settings.scheduledCheck}
+                      onChange={(v) =>
+                        api
+                          .setScheduledCheck(v)
+                          .then(onSettings)
+                          .catch((err) => setError(String(err)))
+                      }
+                      label="Check once a day, even when Mehen is closed"
+                    />
+                  </SettingRow>
+                )}
                 <SectionTitle>Mehen</SectionTitle>
                 <SettingRow title={appUpdate.current ? `Mehen ${appUpdate.current}` : 'Mehen'} help={appUpdateStatus(appUpdate)}>
                   {appUpdate.status === 'available' || appUpdate.status === 'downloading' || appUpdate.status === 'ready' ? (
@@ -545,7 +562,11 @@ export function SettingsDialog({
                 <SectionTitle>Alerts</SectionTitle>
                 <SettingRow
                   title="Notify about new vulnerabilities"
-                  help={settings.backgroundHours > 0 ? 'A Windows notification names the affected projects when a background check finds something new.' : 'Notifications come from background checks, which are off. Turn them on under General.'}
+                  help={
+                    settings.backgroundHours > 0 || settings.scheduledCheck
+                      ? 'A Windows notification names the affected projects when a background check finds something new.'
+                      : 'Notifications come from background checks, which are off. Turn them on under General.'
+                  }
                 >
                   <Switch
                     checked={settings.notify}
