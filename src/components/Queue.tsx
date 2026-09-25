@@ -101,6 +101,11 @@ function toggle<T>(set: Set<T>, value: T | 'all'): Set<T> {
   return next
 }
 
+/** How many packages picking a filter option would show. */
+function Count({ n }: { n: number }) {
+  return <span className={cx('font-mono text-[11.5px]', n ? 'text-muted' : 'text-faint')}>({n})</span>
+}
+
 export function Queue({
   rows,
   repo,
@@ -122,6 +127,7 @@ export function Queue({
   onRelease,
   onWhy,
   present,
+  countFor,
 }: {
   rows: ScopedRow[]
   repo: Repo | null
@@ -146,6 +152,8 @@ export function Queue({
   onWhy: (packageKey: string | null) => void
   /** Project and dependency types the watched projects actually have; only those are offered. */
   present: { types: ProjectType[]; ecosystems: Ecosystem[] }
+  /** How many packages a set of filters would leave, with the scope and search applied. */
+  countFor: (filters: QueueFilters) => number
 }) {
   const [keepMenu, setKeepMenu] = useState<{ row: QueueRow; usages: QueueUsage[]; anchor: HTMLElement } | null>(null)
   const holdsOf = (row: QueueRow) => holds.filter((h) => h.ecosystem === row.ecosystem && h.name === row.name)
@@ -188,12 +196,12 @@ export function Queue({
               menu={(anchor, close) => (
                 <Menu anchor={anchor} label="Project type" onClose={close}>
                   <MenuCheck radio checked={!filters.types.size} onSelect={() => onFilters({ ...filters, types: new Set() })}>
-                    All project types
+                    All project types <Count n={countFor({ ...filters, types: new Set() })} />
                   </MenuCheck>
                   <MenuSeparator />
                   {(Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).filter((t) => present.types.includes(t) || filters.types.has(t)).map((t) => (
                     <MenuCheck key={t} checked={filters.types.has(t)} onSelect={() => onFilters({ ...filters, types: toggle(filters.types, t) })} icon={<ProjectTypeIcon type={t} size={15} />}>
-                      {PROJECT_TYPE_LABEL[t]}
+                      {PROJECT_TYPE_LABEL[t]} <Count n={countFor({ ...filters, types: new Set([t]) })} />
                     </MenuCheck>
                   ))}
                 </Menu>
@@ -207,12 +215,12 @@ export function Queue({
             menu={(anchor, close) => (
               <Menu anchor={anchor} label="Dependency type" onClose={close}>
                 <MenuCheck radio checked={!filters.ecosystems.size} onSelect={() => onFilters({ ...filters, ecosystems: new Set() })}>
-                  All dependency types
+                  All dependency types <Count n={countFor({ ...filters, ecosystems: new Set() })} />
                 </MenuCheck>
                 <MenuSeparator />
                 {ECOSYSTEMS.filter((e) => present.ecosystems.includes(e) || filters.ecosystems.has(e)).map((e) => (
                   <MenuCheck key={e} checked={filters.ecosystems.has(e)} onSelect={() => onFilters({ ...filters, ecosystems: toggle(filters.ecosystems, e) })} icon={<EcoIcon ecosystem={e} size={15} />}>
-                    {ECOSYSTEM_LABEL[e]}
+                    {ECOSYSTEM_LABEL[e]} <Count n={countFor({ ...filters, ecosystems: new Set([e]) })} />
                   </MenuCheck>
                 ))}
               </Menu>
@@ -234,7 +242,7 @@ export function Queue({
                       close()
                     }}
                   >
-                    {RISK_FILTER_LABEL[r]}
+                    {RISK_FILTER_LABEL[r]} <Count n={countFor({ ...filters, risk: r })} />
                   </MenuCheck>
                 ))}
               </Menu>

@@ -220,7 +220,6 @@ export default function App() {
     () => ({ types: projectTypes(inventory?.projects ?? []), ecosystems: [...new Set((inventory?.projects ?? []).map((p) => p.ecosystem))] }),
     [inventory],
   )
-  const repoOf = useCallback((u: QueueUsage) => repoByKey.get(repoKey(u.project).toLowerCase()), [repoByKey])
   const nameOf = useCallback((key: string) => repoByKey.get(key.toLowerCase())?.name ?? folderName(key), [repoByKey])
 
   // Logos: remembered ones first (instant), then a one-time search of new folders.
@@ -259,30 +258,39 @@ export default function App() {
   }, [rows, repoByKey, repoScope])
 
   /** Usages the scope, project-type and dependency-type filters allow. */
-  const inScope = useCallback(
-    (row: QueueRow) =>
+  const typesByRepo = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), new Set(projectTypes(r.projects))])), [repoList])
+
+  /** Usages the scope, project-type and dependency-type filters in `f` allow. */
+  const usagesIn = useCallback(
+    (row: QueueRow, f: QueueFilters) =>
       row.usages.filter((u) => {
         if (repo && !samePath(repoKey(u.project), repo.key)) return false
-        if (!repo && filters.types.size && !projectTypes(repoOf(u)?.projects ?? []).some((t) => filters.types.has(t))) return false
-        return !filters.ecosystems.size || filters.ecosystems.has(row.ecosystem)
+        if (!repo && f.types.size && ![...f.types].some((t) => typesByRepo.get(repoKey(u.project).toLowerCase())?.has(t))) return false
+        return !f.ecosystems.size || f.ecosystems.has(row.ecosystem)
       }),
-    [repo, filters.types, filters.ecosystems, repoOf],
+    [repo, typesByRepo],
   )
+  const inScope = useCallback((row: QueueRow) => usagesIn(row, filters), [usagesIn, filters])
 
   const q = query.trim().toLowerCase()
+  /** The rows `f` leaves, together with the scope and the search: the list, and each filter option's count. */
+  const rowsFor = useCallback(
+    (f: QueueFilters): ScopedRow[] =>
+      rows
+        .filter((row) => f.risk === 'any' || (f.risk === 'security' ? row.risk === 'security' : row.risk === 'security' || row.risk === 'major'))
+        .map((row) => {
+          const usages = usagesIn(row, f)
+          return { row, usages: !q || row.name.toLowerCase().includes(q) ? usages : usages.filter((u) => u.project.name.toLowerCase().includes(q) || u.project.dir.toLowerCase().includes(q)) }
+        })
+        .filter(({ usages }) => usages.length > 0),
+    [rows, usagesIn, q],
+  )
+  const countFor = useCallback((f: QueueFilters) => rowsFor(f).length, [rowsFor])
+
   const visible: ScopedRow[] = useMemo(() => {
-    const list = rows
-      .map((row) => ({ row, usages: inScope(row) }))
-      .filter(({ usages }) => usages.length > 0)
-      .filter(({ row }) => filters.risk === 'any' || (filters.risk === 'security' ? row.risk === 'security' : row.risk === 'security' || row.risk === 'major'))
-      .map(({ row, usages }) => ({
-        row,
-        usages: !q || row.name.toLowerCase().includes(q) ? usages : usages.filter((u) => u.project.name.toLowerCase().includes(q) || u.project.dir.toLowerCase().includes(q)),
-      }))
-      .filter(({ usages }) => usages.length > 0)
     const byName = (a: ScopedRow, b: ScopedRow) => a.row.name.localeCompare(b.row.name, undefined, { sensitivity: 'base' })
-    return list.sort((a, b) => (filters.riskFirst ? RISK_ORDER.indexOf(a.row.risk) - RISK_ORDER.indexOf(b.row.risk) : 0) || byName(a, b))
-  }, [rows, inScope, filters.risk, filters.riskFirst, q])
+    return rowsFor(filters).sort((a, b) => (filters.riskFirst ? RISK_ORDER.indexOf(a.row.risk) - RISK_ORDER.indexOf(b.row.risk) : 0) || byName(a, b))
+  }, [rowsFor, filters])
 
   const security = useMemo(() => {
     const usages = rows.filter((r) => r.vulnIds.length > 0).flatMap((r) => inScope(r).filter((u) => u.dep.vulns.length > 0))
@@ -561,6 +569,7 @@ export default function App() {
             onRelease={release}
             onWhy={(packageKey) => setDialog({ kind: 'held-back', packageKey })}
             present={present}
+            countFor={countFor}
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (
