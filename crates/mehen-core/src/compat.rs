@@ -47,6 +47,34 @@ pub struct ProjectEnv {
     pub ruby: Option<String>,
 }
 
+/// Every part of `requirement` the project does not meet, as (key, reason).
+/// Each peer is its own part (`peer:react`), so one known mismatch does not
+/// hide another.
+pub fn failures(requirement: &Requirement, env: &ProjectEnv) -> Vec<(String, String)> {
+    match requirement {
+        Requirement::Peers { peers } => peers
+            .iter()
+            .filter_map(|(name, range)| {
+                let have = env.installed.get(name)?;
+                (!semver_satisfies(have, range)).then(|| (format!("peer:{name}"), format!("needs {name} {}; this project has {have}", range.trim())))
+            })
+            .collect(),
+        other => {
+            let key = match other {
+                Requirement::Frameworks { .. } => "frameworks",
+                Requirement::Rust { .. } => "rust",
+                Requirement::Node { .. } => "node",
+                Requirement::Python { .. } => "python",
+                Requirement::Dart { .. } => "dart",
+                Requirement::Php { .. } => "php",
+                Requirement::Ruby { .. } => "ruby",
+                Requirement::Peers { .. } => unreachable!(),
+            };
+            check(other, env).err().map(|reason| (key.to_string(), reason)).into_iter().collect()
+        }
+    }
+}
+
 /// `Err` carries a short reason for the UI, like "only supports net10.0".
 pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> {
     match requirement {

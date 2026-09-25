@@ -390,22 +390,24 @@ impl Scanner {
         })
     }
 
+    /// What is installed, from whichever is nearest going up: a copy in
+    /// `node_modules`, or a lockfile. A project with its own lockfile but no
+    /// install of its own is not answered by a parent folder's `node_modules`.
     fn npm_installed(&mut self, dir: &Path, name: &str) -> Option<(String, &'static str)> {
+        const LOCKS: [&str; 6] = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
         let root = self.root_of(dir);
-        let from_node_modules = dir.ancestors().take_while(|d| d.starts_with(&root)).find_map(|d| {
+        for d in dir.ancestors().take_while(|d| d.starts_with(&root)) {
             let manifest = d.join("node_modules").join(name).join("package.json");
-            let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(manifest).ok()?).ok()?;
-            json["version"].as_str().map(str::to_string)
-        });
-        match from_node_modules {
-            Some(v) => Some((v, "node_modules")),
-            None => self.npm_locks.npm_version(&root, dir, name),
+            if let Some(version) = fs::read_to_string(manifest).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|j| j["version"].as_str().map(str::to_string)) {
+                return Some((version, "node_modules"));
+            }
+            if LOCKS.iter().any(|lock| d.join(lock).is_file()) {
+                break;
+            }
         }
+        self.npm_locks.npm_version(&root, dir, name)
     }
 
-    /// Direct requirements only: `// indirect` ones come along with them, as
-    /// npm's nested packages do. A replaced module is local, since updating
-    /// the original would change nothing.
     /// Versions come from `pubspec.lock`; the Flutter SDK, folders, git and
     /// other package servers are local.
     fn pubspec(&mut self, path: &Path) -> anyhow::Result<()> {
@@ -490,6 +492,9 @@ impl Scanner {
         Ok(())
     }
 
+    /// Direct requirements only: `// indirect` ones come along with them, as
+    /// npm's nested packages do. A replaced module is local, since updating
+    /// the original would change nothing.
     fn go_mod(&mut self, path: &Path) -> anyhow::Result<()> {
         let parsed = crate::golang::parse(&read_text(path)?);
         let dir = path.parent().unwrap_or(path);

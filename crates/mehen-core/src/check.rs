@@ -285,6 +285,15 @@ enum Limit {
 }
 
 impl Limit {
+    /// Which limit this is, so a mismatch the installed version already has
+    /// can be set aside without setting aside the others.
+    fn key(&self) -> String {
+        match self {
+            Limit::Peer { owner, .. } => format!("owner:{owner}"),
+            Limit::Hold(_) => "hold".into(),
+        }
+    }
+
     fn check(&self, dep: &str, version: &str) -> Result<(), String> {
         match self {
             Limit::Peer { owner, range } if !compat::semver_satisfies(version, range) => Err(format!("{owner} needs {dep} {}", range.trim())),
@@ -337,20 +346,26 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
         requirements.entry(v.as_str()).or_default().push(r);
     }
     let name = dep.name.clone();
-    let check = |v: &str| -> Result<(), String> {
-        for r in requirements.get(v).into_iter().flatten() {
-            compat::check(r, env)?;
-        }
-        limits.iter().try_for_each(|l| l.check(&name, v))
+    let failures = |v: &str| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = requirements.get(v).into_iter().flatten().flat_map(|r| compat::failures(r, env)).collect();
+        out.extend(limits.iter().filter_map(|l| l.check(&name, v).err().map(|reason| (l.key(), reason))));
+        out
     };
-    // If the version already in use fails the check, our picture of the
-    // project's environment is wrong; trust reality and skip filtering rather
-    // than suggest a downgrade.
-    let env_is_wrong = dep.current.as_deref().is_some_and(|c| {
-        let c = c.trim_start_matches(['v', 'V']);
-        info.versions.iter().any(|v| v.trim_start_matches(['v', 'V']) == c) && check(c).is_err()
-    });
-    let usable = |v: &str| if env_is_wrong { Ok(()) } else { check(v) };
+    // A mismatch the version already in use has too means our picture of
+    // the project is off there (say, a TypeScript read from a parent
+    // folder); trust reality and set that one aside, but keep every other
+    // check. A hold is the user's choice and always counts.
+    let accepted: HashSet<String> = dep
+        .current
+        .as_deref()
+        .map(|c| c.trim_start_matches(['v', 'V']))
+        .and_then(|c| info.versions.iter().find(|v| v.trim_start_matches(['v', 'V']) == c))
+        .map(|c| failures(c).into_iter().map(|(k, _)| k).filter(|k| k != "hold").collect())
+        .unwrap_or_default();
+    let usable = |v: &str| match failures(v).into_iter().find(|(k, _)| !accepted.contains(k)) {
+        Some((_, reason)) => Err(reason),
+        None => Ok(()),
+    };
     // Older releases are never a target, and checking thousands of them is
     // most of a warm check's time.
     let floor = dep.current.as_deref().and_then(Version::parse);
@@ -722,6 +737,22 @@ mod tests {
         assert_eq!(mui.latest.as_deref(), Some("6.4.0"));
         assert_eq!(mui.newest.as_deref(), Some("7.0.0"));
         assert_eq!(mui.blocked_reason.as_deref(), Some("needs react ^19.0.0; this project has 18.3.1"));
+    }
+
+    #[test]
+    fn a_known_mismatch_does_not_hide_another() {
+        let mut cli = npm_dep("@angular/compiler-cli", "16.2.12");
+        let env = ProjectEnv {
+            installed: [("typescript".to_string(), "7.0.2".to_string()), ("@angular/compiler".to_string(), "16.2.12".to_string())].into(),
+            ..Default::default()
+        };
+        let info = npm_info(
+            &["16.2.12", "22.2.0"],
+            &[("16.2.12", &[("typescript", ">=4.9.3 <5.2"), ("@angular/compiler", "16.2.12")]), ("22.2.0", &[("typescript", ">=6.0 <6.1"), ("@angular/compiler", "22.2.0")])],
+        );
+        apply_info(&mut cli, Some(&Ok(info)), &env, &[]);
+        assert_eq!(cli.newest.as_deref(), Some("22.2.0"), "the TypeScript mismatch is already there, but the compiler one is new");
+        assert_eq!(cli.blocked_reason.as_deref(), Some("needs @angular/compiler 22.2.0; this project has 16.2.12"));
     }
 
     #[test]
