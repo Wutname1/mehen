@@ -1,23 +1,21 @@
 import type { ReactNode } from 'react'
 import { STATUS_LABEL, normalizeSeverity } from '../derive'
 import type { Status } from '../types'
+import mehenIcon from '../assets/mehen-icon.png'
 
 const cx = (...parts: (string | false | null | undefined)[]) => parts.filter(Boolean).join(' ')
 export { cx }
 
 export function Logo({ size = 22 }: { size?: number }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 1024 1024" aria-hidden>
-      <defs>
-        <radialGradient id="mehen-sun" cx="46%" cy="42%" r="60%">
-          <stop offset="0" stopColor="#ffd98a" />
-          <stop offset="1" stopColor="#d9951f" />
-        </radialGradient>
-      </defs>
-      <circle cx="512" cy="530" r="205" fill="url(#mehen-sun)" />
-      <path d="M 676 250 A 322 322 0 1 1 398 227" fill="none" stroke="#45c2a6" strokeWidth="86" strokeLinecap="round" />
-      <ellipse cx="700" cy="232" rx="84" ry="62" transform="rotate(-28 700 232)" fill="#45c2a6" />
-    </svg>
+    <img
+      src={mehenIcon}
+      width={size}
+      height={size}
+      alt=""
+      aria-hidden="true"
+      className="shrink-0 object-contain"
+    />
   )
 }
 

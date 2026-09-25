@@ -431,7 +431,7 @@ export default function App() {
       <header className="on-rail flex h-[52px] shrink-0 items-center gap-5 border-b border-bar-line bg-bar pr-3.5 pl-4 text-rail-ink">
         <div className="flex w-[222px] items-center gap-2.5 max-[1100px]:w-[182px]">
           <Logo size={28} />
-          <strong className="font-display text-[16px] font-semibold tracking-[-0.015em]">Mehen</strong>
+          <strong className="font-wordmark text-[17px] font-semibold tracking-[-0.025em]">Mehen</strong>
         </div>
         <label className="ml-auto flex h-[34px] w-[min(440px,40vw)] items-center gap-2 rounded-[3px] border border-rail-border bg-rail-field pr-2 pl-2.5 text-rail-muted focus-within:border-rail-focus">
           <Search size={16} className="shrink-0" />

@@ -1,6 +1,8 @@
 @import 'tailwindcss';
 @import '@fontsource-variable/geist';
 @import '@fontsource/geist-mono/400.css';
+/* The wordmark's face: Sora SemiBold, tracked -25. */
+@import '@fontsource/sora/600.css';
 
 /*
  * Two palettes, each with a light and dark theme, chosen by data-palette and
@@ -12,6 +14,7 @@
   --font-sans: var(--ui-sans);
   --font-mono: var(--ui-mono);
   --font-display: var(--ui-display);
+  --font-wordmark: 'Sora', var(--ui-sans);
 
   --color-paper: var(--paper);
   --color-paper-2: var(--paper-2);

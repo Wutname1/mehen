@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="src-tauri/icons/128x128@2x.png" alt="Mehen" width="128" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/largelogowithwordmark-darkbg.png" />
+    <img src="images/largelogowithwordmark-lightbg.png" alt="Mehen" width="420" />
+  </picture>
 </p>
-
-# Mehen
 
 A desktop app you open when you want to check every project on your machine for outdated and unsafe dependencies, and update them.
 
