@@ -10,3 +10,4 @@ public/dev-inventory.json
 # something in a dev build.
 src-tauri/resources/*
 !src-tauri/resources/README.md
+/.claude/

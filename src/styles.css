@@ -197,7 +197,7 @@ html[data-palette='faience'] {
   --ui-mono: "Geist Mono", Consolas, "Cascadia Mono", monospace;
 
   /* Restrained: gold marks action and selection; status hues sit near 5:1, not at full chroma. */
-  --paper: oklch(0.95 0.02 85);
+  --paper: #f5eee0;
   --paper-2: oklch(0.92 0.025 85);
   --surface: oklch(0.975 0.012 85);
   --sunken: oklch(0.9 0.025 85);
@@ -259,7 +259,7 @@ html[data-palette='faience'] {
 }
 
 html[data-palette='faience'][data-theme='dark'] {
-  --paper: oklch(0.165 0.006 75);
+  --paper: #100e0b;
   --paper-2: oklch(0.19 0.008 75);
   --surface: oklch(0.225 0.01 75);
   --sunken: oklch(0.13 0.005 75);

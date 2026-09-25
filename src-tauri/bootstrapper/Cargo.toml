@@ -15,8 +15,8 @@ name = "mehen-setup"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
-png = "0.17"
+reqwest = { version = "0.13", features = ["blocking", "rustls-tls"], default-features = false }
+png = "0.18"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
