@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { STATUS_LABEL, normalizeSeverity } from '../derive'
 import type { Status } from '../types'
+import gitwyrmMark from '../assets/gitwyrm-mark.png'
 import mehenIcon from '../assets/mehen-icon.png'
 
 const cx = (...parts: (string | false | null | undefined)[]) => parts.filter(Boolean).join(' ')
@@ -17,6 +18,11 @@ export function Logo({ size = 22 }: { size?: number }) {
       className="shrink-0 object-contain"
     />
   )
+}
+
+/** GitWyrm's mark, for the buttons that open a repository in it. */
+export function GitWyrmMark({ size = 16 }: { size?: number }) {
+  return <img src={gitwyrmMark} width={size} height={size} alt="" aria-hidden="true" className="shrink-0 object-contain" draggable={false} />
 }
 
 export const STATUS_STYLE: Record<Status, string> = {

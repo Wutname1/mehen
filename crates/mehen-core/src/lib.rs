@@ -18,6 +18,7 @@ pub mod python;
 pub mod registry;
 pub mod ruby;
 pub mod scan;
+pub mod status;
 pub mod store;
 pub mod together;
 pub mod update;

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mehen_core::check;
 use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
+use mehen_core::status::{self, Fresh};
 use mehen_core::store::{Hold, StoreStats};
 use mehen_core::update::{self, Change, UpdatePlan};
 use mehen_core::{CheckOptions, DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
@@ -14,6 +15,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+mod gitwyrm;
 mod self_update;
 
 /// Setting key: hours between background checks; 0 or missing means off.
@@ -145,9 +147,11 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
         (Some(folders), Some(previous)) => {
             let merged = previous.merge_partial(checked, &folders);
             state.store.replace_last_inventory(&merged).map_err(err)?;
+            publish_status(app, &merged, Fresh::Only(&folders));
             Ok(merged)
         }
         (None, _) => {
+            publish_status(app, &checked, Fresh::All);
             // Only a full check knows everything still in use.
             let app = app.clone();
             let snapshot = checked.clone();
@@ -158,7 +162,21 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
             });
             Ok(checked)
         }
-        _ => Ok(checked),
+        (Some(folders), None) => {
+            publish_status(app, &checked, Fresh::Only(&folders));
+            Ok(checked)
+        }
+    }
+}
+
+/// Rewrites the per-repository summary other apps read, such as GitWyrm's
+/// dependency status. Failing to write it never fails the check.
+fn publish_status(app: &AppHandle, inventory: &Inventory, fresh: Fresh) {
+    let Ok(dir) = app.path().app_data_dir() else { return };
+    let written_by = format!("Mehen {}", app.package_info().version);
+    let exe = std::env::current_exe().ok().map(|p| p.display().to_string());
+    if let Err(e) = status::write(&dir, inventory, fresh, &written_by, exe.as_deref()) {
+        eprintln!("Writing {} failed: {e:#}", status::FILE_NAME);
     }
 }
 
@@ -322,7 +340,7 @@ struct IgnoreResult {
 /// Adds a rule and applies it to the saved result straight away, so ignoring
 /// something after a check does not need a new check.
 #[tauri::command]
-fn add_ignore(state: State<'_, AppState>, kind: IgnoreKind, value: String, note: Option<String>) -> Result<IgnoreResult, String> {
+fn add_ignore(app: AppHandle, state: State<'_, AppState>, kind: IgnoreKind, value: String, note: Option<String>) -> Result<IgnoreResult, String> {
     state.store.add_ignore_rule(kind, &value, note.as_deref()).map_err(err)?;
     let inventory = state.store.last_inventory().map(|mut inv| {
         IgnoreSet::new(&state.store.ignore_rules(), &state.roots()).apply(&mut inv);
@@ -330,6 +348,7 @@ fn add_ignore(state: State<'_, AppState>, kind: IgnoreKind, value: String, note:
     });
     if let Some(inv) = &inventory {
         state.store.replace_last_inventory(inv).map_err(err)?;
+        publish_status(&app, inv, Fresh::None);
     }
     Ok(IgnoreResult { settings: state.settings(), inventory })
 }
@@ -553,9 +572,24 @@ fn open_in_editor(path: String) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(err)
 }
 
+/// Project folders set up in GitWyrm that Mehen could check too.
+#[tauri::command]
+fn gitwyrm_folders(state: State<'_, AppState>) -> Vec<String> {
+    gitwyrm::code_folders(&state.store.folders())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Registered first, as the plugin requires. A second launch (GitWyrm
+        // asking to show a repository, say) hands its folder to this window
+        // instead of starting another Mehen.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(path) = gitwyrm::repo_from_args(argv) {
+                let _ = app.emit("mehen://open-repo", path);
+            }
+            show_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -567,6 +601,7 @@ pub fn run() {
             app.manage(AppState { store, checking: AtomicBool::new(false) });
             build_tray(app)?;
             start_background_loop(app.handle().clone());
+            gitwyrm::set_pending(gitwyrm::repo_from_args(std::env::args()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -608,6 +643,10 @@ pub fn run() {
             release_dates,
             clear_cache,
             open_in_editor,
+            gitwyrm_folders,
+            gitwyrm::gitwyrm_installed,
+            gitwyrm::open_in_gitwyrm,
+            gitwyrm::launch_repo,
             self_update::check_self_update,
             self_update::download_self_update,
             self_update::install_self_update,

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { AdvisoryDialog } from './components/AdvisoryDialog'
 import { AppUpdateButton, AppUpdateDialog, useAppUpdate } from './components/AppUpdate'
-import { Logo, cx } from './components/bits'
+import { GitWyrmMark, Logo, cx } from './components/bits'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
 import { HeldBackDialog } from './components/HeldBack'
 import { ManageProjects } from './components/ManageProjects'
@@ -22,6 +22,14 @@ const SUGGESTED_ROOT = 'C:\\code'
 interface Notice {
   text: string
   undo?: () => void
+  action?: { label: string; run: () => void }
+}
+
+/** A repository someone asked Mehen to show, from GitWyrm or the command line. */
+interface OpenRequest {
+  path: string
+  /** Already checked once for this request, so a folder with no projects does not loop. */
+  checked: boolean
 }
 
 /** Where a dialog goes back to when a nested one closes. */
@@ -51,6 +59,9 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState<Progress | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [gitwyrm, setGitwyrm] = useState(false)
+  const [gitwyrmFolders, setGitwyrmFolders] = useState<string[]>([])
+  const [openRequest, setOpenRequest] = useState<OpenRequest | null>(null)
 
   const [repoScope, setRepoScope] = useState<string | null>(null)
   const [query, setQuery] = useState('')
@@ -105,8 +116,23 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    api.gitwyrmInstalled().then(setGitwyrm).catch(() => {})
+    api.launchRepo().then((path) => path && setOpenRequest({ path, checked: false })).catch(() => {})
+    const unlisten = api.onOpenRepo((path) => setOpenRequest({ path, checked: false }))
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [])
+
+  // Offered on the welcome screen only, so asked for only while it shows.
+  const firstRun = !loading && !inventory && settings?.folders.length === 0
+  useEffect(() => {
+    if (firstRun) api.gitwyrmFolders().then(setGitwyrmFolders).catch(() => {})
+  }, [firstRun])
+
+  useEffect(() => {
     if (!notice) return
-    const t = window.setTimeout(() => setNotice(null), notice.undo ? 8000 : 4500)
+    const t = window.setTimeout(() => setNotice(null), notice.undo || notice.action ? 8000 : 4500)
     return () => window.clearTimeout(t)
   }, [notice])
 
@@ -141,6 +167,27 @@ export default function App() {
       setSettings(await api.addFolder(path))
       setNotice({ text: `Added ${path}. Checking it now.` })
       await run(false, [path])
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const watchFolders = async (paths: string[]) => {
+    try {
+      let latest: Settings | null = null
+      for (const path of paths) latest = await api.addFolder(path)
+      if (latest) setSettings(latest)
+      setNotice({ text: `Added ${plural(paths.length, 'folder')} from GitWyrm. Checking ${paths.length === 1 ? 'it' : 'them'} now.` })
+      await run(false)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const openInGitWyrm = async (path: string) => {
+    try {
+      await api.openInGitWyrm(path)
+      setNotice({ text: `Opening ${folderName(path)} in GitWyrm.` })
     } catch (e) {
       setError(String(e))
     }
@@ -270,6 +317,32 @@ export default function App() {
     setChosen(keep)
     setLinked(keep)
   }, [selected])
+
+  // Show the repository someone asked for: straight away when the last check
+  // has it, after checking it when it sits in a watched folder, and otherwise
+  // offer to start checking it.
+  useEffect(() => {
+    if (!openRequest || loading || running) return
+    const { path, checked } = openRequest
+    const match = repoList.find((r) => samePath(r.key, path)) ?? repoList.find((r) => isWithin(path, r.key))
+    if (match) {
+      setOpenRequest(null)
+      setRepoScope(match.key)
+      setQuery('')
+      setNotice({ text: `Showing ${match.name}.` })
+      return
+    }
+    if (!checked && settings?.folders.some((f) => isWithin(path, f))) {
+      setOpenRequest({ path, checked: true })
+      run(false, [path])
+      return
+    }
+    setOpenRequest(null)
+    const name = folderName(path)
+    if (checked) setNotice({ text: `${name} has no projects Mehen can check, or they are excluded.` })
+    else setNotice({ text: `Mehen does not check ${name} yet.`, action: { label: 'Check it', run: () => (setNotice(null), watchFolder(path)) } })
+    // Keyed on the request and what it is matched against; watchFolder is recreated every render.
+  }, [openRequest, loading, running, repoList, settings, run])
 
   /** Usages the scope, project-type and dependency-type filters allow. */
   const typesByRepo = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), new Set(projectTypes(r.projects))])), [repoList])
@@ -586,8 +659,10 @@ export default function App() {
           loading={loading}
           running={running}
           folders={settings?.folders ?? []}
+          gitwyrmFolders={gitwyrmFolders}
           onRun={() => run(false)}
           onWatch={watchFolder}
+          onWatchMany={watchFolders}
           onChoose={() => setDialog({ kind: 'add-folder', back: null })}
         />
       ) : (
@@ -608,6 +683,7 @@ export default function App() {
             onRefreshAll={() => run(true)}
             onReveal={(path) => api.reveal(path)}
             onOpenInEditor={(path) => api.openInEditor(path)}
+            onOpenInGitWyrm={gitwyrm ? openInGitWyrm : undefined}
             onExclude={(r) => setDialog({ kind: 'exclude', repo: r, back: null })}
             onProjectSettings={(r) => setDialog({ kind: 'settings', repo: r })}
             onScanRepo={(r) => run(false, [r.key])}
@@ -660,7 +736,14 @@ export default function App() {
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (
-              <ProjectRecord repo={repo} icon={icons[repo.key.toLowerCase()]} onReveal={() => api.reveal(repo.key)} onOpenInEditor={() => api.openInEditor(repo.key)} onSettings={() => setDialog({ kind: 'settings', repo })} />
+              <ProjectRecord
+                repo={repo}
+                icon={icons[repo.key.toLowerCase()]}
+                onReveal={() => api.reveal(repo.key)}
+                onOpenInEditor={() => api.openInEditor(repo.key)}
+                onOpenInGitWyrm={gitwyrm && repo.projects.some((p) => p.repo) ? () => openInGitWyrm(repo.key) : undefined}
+                onSettings={() => setDialog({ kind: 'settings', repo })}
+              />
             )}
             <Tray
               groups={trayGroups}
@@ -810,6 +893,7 @@ export default function App() {
             setHolds(await api.setHold(k.ecosystem, k.name, scope, k.line))
             keptDuringUpdate.current.add(scope)
           }}
+          onReviewInGitWyrm={gitwyrm ? openInGitWyrm : undefined}
           onClose={(refreshed) => {
             setDialog(null)
             if (refreshed) setInventory(refreshed)
@@ -826,6 +910,11 @@ export default function App() {
           className="on-rail fixed bottom-5 left-1/2 z-[70] flex max-w-[520px] -translate-x-1/2 items-center gap-2.5 rounded-[4px] border border-rail-border bg-rail-raised py-2 pr-2 pl-3 text-[12.5px] text-rail-ink shadow-[var(--shadow)]"
         >
           <span>{notice.text}</span>
+          {notice.action && (
+            <button type="button" onClick={notice.action.run} className="inline-flex h-7 items-center rounded-[3px] px-2 font-semibold text-rail-link hover:bg-rail-hover">
+              {notice.action.label}
+            </button>
+          )}
           {notice.undo && (
             <button type="button" onClick={notice.undo} className="inline-flex h-7 items-center gap-1 rounded-[3px] px-2 font-semibold text-rail-link hover:bg-rail-hover">
               <Undo2 size={14} />
@@ -854,15 +943,20 @@ function Welcome({
   loading,
   running,
   folders,
+  gitwyrmFolders,
   onRun,
   onWatch,
+  onWatchMany,
   onChoose,
 }: {
   loading: boolean
   running: boolean
   folders: string[]
+  /** Folders set up in GitWyrm, offered instead of a guessed one. */
+  gitwyrmFolders: string[]
   onRun: () => void
   onWatch: (path: string) => void
+  onWatchMany: (paths: string[]) => void
   onChoose: () => void
 }) {
   if (loading) return <div className="flex flex-1 items-center justify-center text-muted">Loading…</div>
@@ -879,6 +973,23 @@ function Welcome({
         <button type="button" onClick={onRun} disabled={running} className={primary}>
           {running ? 'Checking…' : `Check ${folders.length === 1 ? folders[0] : `${folders.length} folders`}`}
         </button>
+      ) : gitwyrmFolders.length > 0 ? (
+        <div className="flex flex-col items-center gap-3">
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => onWatchMany(gitwyrmFolders)} disabled={running} className={cx(primary, 'inline-flex items-center gap-2')}>
+              <GitWyrmMark size={18} />
+              Use your GitWyrm {gitwyrmFolders.length === 1 ? 'folder' : 'folders'}
+            </button>
+            <button type="button" onClick={onChoose} disabled={running} className="h-9 rounded-[3px] border border-line-strong bg-surface px-4 text-ink hover:border-muted">
+              Choose a folder…
+            </button>
+          </div>
+          <ul className="m-0 grid list-none gap-1 p-0 font-mono text-[12.5px] text-muted">
+            {gitwyrmFolders.map((f) => (
+              <li key={f}>{f}</li>
+            ))}
+          </ul>
+        </div>
       ) : (
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => onWatch(SUGGESTED_ROOT)} disabled={running} className={primary}>

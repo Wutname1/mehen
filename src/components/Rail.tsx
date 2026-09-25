@@ -1,7 +1,7 @@
 import { ArrowDownAZ, ArrowDownWideNarrow, ArrowDownZA, Check, Code2, EyeOff, Folder, FolderOpen, FolderPlus, Layers, ListChecks, RefreshCw, Settings2, ShieldAlert, SlidersHorizontal } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, type Repo } from '../derive'
-import { cx } from './bits'
+import { GitWyrmMark, cx } from './bits'
 import { EcoIcon } from './EcoIcon'
 import { Menu, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 import { RepoAvatar } from './RepoAvatar'
@@ -108,6 +108,7 @@ export function Rail({
   onRefreshAll,
   onReveal,
   onOpenInEditor,
+  onOpenInGitWyrm,
   onExclude,
   onProjectSettings,
   onScanRepo,
@@ -128,6 +129,8 @@ export function Rail({
   onRefreshAll: () => void
   onReveal: (path: string) => void
   onOpenInEditor: (path: string) => void
+  /** Absent when GitWyrm is not installed. */
+  onOpenInGitWyrm?: (path: string) => void
   onExclude: (repo: Repo) => void
   onProjectSettings: (repo: Repo) => void
   onScanRepo: (repo: Repo) => void
@@ -304,6 +307,11 @@ export function Rail({
           <MenuItem icon={<Code2 size={15} />} onSelect={() => (setContext(null), onOpenInEditor(context.repo.key))}>
             Open in VS Code
           </MenuItem>
+          {onOpenInGitWyrm && context.repo.projects.some((p) => p.repo) && (
+            <MenuItem icon={<GitWyrmMark size={15} />} onSelect={() => (setContext(null), onOpenInGitWyrm(context.repo.key))}>
+              Open in GitWyrm
+            </MenuItem>
+          )}
           <MenuItem icon={<Settings2 size={15} />} onSelect={() => (setContext(null), onProjectSettings(context.repo))}>
             Project settings…
           </MenuItem>

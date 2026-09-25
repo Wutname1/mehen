@@ -277,6 +277,34 @@ export async function openInEditor(path: string) {
   if (inTauri) await invoke('open_in_editor', { path })
 }
 
+/** Whether GitWyrm, the git app, is installed to hand repositories to. */
+export async function gitwyrmInstalled(): Promise<boolean> {
+  if (!inTauri) return true
+  return invoke<boolean>('gitwyrm_installed')
+}
+
+export async function openInGitWyrm(path: string) {
+  if (inTauri) await invoke('open_in_gitwyrm', { path })
+}
+
+/** Project folders set up in GitWyrm that Mehen does not check yet. */
+export async function gitwyrmFolders(): Promise<string[]> {
+  if (!inTauri) return []
+  return invoke<string[]>('gitwyrm_folders')
+}
+
+/** The repository folder Mehen was started with, if any. Returns it once. */
+export async function launchRepo(): Promise<string | null> {
+  if (!inTauri) return null
+  return invoke<string | null>('launch_repo')
+}
+
+/** A repository folder passed to Mehen while it was already running. */
+export async function onOpenRepo(handler: (path: string) => void): Promise<UnlistenFn> {
+  if (!inTauri) return () => {}
+  return listen<string>('mehen://open-repo', (e) => handler(e.payload))
+}
+
 export async function openLink(url: string) {
   if (inTauri) await openUrl(url)
   else window.open(url, '_blank', 'noopener')

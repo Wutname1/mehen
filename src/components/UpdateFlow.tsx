@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { bumpOf, folderName, relativePath } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
-import { cx } from './bits'
+import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { Checkbox } from './Queue'
 import { RepoAvatar } from './RepoAvatar'
@@ -140,6 +140,7 @@ export function UpdateFlow({
   nameOf,
   icons,
   onKeep,
+  onReviewInGitWyrm,
   onClose,
 }: {
   targets: UpdateTarget[]
@@ -153,6 +154,8 @@ export function UpdateFlow({
   icons: Record<string, string>
   /** Keeps a package on its line in `scope` (a repository) from now on. */
   onKeep: (keep: NonNullable<Conflict['keep']>, scope: string) => Promise<void>
+  /** Opens a repository in GitWyrm; absent when GitWyrm is not installed. */
+  onReviewInGitWyrm?: (repo: string) => void
   onClose: (refreshed: Inventory | null) => void
 }) {
   const [current, setCurrent] = useState(targets)
@@ -687,10 +690,18 @@ export function UpdateFlow({
               )}
             </span>
             {o.ok ? (
-              <StateChip tone="ok">
-                {hash ? <GitCommitHorizontal size={14} /> : <Check size={14} />}
-                {hash ? 'Committed' : 'Updated'}
-              </StateChip>
+              <span className="flex flex-col items-end gap-1.5">
+                <StateChip tone="ok">
+                  {hash ? <GitCommitHorizontal size={14} /> : <Check size={14} />}
+                  {hash ? 'Committed' : 'Updated'}
+                </StateChip>
+                {onReviewInGitWyrm && job.plans.some((p) => p.repo) && (
+                  <Button variant="ghost" className="h-7 px-2" onClick={() => onReviewInGitWyrm(job.key)} title={hash ? 'See the new commit in GitWyrm' : 'See the changed files in GitWyrm, then commit them there'}>
+                    <GitWyrmMark size={14} />
+                    Review in GitWyrm
+                  </Button>
+                )}
+              </span>
             ) : (
               <StateChip tone="fail">
                 <RotateCcw size={14} />

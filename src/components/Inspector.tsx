@@ -1,7 +1,7 @@
 import { ChevronDown, Code2, FileText, FolderOpen, GitCommitHorizontal, Play, Settings2, Terminal, X } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo } from '../derive'
-import { cx } from './bits'
+import { GitWyrmMark, cx } from './bits'
 import { Menu, MenuCheck, MenuSeparator, MenuTitle } from './Menu'
 import { RepoAvatar } from './RepoAvatar'
 
@@ -21,21 +21,43 @@ function Fact({ label, children, warn }: { label: string; children: ReactNode; w
   )
 }
 
-export function ProjectRecord({ repo, icon, onReveal, onOpenInEditor, onSettings }: { repo: Repo; icon?: string; onReveal: () => void; onOpenInEditor: () => void; onSettings: () => void }) {
+export function ProjectRecord({
+  repo,
+  icon,
+  onReveal,
+  onOpenInEditor,
+  onOpenInGitWyrm,
+  onSettings,
+}: {
+  repo: Repo
+  icon?: string
+  onReveal: () => void
+  onOpenInEditor: () => void
+  /** Absent when GitWyrm is not installed or the project is not in a git repository. */
+  onOpenInGitWyrm?: () => void
+  onSettings: () => void
+}) {
   return (
     <section className="shrink-0 border-b border-line px-[18px] pt-4 pb-3.5">
       <div className="flex items-start gap-2">
         {icon && <RepoAvatar name={repo.name} icon={icon} size={30} />}
         <h2 className="m-0 min-w-0 flex-1 font-display text-[22px] leading-tight font-semibold tracking-[-0.015em] [overflow-wrap:anywhere]">{repo.name}</h2>
-        <button type="button" onClick={onSettings} aria-label={`${repo.name} settings`} title="Settings for this project" className="grid size-[30px] shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
-          <Settings2 size={16} />
-        </button>
-        <button type="button" onClick={onReveal} aria-label="Show in File Explorer" title="Show in File Explorer" className="grid size-[30px] shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
-          <FolderOpen size={16} />
-        </button>
-        <button type="button" onClick={onOpenInEditor} aria-label="Open in VS Code" title="Open in VS Code" className="grid size-[30px] shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
-          <Code2 size={16} />
-        </button>
+        <div className="flex shrink-0">
+          <button type="button" onClick={onSettings} aria-label={`${repo.name} settings`} title="Settings for this project" className="grid size-[26px] place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
+            <Settings2 size={16} />
+          </button>
+          <button type="button" onClick={onReveal} aria-label="Show in File Explorer" title="Show in File Explorer" className="grid size-[26px] place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
+            <FolderOpen size={16} />
+          </button>
+          <button type="button" onClick={onOpenInEditor} aria-label="Open in VS Code" title="Open in VS Code" className="grid size-[26px] place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink">
+            <Code2 size={16} />
+          </button>
+          {onOpenInGitWyrm && (
+            <button type="button" onClick={onOpenInGitWyrm} aria-label="Open in GitWyrm" title="Open in GitWyrm to review and commit changes" className="grid size-[26px] place-items-center rounded-[3px] hover:bg-sunken">
+              <GitWyrmMark size={17} />
+            </button>
+          )}
+        </div>
       </div>
       <code className="mt-1 mb-3 block font-mono text-[12px] text-state [overflow-wrap:anywhere]">{repo.key}</code>
       <dl className="m-0 border-t border-line">
