@@ -1,13 +1,27 @@
-import { ArrowDownUp, ChevronDown, Info, Link2, Pin, Plus, ShieldAlert, X } from 'lucide-react'
+import { ArrowDownUp, Check, ChevronDown, Info, Link2, ListTree, MoreHorizontal, Pin, Plus, ShieldAlert, X } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type InputHTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
-import { ECOSYSTEM_LABEL, ECOSYSTEMS, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, repoKey, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
-import type { Ecosystem, Hold } from '../types'
+import { ECOSYSTEM_LABEL, ECOSYSTEMS, POLICY_LABEL, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, samePath, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
+import type { Ecosystem, Hold, VersionPolicy } from '../types'
 import { cx } from './bits'
 import { EcoIcon, ProjectTypeIcon } from './EcoIcon'
 import { Menu, MenuCheck, MenuItem, MenuSeparator, MenuTitle } from './Menu'
 
 export type RiskFilter = 'any' | 'attention' | 'security'
 export const RISK_FILTER_LABEL: Record<RiskFilter, string> = { any: 'Any risk', attention: 'Needs attention', security: 'Security only' }
+
+const LEVEL_VALUE: Record<VersionPolicy, string> = { any: 'Any version', minor: 'Minor and patch', patch: 'Bug fixes only' }
+const LEVEL_HINT: Record<VersionPolicy, string> = {
+  any: 'The newest stable release, even when it has breaking changes',
+  minor: 'New features and fixes. Major versions wait',
+  patch: 'Only bug fixes on the version you have',
+}
+
+/** The update level where the queue is looking: set here, or taken from all projects. */
+export interface Level {
+  own: VersionPolicy | null
+  inherited: VersionPolicy | null
+  effective: VersionPolicy
+}
 
 const RISK_HINT: Record<Risk, string> = {
   security: 'Fixes a known vulnerability',
@@ -128,6 +142,11 @@ export function Queue({
   onWhy,
   present,
   countFor,
+  level,
+  onLevel,
+  levelCount,
+  hiddenByLevel,
+  onDetails,
 }: {
   rows: ScopedRow[]
   repo: Repo | null
@@ -154,8 +173,15 @@ export function Queue({
   present: { types: ProjectType[]; ecosystems: Ecosystem[] }
   /** How many packages a set of filters would leave, with the scope and search applied. */
   countFor: (filters: QueueFilters) => number
+  level: Level
+  /** Sets the level for the current scope; null follows all projects (or any version, for all projects). */
+  onLevel: (level: VersionPolicy | null) => void
+  levelCount: (level: VersionPolicy | null) => number
+  /** Packages in view with a bigger update than the level lets through. */
+  hiddenByLevel: number
+  onDetails: (row: QueueRow, usages: QueueUsage[]) => void
 }) {
-  const [keepMenu, setKeepMenu] = useState<{ row: QueueRow; usages: QueueUsage[]; anchor: HTMLElement } | null>(null)
+  const [rowMenu, setRowMenu] = useState<{ row: QueueRow; usages: QueueUsage[]; anchor: HTMLElement | { x: number; y: number } } | null>(null)
   const holdsOf = (row: QueueRow) => holds.filter((h) => h.ecosystem === row.ecosystem && h.name === row.name)
   const shown = rows.flatMap((r) => r.usages)
   const shownSelected = shown.filter((u) => selected.has(u.key)).length
@@ -243,6 +269,26 @@ export function Queue({
                     }}
                   >
                     {RISK_FILTER_LABEL[r]} <Count n={countFor({ ...filters, risk: r })} />
+                  </MenuCheck>
+                ))}
+              </Menu>
+            )}
+          />
+          <FilterButton
+            label="Update level"
+            value={LEVEL_VALUE[level.effective]}
+            active={level.effective !== 'any'}
+            menu={(anchor, close) => (
+              <Menu anchor={anchor} label="Update level" width={320} onClose={close}>
+                <MenuTitle title={repo ? `Update level for ${repo.name}` : 'Update level for every project'} detail="How far updates may go. Right-click a package to keep just that one on its version." />
+                {repo && (
+                  <MenuCheck radio checked={!level.own} onSelect={() => (onLevel(null), close())} detail={POLICY_LABEL[level.inherited ?? 'any']}>
+                    Same as all projects <Count n={levelCount(null)} />
+                  </MenuCheck>
+                )}
+                {(Object.keys(POLICY_LABEL) as VersionPolicy[]).map((p) => (
+                  <MenuCheck key={p} radio checked={repo ? level.own === p : level.effective === p} onSelect={() => (onLevel(p === 'any' && !repo ? null : p), close())} detail={LEVEL_HINT[p]}>
+                    {POLICY_LABEL[p]} <Count n={levelCount(p)} />
                   </MenuCheck>
                 ))}
               </Menu>
@@ -340,6 +386,10 @@ export function Queue({
                   key={row.key}
                   role="row"
                   aria-rowindex={i + 2}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    setRowMenu({ row, usages, anchor: { x: e.clientX, y: e.clientY } })
+                  }}
                   className={cx(
                     'group grid min-h-[50px] grid-cols-[40px_minmax(170px,1fr)_104px_104px_minmax(96px,150px)_112px] items-center border-b border-line max-[1279px]:grid-cols-[36px_minmax(140px,1fr)_88px_88px_minmax(84px,120px)_104px] max-[1100px]:grid-cols-[32px_minmax(120px,1fr)_76px_76px_minmax(64px,96px)_96px]',
                     vulnerable ? (picked ? 'bg-vuln-selected' : 'bg-vuln-row') : picked ? 'bg-row-selected' : 'hover:bg-row-hover',
@@ -356,7 +406,9 @@ export function Queue({
                     />
                   </span>
                   <span role="cell" className="flex min-w-0 flex-col gap-0.5 pr-3">
-                    <b className="truncate text-[13px] font-semibold">{row.name}</b>
+                    <button type="button" onClick={() => onDetails(row, usages)} title="Details and other versions" className="truncate text-left text-[13px] font-semibold hover:underline hover:underline-offset-2">
+                      {row.name}
+                    </button>
                     <small className="flex flex-wrap items-center gap-x-2.5 font-mono text-[12px] text-muted">
                       {ECOSYSTEM_LABEL[row.ecosystem]}
                       {(() => {
@@ -374,10 +426,16 @@ export function Queue({
                         )
                       })()}
                       {holdsOf(row).map((h) => (
-                        <span key={h.id} className="inline-flex items-center gap-1 font-sans text-[12px] text-state" title={`Kept on ${h.line}.x ${h.scope === '*' ? 'in every project' : `in ${nameOf(h.scope)}`}`}>
-                          <Pin size={12} />
+                        <button
+                          key={h.id}
+                          type="button"
+                          onClick={(e) => setRowMenu({ row, usages, anchor: e.currentTarget })}
+                          className="inline-flex h-[18px] items-center gap-1 rounded-[2px] border border-[color-mix(in_oklab,var(--state)_45%,transparent)] bg-[color-mix(in_oklab,var(--state)_8%,transparent)] px-1.5 font-sans text-[11.5px] font-semibold text-state"
+                          title={`Staying on ${h.line}.x ${h.scope === '*' ? 'in every project' : `in ${nameOf(h.scope)}`}. Click to change.`}
+                        >
+                          <Pin size={11} />
                           {h.line}.x
-                        </span>
+                        </button>
                       ))}
                       {vulnerable && (
                         <button type="button" onClick={() => onAdvisory(row)} className="inline-flex items-center gap-1 font-sans text-[12px] font-semibold whitespace-nowrap text-risk-security underline underline-offset-2">
@@ -392,7 +450,10 @@ export function Queue({
                     {installed.length > 1 && <span className="ml-1 font-sans text-[11px] text-muted">+{installed.length - 1}</span>}
                   </code>
                   <span role="cell" className="flex min-w-0 items-center gap-1">
-                    <code className="font-mono text-[12.5px] font-semibold" title={targets.join(', ')}>
+                    <code
+                      className={cx('font-mono text-[12.5px] font-semibold', usages.some((u) => u.chosen) && 'text-state underline decoration-dotted underline-offset-[3px]')}
+                      title={usages.some((u) => u.chosen) ? `You picked ${targets.join(', ')}` : targets.join(', ')}
+                    >
                       {targets.length > 1 && <span className="mr-1 font-sans text-[11px] font-normal text-muted">up to</span>}
                       {targets.at(-1)}
                     </code>
@@ -428,16 +489,16 @@ export function Queue({
                     <RiskPill risk={row.risk} />
                     <button
                       type="button"
-                      onClick={(e) => setKeepMenu({ row, usages, anchor: e.currentTarget })}
-                      aria-label={`Keep ${row.name} on a release line`}
+                      onClick={(e) => setRowMenu({ row, usages, anchor: e.currentTarget })}
+                      aria-label={`More for ${row.name}`}
                       aria-haspopup="menu"
-                      title="Keep on this release line"
+                      title="Details, versions and update level (or right-click the row)"
                       className={cx(
                         'grid size-6 shrink-0 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink focus-visible:opacity-100',
-                        keepMenu?.row.key === row.key ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
+                        rowMenu?.row.key === row.key ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
                       )}
                     >
-                      <Pin size={14} />
+                      <MoreHorizontal size={15} />
                     </button>
                   </span>
                 </div>
@@ -475,27 +536,58 @@ export function Queue({
           {heldBack} newer version{heldBack === 1 ? '' : 's'} held back. Why?
         </button>
       )}
-      {keepMenu &&
+      {hiddenByLevel > 0 && (
+        <p className="mt-2 mb-0 flex items-center gap-1.5 text-[12px] text-muted">
+          <Info size={13} />
+          {hiddenByLevel} package{hiddenByLevel === 1 ? ' has a' : 's have'} bigger update{hiddenByLevel === 1 ? '' : 's'} than the update level ({POLICY_LABEL[level.effective].toLowerCase()}) lets through.
+        </p>
+      )}
+      {rowMenu &&
         (() => {
-          const { row, usages, anchor } = keepMenu
-          const lines = distinctVersions(usages.map((u) => holdLine(displayVersion(u.dep))))
-          const line = lines[0]
-          const repos = [...new Set(usages.map((u) => repoKey(u.project)))]
-          const only = repo ? repo.key : repos.length === 1 ? repos[0] : null
-          const close = () => setKeepMenu(null)
+          const { row, usages, anchor } = rowMenu
+          const close = () => setRowMenu(null)
+          const scope = repo ? repo.key : '*'
+          const installed = distinctVersions(usages.map((u) => displayVersion(u.dep)))
+          const targets = distinctVersions(usages.map((u) => u.target))
+          const major = holdLine(installed[0])
+          const [m, n] = installed[0].replace(/^[^\d]+/, '').split(/[.-]/)
+          const minor = major.startsWith('0.') ? null : `${m}.${n ?? 0}`
+          const own = holdsOf(row).find((h) => (scope === '*' ? h.scope === '*' : samePath(h.scope, scope)))
+          const others = holdsOf(row).filter((h) => h !== own)
+          const lines = [...new Set([major, minor, own?.line].filter((l): l is string => !!l))]
+          const all = usages.every((u) => selected.has(u.key))
           return (
-            <Menu anchor={anchor} label={`Keep ${row.name}`} placement="below-end" width={280} onClose={close}>
-              <MenuTitle title={`Keep ${row.name} on ${line}.x`} detail="Updates stay within this release line" />
-              <MenuItem icon={<Pin size={15} />} onSelect={() => (close(), onKeep(row, '*', line))}>
-                In every project
+            <Menu anchor={anchor} label={row.name} width={300} placement={anchor instanceof HTMLElement ? 'below-end' : 'below-start'} onClose={close}>
+              <MenuTitle title={row.name} detail={`${installed.join(', ')} to ${targets.join(', ')}`} />
+              <MenuItem icon={<ListTree size={15} />} onSelect={() => (close(), onDetails(row, usages))}>
+                Details and other versions
               </MenuItem>
-              {only && (
-                <MenuItem icon={<Pin size={15} />} onSelect={() => (close(), onKeep(row, only, line))}>
-                  Only in {nameOf(only)}
+              <MenuItem icon={all ? <X size={15} /> : <Check size={15} />} onSelect={() => (close(), onToggle(usages))}>
+                {all ? 'Unselect this update' : 'Select this update'}
+              </MenuItem>
+              {row.vulnIds.length > 0 && (
+                <MenuItem icon={<ShieldAlert size={15} />} onSelect={() => (close(), onAdvisory(row))}>
+                  Security advisories
                 </MenuItem>
               )}
-              {holdsOf(row).length > 0 && <MenuSeparator />}
-              {holdsOf(row).map((h) => (
+              <MenuSeparator />
+              <div className="px-2.5 pt-1 pb-1 font-mono text-[10.5px] tracking-[0.04em] text-muted uppercase">Updates {scope === '*' ? 'in every project' : `in ${repo!.name}`}</div>
+              <MenuCheck radio checked={!own} onSelect={() => (close(), own && onRelease(own))} detail={`${POLICY_LABEL[level.effective]}, like everything else`}>
+                Follow the update level
+              </MenuCheck>
+              {lines.map((line) => (
+                <MenuCheck
+                  key={line}
+                  radio
+                  checked={own?.line === line}
+                  onSelect={() => (close(), own?.line !== line && onKeep(row, scope, line))}
+                  detail={line.includes('.') && !line.startsWith('0.') ? 'Bug fixes only' : 'New features and fixes, no breaking changes'}
+                >
+                  Stay on {line}.x
+                </MenuCheck>
+              ))}
+              {others.length > 0 && <MenuSeparator />}
+              {others.map((h) => (
                 <MenuItem key={h.id} icon={<X size={15} />} onSelect={() => (close(), onRelease(h))}>
                   Stop keeping on {h.line}.x {h.scope === '*' ? 'everywhere' : `in ${nameOf(h.scope)}`}
                 </MenuItem>

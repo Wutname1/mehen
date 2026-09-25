@@ -3,8 +3,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
-import { isWithin, samePath } from './derive'
-import type { AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan } from './types'
+import { compareVersions, isWithin, samePath } from './derive'
+import type { AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -107,6 +107,32 @@ export async function setVersionPolicy(scope: string, policy: VersionPolicy | nu
 }
 
 const mockPolicies: VersionPolicies = {}
+
+/** Every published version of a package, newest first, as one project sees it. */
+export async function packageVersions(projectId: string, name: string): Promise<VersionView[]> {
+  if (!inTauri) return mock.packageVersions(projectId, name)
+  return invoke<VersionView[]>('package_versions', { projectId, name })
+}
+
+/** What else has to move for a package to go to `version` in one project. */
+export async function moveWith(projectId: string, name: string, version: string): Promise<Move[]> {
+  if (!inTauri) return mock.moveWith(projectId, name, version)
+  return invoke<Move[]>('move_with', { projectId, name, version })
+}
+
+const releaseDateCache = new Map<string, Promise<Record<string, string>>>()
+
+/** When each version came out, fetched once per package per session. */
+export function releaseDates(ecosystem: Ecosystem, name: string): Promise<Record<string, string>> {
+  const key = `${ecosystem}:${name}`
+  let found = releaseDateCache.get(key)
+  if (!found) {
+    found = inTauri ? invoke<Record<string, string>>('release_dates', { ecosystem, name }) : mock.releaseDates(ecosystem, name)
+    found.catch(() => releaseDateCache.delete(key))
+    releaseDateCache.set(key, found)
+  }
+  return found
+}
 
 /** Logos for project folders; `discover` searches folders not looked at before. */
 export async function repoIcons(repos: string[], discover: boolean): Promise<{ repo: string; dataUrl: string }[]> {
@@ -295,6 +321,8 @@ const mock = (() => {
       if (!hold || !best || !dep.current) return dep
       const onLine = (v: string) => v.replace(/^v/i, '').startsWith(`${hold.line}.`)
       if (onLine(best)) return dep
+      const within = { safeLatest: dep.safeLatest && onLine(dep.safeLatest) ? dep.safeLatest : null, patchLatest: dep.patchLatest && onLine(dep.patchLatest) ? dep.patchLatest : null }
+      if (!onLine(dep.latest ?? '')) return { ...dep, ...within, latest: within.safeLatest ?? within.patchLatest ?? dep.current, newest: best, blockedReason: `kept on ${hold.line}.x`, status: within.safeLatest || within.patchLatest ? ('minor' as const) : ('up-to-date' as const) }
       return { ...dep, latest: onLine(dep.latest ?? '') ? dep.latest : dep.current, newest: best, blockedReason: `kept on ${hold.line}.x`, status: onLine(dep.latest ?? '') ? dep.status : ('up-to-date' as const) }
     })
     return { ...project, dependencies }
@@ -360,6 +388,36 @@ const mock = (() => {
       }))
     },
     inventory: filtered,
+    // Made-up release history from the current version up to the newest.
+    packageVersions: async (projectId: string, name: string): Promise<VersionView[]> => {
+      const dep = (await load())?.projects.find((p) => p.id === projectId)?.dependencies.find((d) => d.name === name)
+      if (!dep?.current) throw new Error(`No version list for ${name}`)
+      const partners = dep.group ? (await load())!.projects.find((p) => p.id === projectId)!.dependencies.filter((d) => d.group === dep.group).length - 1 : 0
+      return mockVersions(dep.current, dep.newest ?? dep.latest ?? dep.current).map((version) => {
+        const past = !partners && !!dep.newest && dep.latest && compareVersions(version, dep.latest) > 0
+        return {
+          version,
+          prerelease: version.includes('-'),
+          blocked: past ? (dep.blockedReason ?? 'needs a newer runtime') : null,
+          together: partners && compareVersions(version, dep.current!) > 0 && !version.includes('-') ? partners : 0,
+          requirements: version.includes('-') ? [] : [{ kind: 'node', range: `>=${18 + Math.max(0, Number.parseInt(version, 10) - Number.parseInt(dep.current!, 10))}` }],
+        }
+      })
+    },
+    moveWith: async (projectId: string, name: string, version: string): Promise<Move[]> => {
+      const project = (await load())?.projects.find((p) => p.id === projectId)
+      const dep = project?.dependencies.find((d) => d.name === name)
+      if (!project || !dep) throw new Error(`${name} is not in that project`)
+      const partners = dep.group ? project.dependencies.filter((d) => d.group === dep.group && d.name !== name) : []
+      return [dep, ...partners].map((d) => ({ name: d.name, from: d.current ?? '', to: d === dep || d.current?.split('.')[0] === dep.current?.split('.')[0] ? version : (d.groupTarget ?? version) }))
+    },
+    releaseDates: async (_ecosystem: Ecosystem, name: string): Promise<Record<string, string>> => {
+      const dep = (await load())?.projects.flatMap((p) => p.dependencies).find((d) => d.name === name)
+      if (!dep?.current) return {}
+      const versions = mockVersions(dep.current, dep.newest ?? dep.latest ?? dep.current)
+      const day = 86_400_000
+      return Object.fromEntries(versions.map((v, i) => [v, new Date(Date.now() - (i === 0 ? day : i * 23 * day)).toISOString()]))
+    },
     // Fake plan and apply so the update flow can be exercised in a browser.
     planUpdate: async (projectId: string, changes: Change[]): Promise<UpdatePlan> => {
       const inv = await load()
@@ -458,3 +516,11 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
     },
   }
 })()
+
+/** Newest first: each major from `current` to `newest`, with a few minors and patches, plus a pre-release. */
+function mockVersions(current: string, newest: string): string[] {
+  const [from, to] = [current, newest].map((v) => Number.parseInt(v.replace(/^\D+/, ''), 10) || 0)
+  const out = [`${to + 1}.0.0-rc.1`, newest]
+  for (let major = to; major >= from; major--) for (const minor of [2, 1, 0]) for (const patch of [3, 0]) out.push(`${major}.${minor}.${patch}`)
+  return [...new Set(out.filter((v) => v === newest || v.includes('-') || compareVersions(v, newest) < 0))].sort((a, b) => compareVersions(b, a))
+}

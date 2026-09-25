@@ -297,3 +297,29 @@ export interface Hold {
   /** `5` for 5.x, `0.13` for 0.13.x. */
   line: string
 }
+
+/** What a published version asks of the project using it. */
+export type Requirement =
+  | { kind: 'frameworks'; frameworks: string[] }
+  | { kind: 'rust'; version: string }
+  | { kind: 'node'; range: string }
+  | { kind: 'peers'; peers: [string, string][] }
+  | { kind: 'python' | 'dart' | 'php' | 'ruby'; range: string }
+
+/** One published version, as one project sees it. */
+export interface VersionView {
+  version: string
+  prerelease: boolean
+  /** Why the project cannot use it; null when it can. */
+  blocked: string | null
+  requirements: Requirement[]
+  /** How many other packages have to move with it for it to fit. */
+  together: number
+}
+
+/** A package moving as part of a chosen update. */
+export interface Move {
+  name: string
+  from: string
+  to: string
+}

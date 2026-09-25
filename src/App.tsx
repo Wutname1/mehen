@@ -7,14 +7,15 @@ import { Logo, cx } from './components/bits'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
 import { HeldBackDialog } from './components/HeldBack'
 import { ManageProjects } from './components/ManageProjects'
-import { Queue, type QueueFilters, type ScopedRow } from './components/Queue'
+import { PackageDialog } from './components/PackageDialog'
+import { Queue, type Level, type QueueFilters, type ScopedRow } from './components/Queue'
 import { Rail, ScanStatus } from './components/Rail'
 import { SettingsDialog, type SettingsTab } from './components/SettingsDialog'
 import { AddFolderDialog, ExcludeDialog } from './components/SmallDialogs'
 import { UpdateFlow, type UpdateTarget } from './components/UpdateFlow'
-import { RISK_ORDER, distinctVersions, folderName, heldBack, isWithin, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, type QueueRow, type QueueUsage, type Repo } from './derive'
+import { POLICY_LABEL, RISK_ORDER, distinctVersions, folderName, heldBack, isWithin, policyFor, projectTypes, queueRows, repoKey, repos as groupRepos, samePath, usageKey, type QueueRow, type QueueUsage, type Repo } from './derive'
 import { usePrefs } from './prefs'
-import type { Change, Hold, IgnoreKind, IgnoreRule, Inventory, Progress, Settings, VersionPolicies } from './types'
+import type { Change, Hold, IgnoreKind, IgnoreRule, Inventory, Move, Progress, Project, Settings, VersionPolicies, VersionPolicy } from './types'
 
 const SUGGESTED_ROOT = 'C:\\code'
 
@@ -33,6 +34,7 @@ type Dialog =
   | { kind: 'exclude'; repo: Repo; back: Back }
   | { kind: 'update'; start: 'confirm' | 'preview'; targets: UpdateTarget[] }
   | { kind: 'advisory'; row: QueueRow }
+  | { kind: 'package'; row: QueueRow; usages: QueueUsage[] }
   | { kind: 'held-back'; packageKey: string | null }
   | { kind: 'app-update' }
 
@@ -58,6 +60,8 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   /** Selected usages moving somewhere other than their usual target, like a smaller security fix. */
   const [chosen, setChosen] = useState<Map<string, string>>(new Map())
+  /** Usages picked together by hand, which are selected and unselected as one. */
+  const [linked, setLinked] = useState<Map<string, string[]>>(new Map())
   const [icons, setIcons] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLInputElement>(null)
   const scannedOnOpen = useRef(false)
@@ -212,7 +216,7 @@ export default function App() {
     }
   }
 
-  const rows = useMemo(() => (inventory ? queueRows(inventory, policies) : []), [inventory, policies])
+  const rows = useMemo(() => (inventory ? queueRows(inventory, policies, chosen) : []), [inventory, policies, chosen])
   const repoList = useMemo(() => (inventory ? groupRepos(inventory, rows) : []), [inventory, rows])
   const repoByKey = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), r])), [repoList])
   const repo = repoScope ? (repoByKey.get(repoScope.toLowerCase()) ?? null) : null
@@ -257,6 +261,16 @@ export default function App() {
     if (repoScope && !repoByKey.has(repoScope.toLowerCase())) setRepoScope(null)
   }, [rows, repoByKey, repoScope])
 
+  // A hand-picked version only lasts while it is selected.
+  useEffect(() => {
+    const keep = <V,>(prev: Map<string, V>) => {
+      const next = new Map([...prev].filter(([k]) => selected.has(k)))
+      return next.size === prev.size ? prev : next
+    }
+    setChosen(keep)
+    setLinked(keep)
+  }, [selected])
+
   /** Usages the scope, project-type and dependency-type filters allow. */
   const typesByRepo = useMemo(() => new Map(repoList.map((r) => [r.key.toLowerCase(), new Set(projectTypes(r.projects))])), [repoList])
 
@@ -274,17 +288,18 @@ export default function App() {
 
   const q = query.trim().toLowerCase()
   /** The rows `f` leaves, together with the scope and the search: the list, and each filter option's count. */
-  const rowsFor = useCallback(
-    (f: QueueFilters): ScopedRow[] =>
-      rows
+  const scopedRows = useCallback(
+    (source: QueueRow[], f: QueueFilters): ScopedRow[] =>
+      source
         .filter((row) => f.risk === 'any' || (f.risk === 'security' ? row.risk === 'security' : row.risk === 'security' || row.risk === 'major'))
         .map((row) => {
           const usages = usagesIn(row, f)
           return { row, usages: !q || row.name.toLowerCase().includes(q) ? usages : usages.filter((u) => u.project.name.toLowerCase().includes(q) || u.project.dir.toLowerCase().includes(q)) }
         })
         .filter(({ usages }) => usages.length > 0),
-    [rows, usagesIn, q],
+    [usagesIn, q],
   )
+  const rowsFor = useCallback((f: QueueFilters) => scopedRows(rows, f), [scopedRows, rows])
   const countFor = useCallback((f: QueueFilters) => rowsFor(f).length, [rowsFor])
 
   const visible: ScopedRow[] = useMemo(() => {
@@ -299,6 +314,63 @@ export default function App() {
     const projects = new Set(usages.map((u) => repoKey(u.project).toLowerCase())).size
     return { packages, projects, usages, allSelected: usages.every((u) => selected.has(u.key)) }
   }, [rows, inScope, selected])
+
+  const levelScope = repo ? repo.key : '*'
+  const ownLevel = repo ? (Object.entries(policies).find(([k]) => samePath(k, repo.key))?.[1] ?? null) : (policies['*'] ?? null)
+  const level: Level = { own: ownLevel, inherited: repo ? (policies['*'] ?? null) : null, effective: ownLevel ?? (repo ? policies['*'] : null) ?? 'any' }
+  const policiesWith = useCallback(
+    (next: VersionPolicy | null) => {
+      const out = Object.fromEntries(Object.entries(policies).filter(([k]) => (levelScope === '*' ? k !== '*' : !samePath(k, levelScope))))
+      if (next) out[levelScope] = next
+      return out as VersionPolicies
+    },
+    [policies, levelScope],
+  )
+  const levelCount = useCallback((next: VersionPolicy | null) => (inventory ? scopedRows(queueRows(inventory, policiesWith(next), chosen), filters).length : 0), [inventory, policiesWith, chosen, scopedRows, filters])
+  const hiddenByLevel = useMemo(() => {
+    if (!inventory || !Object.values(policies).some((p) => p !== 'any')) return 0
+    const shown = new Set(visible.map((r) => r.row.key))
+    return scopedRows(queueRows(inventory, {}, chosen), filters).filter((r) => !shown.has(r.row.key)).length
+  }, [inventory, policies, visible, scopedRows, chosen, filters])
+
+  const setLevel = async (next: VersionPolicy | null) => {
+    const before = ownLevel
+    const where = repo ? repo.name : 'every project'
+    try {
+      setPolicies(await api.setVersionPolicy(levelScope, next))
+      setNotice({
+        text: `Update level for ${where}: ${next ? POLICY_LABEL[next].toLowerCase() : repo ? 'same as all projects' : POLICY_LABEL.any.toLowerCase()}.`,
+        undo: async () => {
+          setNotice(null)
+          setPolicies(await api.setVersionPolicy(levelScope, before))
+        },
+      })
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  /** Selects a version picked by hand, with everything that has to move with it. */
+  const chooseMoves = (project: Project, name: string, moves: Move[]) => {
+    const picks = moves.flatMap((m) => {
+      const dep = project.dependencies.find((d) => d.name === m.name)
+      return dep ? [[usageKey(project, dep), m.to] as [string, string]] : []
+    })
+    const keys = picks.map(([k]) => k)
+    const [beforeSelected, beforeChosen, beforeLinked] = [selected, chosen, linked]
+    setChosen((prev) => new Map([...prev, ...picks]))
+    setSelected((prev) => new Set([...prev, ...keys]))
+    setLinked((prev) => {
+      const next = new Map(prev)
+      if (keys.length > 1) for (const k of keys) next.set(k, keys.filter((o) => o !== k))
+      return next
+    })
+    const to = moves.find((m) => m.name === name)?.to ?? ''
+    setNotice({
+      text: `${name} ${to} selected${moves.length > 1 ? `, with ${plural(moves.length - 1, 'other package')} it needs` : ''}.`,
+      undo: () => (setNotice(null), setSelected(beforeSelected), setChosen(beforeChosen), setLinked(beforeLinked)),
+    })
+  }
 
   const held = useMemo(() => (inventory ? heldBack(inventory.projects.filter((p) => !repo || samePath(repoKey(p), repo.key))) : []), [inventory, repo])
 
@@ -382,8 +454,9 @@ export default function App() {
   /** Usages with every group partner in the same project, which must be picked together. */
   const withPartners = (usages: QueueUsage[]) => {
     const wanted = new Set(usages.flatMap((u) => u.together.map((name) => `${u.project.id}\u0000${name}`)))
-    if (!wanted.size) return usages
-    const partners = rows.flatMap((r) => r.usages).filter((u) => wanted.has(`${u.project.id}\u0000${u.dep.name}`))
+    const picked = new Set(usages.flatMap((u) => linked.get(u.key) ?? []))
+    if (!wanted.size && !picked.size) return usages
+    const partners = rows.flatMap((r) => r.usages).filter((u) => wanted.has(`${u.project.id}\u0000${u.dep.name}`) || picked.has(u.key))
     return [...new Map([...usages, ...partners].map((u) => [u.key, u])).values()]
   }
 
@@ -579,6 +652,11 @@ export default function App() {
             onWhy={(packageKey) => setDialog({ kind: 'held-back', packageKey })}
             present={present}
             countFor={countFor}
+            level={level}
+            onLevel={setLevel}
+            levelCount={levelCount}
+            hiddenByLevel={hiddenByLevel}
+            onDetails={(row, usages) => setDialog({ kind: 'package', row, usages })}
           />
           <aside className="flex min-h-0 flex-col overflow-y-auto border-l border-line bg-paper-2" aria-label="Project and selected updates">
             {repo && (
@@ -684,6 +762,23 @@ export default function App() {
             selectFix(dialog.row, pick)
             setDialog(null)
           }}
+          onClose={() => setDialog(null)}
+        />
+      )}
+
+      {dialog?.kind === 'package' && (
+        <PackageDialog
+          row={dialog.row}
+          usages={dialog.usages}
+          holds={holds}
+          levelOf={(p) => policyFor(policies, p)}
+          nameOf={nameOf}
+          chosenTarget={(u) => (selected.has(u.key) ? (chosen.get(u.key) ?? u.target) : null)}
+          onChoose={(project, moves) => {
+            chooseMoves(project, dialog.row.name, moves)
+            setDialog(null)
+          }}
+          onAdvisory={() => setDialog({ kind: 'advisory', row: dialog.row })}
           onClose={() => setDialog(null)}
         />
       )}

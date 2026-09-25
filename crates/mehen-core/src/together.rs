@@ -39,7 +39,29 @@ pub fn resolve(seed: &str, pkgs: &HashMap<String, Pkg>, allowed: &dyn Fn(&str, &
     if Some(&first) == pkgs.get(seed).map(|p| &p.current) {
         return None;
     }
-    let mut moved: BTreeMap<String, String> = BTreeMap::from([(seed.to_string(), first)]);
+    settle(seed, &first, pkgs, allowed).filter(|moved| moved.len() > 1)
+}
+
+/// Everything that has to move for `seed` to be at `version`, and where
+/// each goes, including `seed` itself; just `seed` when nothing else
+/// needs to. `None` when no set of versions fits.
+pub fn settle(seed: &str, version: &str, pkgs: &HashMap<String, Pkg>, allowed: &dyn Fn(&str, &str) -> bool) -> Option<BTreeMap<String, String>> {
+    pkgs.get(seed)?;
+    if !allowed(seed, version) {
+        return None;
+    }
+    let mut moved: BTreeMap<String, String> = BTreeMap::from([(seed.to_string(), version.to_string())]);
+    // Packages released in step with the seed (on the same line today, like a
+    // framework's parts) follow it to its exact version, else its line, so
+    // picking an older line does not drag the others up to the newest one.
+    let line = |v: &str| Version::parse(v).map(|p| if p.part(0) == 0 { (0, p.part(1)) } else { (p.part(0), 0) });
+    let seed_line = line(&pkgs[seed].current);
+    let pick = |name: &str, fits: &dyn Fn(&str) -> bool| -> Option<String> {
+        let versions = &pkgs[name].versions;
+        let first = |want: &dyn Fn(&str) -> bool| versions.iter().find(|v| want(v) && fits(v)).cloned();
+        let in_step = seed_line.is_some() && line(&pkgs[name].current) == seed_line;
+        (in_step.then(|| first(&|v| v == version).or_else(|| first(&|v| line(v) == line(version)))).flatten()).or_else(|| first(&|_| true))
+    };
     // A fixed order, so the same project always gives the same group.
     let mut names: Vec<&String> = pkgs.keys().collect();
     names.sort();
@@ -56,17 +78,17 @@ pub fn resolve(seed: &str, pkgs: &HashMap<String, Pkg>, allowed: &dyn Fn(&str, &
                 .map(|(peer, range)| (owner.to_string(), peer.clone(), range.clone()))
         });
         let Some((owner, peer, range)) = conflict else {
-            return (moved.len() > 1).then_some(moved);
+            return Some(moved);
         };
         // Move whichever side has not moved yet: the peer up into the range,
         // or the owner up to a version that accepts where the moved packages
         // are going. What else that version needs becomes the next conflict.
         let (name, pick) = if !moved.contains_key(&peer) {
-            let pick = pkgs[&peer].versions.iter().find(|v| allowed(&peer, v) && semver_satisfies(v, &range)).cloned();
+            let pick = pick(&peer, &|v| allowed(&peer, v) && semver_satisfies(v, &range));
             (peer, pick)
         } else {
             let accepts = |v: &str| pkgs[&owner].peers_of(v).iter().filter(|(p, _)| moved.contains_key(p)).all(|(p, r)| semver_satisfies(&moved[p], r));
-            let pick = pkgs[&owner].versions.iter().find(|v| allowed(&owner, v) && accepts(v)).cloned();
+            let pick = pick(&owner, &|v| allowed(&owner, v) && accepts(v));
             (owner, pick)
         };
         let pick = pick?;
@@ -145,6 +167,35 @@ mod tests {
     fn nothing_for_a_package_that_can_move_alone() {
         let pkgs = angular();
         assert_eq!(resolve("rxjs", &pkgs, &|_, _| true), None);
+    }
+
+    #[test]
+    fn a_chosen_older_line_brings_the_matching_versions() {
+        let mut pkgs = angular();
+        let core = pkgs.get_mut("@angular/core").unwrap();
+        core.versions.insert(1, "21.2.3".into());
+        core.peers.insert("21.2.3".into(), vec![("@angular/compiler".into(), "21.2.3".into()), ("zone.js".into(), "~0.15.0".into())]);
+        let compiler = pkgs.get_mut("@angular/compiler").unwrap();
+        compiler.versions.insert(1, "21.2.3".into());
+        compiler.peers.insert("21.2.3".into(), vec![("@angular/core".into(), "21.2.3".into())]);
+        for (name, peers) in [
+            ("@angular/platform-browser-dynamic", vec![("@angular/core", "21.2.3"), ("@angular/compiler", "21.2.3")]),
+            ("@angular/common", vec![("@angular/core", "21.2.3")]),
+            ("@angular/cdk", vec![("@angular/core", "^21.0.0"), ("@angular/common", "^21.0.0")]),
+        ] {
+            let p = pkgs.get_mut(name).unwrap();
+            p.versions.insert(1, "21.2.3".into());
+            p.peers.insert("21.2.3".into(), peers.into_iter().map(|(n, r)| (n.to_string(), r.to_string())).collect());
+        }
+        // Newer compilers stopped naming the core they need; they still belong with 21.
+        pkgs.get_mut("@angular/compiler").unwrap().peers.remove("22.2.0");
+        let moved = settle("@angular/core", "21.2.3", &pkgs, &|_, _| true).unwrap();
+        for name in ["@angular/compiler", "@angular/common", "@angular/platform-browser-dynamic", "@angular/cdk"] {
+            assert_eq!(moved.get(name).map(String::as_str), Some("21.2.3"), "{name} goes to 21 with core, not the newest 22");
+        }
+        assert_eq!(settle("rxjs", "7.8.2", &pkgs, &|_, _| true).unwrap().len(), 1, "a package that moves alone is just itself");
+        let no_core_21 = |name: &str, v: &str| !(name == "@angular/core" && v == "21.2.3");
+        assert_eq!(settle("@angular/core", "21.2.3", &pkgs, &no_core_21), None, "a held or unusable choice is never offered");
     }
 
     #[test]

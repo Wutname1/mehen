@@ -225,6 +225,8 @@ export interface QueueUsage {
   target: string
   /** Other packages in this project that must move in the same update. */
   together: string[]
+  /** The target was picked by hand rather than worked out. */
+  chosen?: boolean
 }
 
 /** One package that has an update somewhere, with every usage that can take it. */
@@ -257,6 +259,18 @@ export function updateTarget(dep: Dependency, policy: VersionPolicy = 'any'): st
   return patch && dep.current && isBehind(dep.current, patch) ? patch : null
 }
 
+/**
+ * The update level's target, except that a known vulnerability is never
+ * hidden by it: when the level stops short of the fix, the smallest fix is
+ * offered instead.
+ */
+function levelTarget(dep: Dependency, policy: VersionPolicy): string | null {
+  const target = updateTarget(dep, policy)
+  if (policy === 'any' || !dep.vulns.length || !canRetarget(dep)) return target
+  if (dep.fixTarget) return target && compareVersions(target, dep.fixTarget) >= 0 ? target : dep.fixTarget
+  return target ?? updateTarget(dep, 'any')
+}
+
 /** How big the jump from `current` to `target` is. */
 export function bumpOf(current: string, target: string): Exclude<Risk, 'security'> {
   // Tolerates a written spec like `^5.1.2` or `>=5` as well as a version.
@@ -273,7 +287,12 @@ export function riskOf(usages: { dep: Dependency; target?: string }[]): Risk {
   return bumps.includes('major') ? 'major' : bumps.includes('minor') ? 'minor' : 'patch'
 }
 
-export function queueRows(inventory: Inventory, policies: VersionPolicies = {}): QueueRow[] {
+/**
+ * Every package with somewhere to go, per project. `chosen` holds versions
+ * picked by hand (by usage key); those count even where the policy would
+ * leave the package alone.
+ */
+export function queueRows(inventory: Inventory, policies: VersionPolicies = {}, chosen: Map<string, string> = new Map()): QueueRow[] {
   const rows = new Map<string, QueueRow>()
   for (const project of inventory.projects) {
     const policy = policyFor(policies, project)
@@ -283,12 +302,14 @@ export function queueRows(inventory: Inventory, policies: VersionPolicies = {}):
     const members = new Map<string, string[]>()
     for (const dep of project.dependencies) if (grouped(dep)) members.set(dep.group!, [...(members.get(dep.group!) ?? []), dep.name])
     for (const dep of project.dependencies) {
-      const target = grouped(dep) ?? updateTarget(dep, policy)
+      const picked = chosen.get(usageKey(project, dep))
+      const custom = picked && picked !== dep.current ? picked : null
+      const target = custom ?? grouped(dep) ?? levelTarget(dep, policy)
       if (!target) continue
       const key = `${dep.ecosystem}:${dep.name}`
       const row = rows.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, usages: [], risk: 'patch', vulnIds: [] }
       const together = grouped(dep) ? [...new Set(members.get(dep.group!) ?? [])].filter((n) => n !== dep.name) : []
-      row.usages.push({ key: usageKey(project, dep), project, dep, target, together })
+      row.usages.push({ key: usageKey(project, dep), project, dep, target, together, chosen: !!custom })
       for (const id of dep.vulns) if (!row.vulnIds.includes(id)) row.vulnIds.push(id)
       rows.set(key, row)
     }

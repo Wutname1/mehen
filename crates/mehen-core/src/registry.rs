@@ -1,5 +1,6 @@
 //! Latest-version lookups, one per package no matter how many projects use it.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -425,9 +426,116 @@ fn tags_from_refs(refs: &str) -> PackageInfo {
     PackageInfo { latest, versions, tags, requirements: Vec::new() }
 }
 
+/// When each version came out (ISO 8601), fetched only when someone looks at
+/// a package's versions. Empty where the registry does not say.
+pub async fn release_dates(http: &reqwest::Client, ecosystem: Ecosystem, name: &str) -> anyhow::Result<HashMap<String, String>> {
+    use serde_json::Value;
+    let text = |v: &Value| v.as_str().map(str::to_string);
+    let mut dates = HashMap::new();
+    match ecosystem {
+        Ecosystem::Npm => {
+            let doc: Value = get(http, &format!("https://registry.npmjs.org/{}", name.replace('/', "%2f")), None).await?.json().await?;
+            if let Some(time) = doc["time"].as_object() {
+                dates.extend(time.iter().filter(|(k, _)| *k != "created" && *k != "modified").filter_map(|(k, v)| Some((k.clone(), text(v)?))));
+            }
+        }
+        Ecosystem::Cargo => {
+            let base = format!("https://crates.io/api/v1/crates/{name}/versions");
+            let mut query = "?per_page=100".to_string();
+            // The API asks for about one request a second; a long history is a few pages.
+            for _ in 0..10 {
+                let doc: Value = get(http, &format!("{base}{query}"), None).await?.json().await?;
+                for v in doc["versions"].as_array().into_iter().flatten() {
+                    if let (Some(num), Some(at)) = (text(&v["num"]), text(&v["created_at"])) {
+                        dates.insert(num, at);
+                    }
+                }
+                match text(&doc["meta"]["next_page"]) {
+                    Some(next) => query = next,
+                    None => break,
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+        Ecosystem::Nuget => {
+            let url = format!("https://api.nuget.org/v3/registration5-gz-semver2/{}/index.json", name.to_ascii_lowercase());
+            let index: Value = get(http, &url, None).await?.json().await?;
+            let pages = futures::future::try_join_all(index["items"].as_array().cloned().unwrap_or_default().into_iter().map(|page| async move {
+                match page["items"].as_array() {
+                    Some(items) => anyhow::Ok(items.clone()),
+                    None => {
+                        let body: Value = get(http, page["@id"].as_str().unwrap_or_default(), None).await?.json().await?;
+                        Ok(body["items"].as_array().cloned().unwrap_or_default())
+                    }
+                }
+            }))
+            .await?;
+            for leaf in pages.iter().flatten() {
+                let entry = &leaf["catalogEntry"];
+                // Unlisted versions carry a 1900 placeholder date.
+                if let (Some(v), Some(at)) = (text(&entry["version"]), text(&entry["published"]).filter(|d| !d.starts_with("1900"))) {
+                    dates.insert(v.split('+').next().unwrap_or(&v).to_string(), at);
+                }
+            }
+        }
+        Ecosystem::Pypi => {
+            let doc: Value = get(http, &format!("https://pypi.org/pypi/{}/json", crate::python::normalize(name)), None).await?.json().await?;
+            for (v, files) in doc["releases"].as_object().into_iter().flatten() {
+                if let Some(at) = files.as_array().and_then(|f| f.iter().filter_map(|f| text(&f["upload_time_iso_8601"])).min()) {
+                    dates.insert(v.clone(), at);
+                }
+            }
+        }
+        Ecosystem::Pub => {
+            let doc: Value = get(http, &format!("https://pub.dev/api/packages/{name}"), Some("application/vnd.pub.v2+json")).await?.json().await?;
+            for v in doc["versions"].as_array().into_iter().flatten() {
+                if let (Some(num), Some(at)) = (text(&v["version"]), text(&v["published"])) {
+                    dates.insert(num, at);
+                }
+            }
+        }
+        Ecosystem::Packagist => {
+            let doc: Value = get(http, &format!("https://repo.packagist.org/p2/{name}.json"), None).await?.json().await?;
+            for v in doc["packages"][name].as_array().into_iter().flatten() {
+                if let (Some(num), Some(at)) = (text(&v["version"]), text(&v["time"])) {
+                    dates.insert(num, at);
+                }
+            }
+        }
+        Ecosystem::RubyGems => {
+            let doc: Value = get(http, &format!("https://rubygems.org/api/v1/versions/{name}.json"), None).await?.json().await?;
+            for v in doc.as_array().into_iter().flatten() {
+                if let (Some(num), Some(at)) = (text(&v["number"]), text(&v["created_at"])) {
+                    dates.entry(num).or_insert(at);
+                }
+            }
+        }
+        Ecosystem::Go | Ecosystem::GithubActions => {}
+    }
+    Ok(dates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn release_dates_from_each_registry() {
+        let http = http_client();
+        for (eco, name, version) in [
+            (Ecosystem::Npm, "@angular/core", "16.2.12"),
+            (Ecosystem::Cargo, "serde", "1.0.100"),
+            (Ecosystem::Nuget, "AutoMapper", "12.0.1"),
+            (Ecosystem::Pypi, "requests", "2.31.0"),
+            (Ecosystem::Pub, "http", "1.1.0"),
+            (Ecosystem::Packagist, "monolog/monolog", "3.5.0"),
+            (Ecosystem::RubyGems, "rails", "7.1.0"),
+        ] {
+            let dates = release_dates(&http, eco, name).await.unwrap();
+            assert!(dates.get(version).is_some_and(|d| d.len() >= 10), "{name} {version}: {} dates", dates.len());
+        }
+    }
 
     fn pkt(line: &str) -> String {
         format!("{:04x}{line}", line.len() + 4)

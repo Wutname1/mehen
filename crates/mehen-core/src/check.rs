@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt, stream};
+use serde::Serialize;
 
 use crate::compat::{self, ProjectEnv, Requirement};
 use crate::model::{AffectedRange, CheckStats, Dependency, Ecosystem, Inventory, Progress, Project, Status, Vulnerability};
@@ -134,24 +135,9 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             .collect();
         let limits = peer_limits(project, &infos);
         let folder = project.repo.clone().unwrap_or_else(|| project.dir.clone());
-        let env = ProjectEnv {
-            frameworks: project.frameworks.clone(),
-            rust: project.rust_version.clone().or_else(|| toolchain.rust.clone()),
-            node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
-            installed,
-            python: project.python_version.clone(),
-            dart: toolchain.dart.clone(),
-            php: project.php_version.clone().or_else(|| toolchain.php.clone()),
-            ruby: toolchain.ruby.clone(),
-        };
+        let env = project_env(project, installed, &toolchain);
         for dep in &mut project.dependencies {
-            let mut own: Vec<Limit> = limits.get(&dep.name).cloned().unwrap_or_default();
-            own.extend(
-                holds
-                    .iter()
-                    .filter(|h| h.ecosystem == dep.ecosystem && h.name == dep.name && h.applies_to(&folder))
-                    .map(|h| Limit::Hold(h.clone())),
-            );
+            let own = limits_for(dep, &limits, &holds, &folder);
             apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env, &own);
         }
         let project_holds: Vec<&Hold> = holds.iter().filter(|h| h.applies_to(&folder)).collect();
@@ -328,6 +314,55 @@ fn peer_limits(project: &Project, infos: &HashMap<(Ecosystem, String), Result<Pa
     limits
 }
 
+fn project_env(project: &Project, installed: HashMap<String, String>, toolchain: &Toolchain) -> ProjectEnv {
+    ProjectEnv {
+        frameworks: project.frameworks.clone(),
+        rust: project.rust_version.clone().or_else(|| toolchain.rust.clone()),
+        node: project_node(project.node_version.as_deref(), project.node_engines.as_deref(), toolchain.node.as_deref()),
+        installed,
+        python: project.python_version.clone(),
+        dart: toolchain.dart.clone(),
+        php: project.php_version.clone().or_else(|| toolchain.php.clone()),
+        ruby: toolchain.ruby.clone(),
+    }
+}
+
+/// Peer limits other installed packages put on `dep`, and the user's holds on it.
+fn limits_for(dep: &Dependency, peer: &HashMap<String, Vec<Limit>>, holds: &[Hold], folder: &str) -> Vec<Limit> {
+    let mut own: Vec<Limit> = peer.get(&dep.name).cloned().unwrap_or_default();
+    own.extend(holds.iter().filter(|h| h.ecosystem == dep.ecosystem && h.name == dep.name && h.applies_to(folder)).map(|h| Limit::Hold(h.clone())));
+    own
+}
+
+/// Whether this project can use a version of `dep`, and why not. A
+/// mismatch the version already in use has too means our picture of the
+/// project is off there (say, a TypeScript read from a parent folder);
+/// that one is set aside, but every other check still counts. A hold is
+/// the user's choice and always counts.
+fn verdict<'a>(dep: &Dependency, info: &'a PackageInfo, env: &'a ProjectEnv, limits: &'a [Limit]) -> Box<dyn Fn(&str) -> Result<(), String> + 'a> {
+    let mut requirements: HashMap<&str, Vec<&compat::Requirement>> = HashMap::new();
+    for (v, r) in &info.requirements {
+        requirements.entry(v.as_str()).or_default().push(r);
+    }
+    let name = dep.name.clone();
+    let failures = move |v: &str| -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = requirements.get(v).into_iter().flatten().flat_map(|r| compat::failures(r, env)).collect();
+        out.extend(limits.iter().filter_map(|l| l.check(&name, v).err().map(|reason| (l.key(), reason))));
+        out
+    };
+    let accepted: HashSet<String> = dep
+        .current
+        .as_deref()
+        .map(|c| c.trim_start_matches(['v', 'V']))
+        .and_then(|c| info.versions.iter().find(|v| v.trim_start_matches(['v', 'V']) == c))
+        .map(|c| failures(c).into_iter().map(|(k, _)| k).filter(|k| k != "hold").collect())
+        .unwrap_or_default();
+    Box::new(move |v: &str| match failures(v).into_iter().find(|(k, _)| !accepted.contains(k)) {
+        Some((_, reason)) => Err(reason),
+        None => Ok(()),
+    })
+}
+
 fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, env: &ProjectEnv, limits: &[Limit]) {
     if dep.status != Status::Pending {
         return;
@@ -346,31 +381,7 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
     };
     // Only versions this project can actually use count as update targets.
     // When the newest release is out of reach, keep it (and why) for display.
-    let mut requirements: HashMap<&str, Vec<&compat::Requirement>> = HashMap::new();
-    for (v, r) in &info.requirements {
-        requirements.entry(v.as_str()).or_default().push(r);
-    }
-    let name = dep.name.clone();
-    let failures = |v: &str| -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = requirements.get(v).into_iter().flatten().flat_map(|r| compat::failures(r, env)).collect();
-        out.extend(limits.iter().filter_map(|l| l.check(&name, v).err().map(|reason| (l.key(), reason))));
-        out
-    };
-    // A mismatch the version already in use has too means our picture of
-    // the project is off there (say, a TypeScript read from a parent
-    // folder); trust reality and set that one aside, but keep every other
-    // check. A hold is the user's choice and always counts.
-    let accepted: HashSet<String> = dep
-        .current
-        .as_deref()
-        .map(|c| c.trim_start_matches(['v', 'V']))
-        .and_then(|c| info.versions.iter().find(|v| v.trim_start_matches(['v', 'V']) == c))
-        .map(|c| failures(c).into_iter().map(|(k, _)| k).filter(|k| k != "hold").collect())
-        .unwrap_or_default();
-    let usable = |v: &str| match failures(v).into_iter().find(|(k, _)| !accepted.contains(k)) {
-        Some((_, reason)) => Err(reason),
-        None => Ok(()),
-    };
+    let usable = verdict(dep, info, env, limits);
     // Older releases are never a target, and checking thousands of them is
     // most of a warm check's time.
     let floor = dep.current.as_deref().and_then(Version::parse);
@@ -513,14 +524,25 @@ fn merge_aliases(vulns: Vec<Vulnerability>, inventory: &mut Inventory) -> Vec<Vu
 /// (Angular's parts pin each other) and marks each group's members with
 /// where they go together. Holds and runtime limits (Node and the like)
 /// still count; peers are what the search works out.
-fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, env: &ProjectEnv, holds: &[&Hold]) {
-    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
-    if !npm.iter().any(|d| d.newest.is_some()) {
-        return;
+/// What the group search needs about a project's npm packages: each one's
+/// versions and peers, and everything else its versions require.
+struct GroupInputs<'a> {
+    pkgs: HashMap<String, together::Pkg>,
+    other_reqs: HashMap<String, HashMap<String, Vec<&'a Requirement>>>,
+}
+
+impl GroupInputs<'_> {
+    /// Everything besides peers: holds, Node and the like.
+    fn allowed(&self, name: &str, version: &str, env: &ProjectEnv, holds: &[&Hold]) -> bool {
+        holds.iter().filter(|h| h.name == name && h.ecosystem == Ecosystem::Npm).all(|h| h.allows(version))
+            && self.other_reqs.get(name).and_then(|m| m.get(version)).into_iter().flatten().all(|r| compat::check(r, env).is_ok())
     }
+}
+
+fn group_inputs<'a>(project: &Project, infos: &'a HashMap<(Ecosystem, String), Result<PackageInfo, String>>) -> GroupInputs<'a> {
+    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
     let own: HashSet<&str> = npm.iter().map(|d| d.name.as_str()).collect();
-    let mut pkgs: HashMap<String, together::Pkg> = HashMap::new();
-    let mut other_reqs: HashMap<String, HashMap<String, Vec<&Requirement>>> = HashMap::new();
+    let mut inputs = GroupInputs { pkgs: HashMap::new(), other_reqs: HashMap::new() };
     for dep in &npm {
         let Some(Ok(info)) = infos.get(&(Ecosystem::Npm, dep.name.clone())) else { continue };
         let current = dep.current.clone().unwrap_or_default();
@@ -532,15 +554,22 @@ fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result
                 Requirement::Peers { peers: list } => {
                     peers.entry(version.clone()).or_default().extend(list.iter().filter(|(n, _)| own.contains(n.as_str())).cloned());
                 }
-                other => other_reqs.entry(dep.name.clone()).or_default().entry(version.clone()).or_default().push(other),
+                other => inputs.other_reqs.entry(dep.name.clone()).or_default().entry(version.clone()).or_default().push(other),
             }
         }
-        pkgs.insert(dep.name.clone(), together::Pkg { current, versions, peers });
+        inputs.pkgs.insert(dep.name.clone(), together::Pkg { current, versions, peers });
     }
-    let allowed = |name: &str, version: &str| {
-        holds.iter().filter(|h| h.name == name && h.ecosystem == Ecosystem::Npm).all(|h| h.allows(version))
-            && other_reqs.get(name).and_then(|m| m.get(version)).into_iter().flatten().all(|r| compat::check(r, env).is_ok())
-    };
+    inputs
+}
+
+fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, env: &ProjectEnv, holds: &[&Hold]) {
+    if !project.dependencies.iter().any(|d| d.ecosystem == Ecosystem::Npm && d.newest.is_some()) {
+        return;
+    }
+    let inputs = group_inputs(project, infos);
+    let pkgs = &inputs.pkgs;
+    let allowed = |name: &str, version: &str| inputs.allowed(name, version, env, holds);
+    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
 
     let mut seeds: Vec<&str> = npm.iter().filter(|d| d.newest.is_some()).map(|d| d.name.as_str()).collect();
     seeds.sort();
@@ -550,7 +579,7 @@ fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result
         if groups.iter().any(|(_, g)| g.contains_key(seed)) {
             continue;
         }
-        let Some(found) = together::resolve(seed, &pkgs, &allowed) else { continue };
+        let Some(found) = together::resolve(seed, pkgs, &allowed) else { continue };
         match groups.iter_mut().find(|(_, g)| g.keys().any(|k| found.contains_key(k))) {
             Some((_, group)) => {
                 for (name, to) in found {
@@ -568,6 +597,115 @@ fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result
             dep.group = Some(lead.clone());
             dep.group_target = group.get(&dep.name).cloned();
         }
+    }
+}
+
+/// One published version of a package, as a particular project sees it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionView {
+    pub version: String,
+    pub prerelease: bool,
+    /// Why the project cannot use it; `None` when it can.
+    pub blocked: Option<String>,
+    pub requirements: Vec<Requirement>,
+    /// How many other packages have to move with it for it to fit.
+    pub together: usize,
+}
+
+/// A package moving as part of a chosen update.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Move {
+    pub name: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Everything the check knows about one project, from the saved answers:
+/// for looking at a package's versions and what picking one would take.
+pub struct ProjectContext {
+    project: Project,
+    infos: HashMap<(Ecosystem, String), Result<PackageInfo, String>>,
+    env: ProjectEnv,
+    limits: HashMap<String, Vec<Limit>>,
+    holds: Vec<Hold>,
+    folder: String,
+}
+
+pub async fn project_context(store: &Store, project: &Project) -> ProjectContext {
+    let infos: HashMap<(Ecosystem, String), Result<PackageInfo, String>> =
+        project.dependencies.iter().filter_map(|d| store.package_any_age(d.ecosystem, &d.name).map(|info| ((d.ecosystem, d.name.clone()), Ok(info)))).collect();
+    let installed: HashMap<String, String> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm).filter_map(|d| d.current.clone().map(|c| (d.name.clone(), c))).collect();
+    let toolchain = Toolchain::detect().await;
+    let folder = project.repo.clone().unwrap_or_else(|| project.dir.clone());
+    ProjectContext { env: project_env(project, installed, &toolchain), limits: peer_limits(project, &infos), holds: store.holds(), folder, infos, project: project.clone() }
+}
+
+impl ProjectContext {
+    /// Every published version of `name`, newest first, with whether this
+    /// project can use it and what it asks for.
+    pub fn versions(&self, name: &str) -> Option<Vec<VersionView>> {
+        let dep = self.project.dependencies.iter().find(|d| d.name == name)?;
+        let Some(Ok(info)) = self.infos.get(&(dep.ecosystem, name.to_string())) else { return None };
+        let limits = limits_for(dep, &self.limits, &self.holds, &self.folder);
+        let usable = verdict(dep, info, &self.env, &limits);
+        // A version that only clashes with packages that can move too is fine,
+        // as long as a set of versions fits together.
+        let inputs = (dep.ecosystem == Ecosystem::Npm).then(|| group_inputs(&self.project, &self.infos));
+        let installed = dep.current.as_deref().and_then(Version::parse);
+        let mut requirements: HashMap<&str, Vec<Requirement>> = HashMap::new();
+        for (v, r) in &info.requirements {
+            requirements.entry(v.as_str()).or_default().push(r.clone());
+        }
+        let mut views: Vec<(Option<Version>, VersionView)> = info
+            .versions
+            .iter()
+            .map(|v| {
+                let parsed = Version::parse(v);
+                let mut blocked = usable(v).err();
+                let mut together = 0;
+                let newer = parsed.as_ref().zip(installed.as_ref()).is_some_and(|(p, i)| p > i);
+                if let (true, Some(_), Some(inputs)) = (newer, &blocked, &inputs) {
+                    if let Ok(moves) = self.settle(inputs, name, v) {
+                        if moves.len() > 1 {
+                            blocked = None;
+                            together = moves.len() - 1;
+                        }
+                    }
+                }
+                let view = VersionView {
+                    version: v.clone(),
+                    prerelease: parsed.as_ref().is_some_and(|p| p.prerelease),
+                    blocked,
+                    requirements: requirements.get(v.as_str()).cloned().unwrap_or_default(),
+                    together,
+                };
+                (parsed, view)
+            })
+            .collect();
+        views.sort_by(|a, b| b.0.cmp(&a.0));
+        Some(views.into_iter().map(|(_, v)| v).collect())
+    }
+
+    /// What has to move for `name` to be at `version`: just itself, or the
+    /// set whose peers pin each other. `Err` says why no set fits.
+    pub fn move_with(&self, name: &str, version: &str) -> Result<Vec<Move>, String> {
+        let dep = self.project.dependencies.iter().find(|d| d.name == name).ok_or_else(|| format!("{name} is not in {}", self.project.name))?;
+        let from = |n: &str| self.project.dependencies.iter().find(|d| d.name == n).and_then(|d| d.current.clone()).unwrap_or_default();
+        if dep.ecosystem != Ecosystem::Npm {
+            return Ok(vec![Move { name: name.to_string(), from: from(name), to: version.to_string() }]);
+        }
+        self.settle(&group_inputs(&self.project, &self.infos), name, version)
+    }
+
+    fn settle(&self, inputs: &GroupInputs, name: &str, version: &str) -> Result<Vec<Move>, String> {
+        let from = |n: &str| self.project.dependencies.iter().find(|d| d.name == n).and_then(|d| d.current.clone()).unwrap_or_default();
+        let holds: Vec<&Hold> = self.holds.iter().filter(|h| h.applies_to(&self.folder)).collect();
+        let allowed = |n: &str, v: &str| inputs.allowed(n, v, &self.env, &holds);
+        let moved = together::settle(name, version, &inputs.pkgs, &allowed)
+            .ok_or_else(|| format!("No set of versions fits together with {name} {version}. Something else the project uses would have to change first."))?;
+        Ok(moved.into_iter().map(|(n, to)| Move { from: from(&n), name: n, to }).collect())
     }
 }
 

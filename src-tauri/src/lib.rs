@@ -1,8 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mehen_core::check;
 use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
 use mehen_core::store::{Hold, StoreStats};
 use mehen_core::update::{self, Change, UpdatePlan};
@@ -501,6 +502,30 @@ async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, checks: bool, commi
     Ok(BatchResult { outcomes, inventory })
 }
 
+/// A package's published versions for one project: whether each fits and
+/// what it asks for.
+#[tauri::command]
+async fn package_versions(app: AppHandle, project_id: String, name: String) -> Result<Vec<check::VersionView>, String> {
+    let store = &app.state::<AppState>().store;
+    let inventory = store.last_inventory().ok_or("Run a check first")?;
+    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
+    check::project_context(store, project).await.versions(&name).ok_or_else(|| format!("Mehen has no version list for {name} yet. Check again first."))
+}
+
+/// What else has to move for `name` to go to `version` in one project.
+#[tauri::command]
+async fn move_with(app: AppHandle, project_id: String, name: String, version: String) -> Result<Vec<check::Move>, String> {
+    let store = &app.state::<AppState>().store;
+    let inventory = store.last_inventory().ok_or("Run a check first")?;
+    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
+    check::project_context(store, project).await.move_with(&name, &version)
+}
+
+#[tauri::command]
+async fn release_dates(ecosystem: Ecosystem, name: String) -> Result<HashMap<String, String>, String> {
+    mehen_core::registry::release_dates(&mehen_core::registry::http_client(), ecosystem, &name).await.map_err(|e| format!("{e:#}"))
+}
+
 #[tauri::command]
 fn store_stats(state: State<'_, AppState>) -> Result<StoreStats, String> {
     state.store.stats().map_err(err)
@@ -578,6 +603,9 @@ pub fn run() {
             version_policy,
             set_version_policy,
             store_stats,
+            package_versions,
+            move_with,
+            release_dates,
             clear_cache,
             open_in_editor,
             self_update::check_self_update,
