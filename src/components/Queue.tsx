@@ -1,4 +1,4 @@
-import { ArrowDownUp, ChevronDown, Info, Pin, Plus, ShieldAlert, X } from 'lucide-react'
+import { ArrowDownUp, ChevronDown, Info, Link2, Pin, Plus, ShieldAlert, X } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type InputHTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, ECOSYSTEMS, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, repoKey, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
 import type { Ecosystem, Hold } from '../types'
@@ -359,6 +359,20 @@ export function Queue({
                     <b className="truncate text-[13px] font-semibold">{row.name}</b>
                     <small className="flex flex-wrap items-center gap-x-2.5 font-mono text-[12px] text-muted">
                       {ECOSYSTEM_LABEL[row.ecosystem]}
+                      {(() => {
+                        const partners = [...new Set(usages.flatMap((u) => u.together))]
+                        return (
+                          partners.length > 0 && (
+                            <span
+                              className="inline-flex items-center gap-1 font-sans text-[12px] text-state"
+                              title={`Its newer versions need these to move too, so they are picked together:\n${partners.join('\n')}`}
+                            >
+                              <Link2 size={12} />
+                              moves with {partners.length} other{partners.length === 1 ? '' : 's'}
+                            </span>
+                          )
+                        )
+                      })()}
                       {holdsOf(row).map((h) => (
                         <span key={h.id} className="inline-flex items-center gap-1 font-sans text-[12px] text-state" title={`Kept on ${h.line}.x ${h.scope === '*' ? 'in every project' : `in ${nameOf(h.scope)}`}`}>
                           <Pin size={12} />
@@ -383,7 +397,7 @@ export function Queue({
                       {targets.at(-1)}
                     </code>
                     {(() => {
-                      const blocked = usages.filter((u) => u.dep.newest && u.dep.blockedReason)
+                      const blocked = usages.filter((u) => u.dep.newest && u.dep.blockedReason && u.dep.newest !== u.target)
                       if (!blocked.length) return null
                       const newest = distinctVersions(blocked.map((u) => u.dep.newest!)).at(-1)
                       const reasons = [...new Set(blocked.map((u) => reasonText(u.dep.blockedReason!)))]

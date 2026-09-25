@@ -2,7 +2,7 @@
 //! Every network answer goes through the SQLite store, so only stale entries
 //! are fetched.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use crate::model::{AffectedRange, CheckStats, Dependency, Ecosystem, Inventory, 
 use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Hold, Store};
+use crate::together;
 use crate::version::{Version, compare, from_spec, max_version, safe_target, patch_target};
 
 const LOOKUP_CONCURRENCY: usize = 24;
@@ -153,6 +154,8 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
             );
             apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env, &own);
         }
+        let project_holds: Vec<&Hold> = holds.iter().filter(|h| h.applies_to(&folder)).collect();
+        set_groups(project, &infos, &env, &project_holds);
     }
 
     progress(Progress { phase: "Checking for vulnerabilities".into(), done: 0, total: 1 });
@@ -258,6 +261,8 @@ fn reset(dep: &mut Dependency) {
     dep.newest = None;
     dep.blocked_reason = None;
     dep.fix_target = None;
+    dep.group = None;
+    dep.group_target = None;
     dep.vulns.clear();
     dep.approximate = false;
     if dep.status == Status::Local {
@@ -502,6 +507,68 @@ fn merge_aliases(vulns: Vec<Vulnerability>, inventory: &mut Inventory) -> Vec<Vu
         dep.vulns = renamed;
     }
     merged
+}
+
+/// Finds npm packages held back only because others must move with them
+/// (Angular's parts pin each other) and marks each group's members with
+/// where they go together. Holds and runtime limits (Node and the like)
+/// still count; peers are what the search works out.
+fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, env: &ProjectEnv, holds: &[&Hold]) {
+    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
+    if !npm.iter().any(|d| d.newest.is_some()) {
+        return;
+    }
+    let own: HashSet<&str> = npm.iter().map(|d| d.name.as_str()).collect();
+    let mut pkgs: HashMap<String, together::Pkg> = HashMap::new();
+    let mut other_reqs: HashMap<String, HashMap<String, Vec<&Requirement>>> = HashMap::new();
+    for dep in &npm {
+        let Some(Ok(info)) = infos.get(&(Ecosystem::Npm, dep.name.clone())) else { continue };
+        let current = dep.current.clone().unwrap_or_default();
+        let versions = together::candidates(&current, &info.versions);
+        let wanted: HashSet<&str> = versions.iter().map(String::as_str).collect();
+        let mut peers: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (version, requirement) in info.requirements.iter().filter(|(v, _)| wanted.contains(v.as_str())) {
+            match requirement {
+                Requirement::Peers { peers: list } => {
+                    peers.entry(version.clone()).or_default().extend(list.iter().filter(|(n, _)| own.contains(n.as_str())).cloned());
+                }
+                other => other_reqs.entry(dep.name.clone()).or_default().entry(version.clone()).or_default().push(other),
+            }
+        }
+        pkgs.insert(dep.name.clone(), together::Pkg { current, versions, peers });
+    }
+    let allowed = |name: &str, version: &str| {
+        holds.iter().filter(|h| h.name == name && h.ecosystem == Ecosystem::Npm).all(|h| h.allows(version))
+            && other_reqs.get(name).and_then(|m| m.get(version)).into_iter().flatten().all(|r| compat::check(r, env).is_ok())
+    };
+
+    let mut seeds: Vec<&str> = npm.iter().filter(|d| d.newest.is_some()).map(|d| d.name.as_str()).collect();
+    seeds.sort();
+    seeds.dedup();
+    let mut groups: Vec<(String, BTreeMap<String, String>)> = Vec::new();
+    for seed in seeds {
+        if groups.iter().any(|(_, g)| g.contains_key(seed)) {
+            continue;
+        }
+        let Some(found) = together::resolve(seed, &pkgs, &allowed) else { continue };
+        match groups.iter_mut().find(|(_, g)| g.keys().any(|k| found.contains_key(k))) {
+            Some((_, group)) => {
+                for (name, to) in found {
+                    let keep = group.get(&name).is_some_and(|have| Version::parse(have) >= Version::parse(&to));
+                    if !keep {
+                        group.insert(name, to);
+                    }
+                }
+            }
+            None => groups.push((seed.to_string(), found)),
+        }
+    }
+    for dep in project.dependencies.iter_mut().filter(|d| d.ecosystem == Ecosystem::Npm) {
+        if let Some((lead, group)) = groups.iter().find(|(_, g)| g.contains_key(&dep.name)) {
+            dep.group = Some(lead.clone());
+            dep.group_target = group.get(&dep.name).cloned();
+        }
+    }
 }
 
 fn set_fix_targets(inventory: &mut Inventory, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, vulns: &[Vulnerability]) {

@@ -109,6 +109,12 @@ pub struct Dependency {
     /// the lowest line no advisory covers (15.1.3 when 16.x is also safe).
     #[serde(default)]
     pub fix_target: Option<String>,
+    /// Can only move together with other packages (a framework's parts):
+    /// the package that leads the group, and where this one goes with it.
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub group_target: Option<String>,
     pub status: Status,
     pub vulns: Vec<String>,
     pub note: Option<String>,
@@ -132,6 +138,8 @@ impl Dependency {
             newest: None,
             blocked_reason: None,
             fix_target: None,
+            group: None,
+            group_target: None,
             status: Status::Pending,
             vulns: Vec::new(),
             note: None,

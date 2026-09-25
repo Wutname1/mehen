@@ -19,6 +19,7 @@ pub mod registry;
 pub mod ruby;
 pub mod scan;
 pub mod store;
+pub mod together;
 pub mod update;
 pub mod version;
 

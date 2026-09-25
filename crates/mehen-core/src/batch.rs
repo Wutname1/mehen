@@ -81,6 +81,8 @@ pub struct JobOutcome {
     pub commit_skipped: Option<String>,
     /// Dependency conflicts the package managers reported along the way.
     pub conflicts: Vec<Conflict>,
+    /// Anything worth knowing about how it went, like a clean install.
+    pub notes: Vec<String>,
 }
 
 /// One repository's share of the batch.
@@ -152,6 +154,60 @@ pub struct CommitOutcome {
     pub name: String,
     pub committed: Option<String>,
     pub error: Option<String>,
+}
+
+/// Where this install may start clean: the job's `clean_retry` paths that
+/// sit in the folder the step runs in.
+fn clean_retry_paths(job: &Job, step: &Step) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = job
+        .plans
+        .iter()
+        .flat_map(|p| &p.clean_retry)
+        .map(PathBuf::from)
+        .filter(|p| p.parent().is_some_and(|d| d.display().to_string().eq_ignore_ascii_case(&step.cwd)))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Renames each existing path to `<path>.mehen-aside`; returns what moved.
+fn set_aside(paths: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
+    let mut moved = Vec::new();
+    for path in paths.iter().filter(|p| p.exists()) {
+        let aside = PathBuf::from(format!("{}.mehen-aside", path.display()));
+        remove_path(&aside);
+        if std::fs::rename(path, &aside).is_ok() {
+            moved.push((path.clone(), aside));
+        }
+    }
+    moved
+}
+
+/// Undoes `set_aside`, dropping whatever the failed install left in their place.
+fn put_back(moved: Vec<(PathBuf, PathBuf)>) {
+    for (path, aside) in moved {
+        remove_path(&path);
+        let _ = std::fs::rename(&aside, &path);
+    }
+}
+
+/// The set-aside copies are no longer needed; a large `node_modules` is
+/// removed in the background.
+fn discard(moved: Vec<(PathBuf, PathBuf)>) {
+    std::thread::spawn(move || {
+        for (_, aside) in moved {
+            remove_path(&aside);
+        }
+    });
+}
+
+fn remove_path(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Commits already-applied plans, one commit per repository, as the batch
@@ -248,6 +304,7 @@ where
         commit_error: None,
         commit_skipped: None,
         conflicts: Vec::new(),
+        notes: Vec::new(),
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -308,7 +365,21 @@ where
         };
         on_event(job.event(JobState::Running, Some(step.label.clone()), Some(lane.clone())));
         let started = Instant::now();
-        let (ok, output) = run_step(step.clone()).await;
+        let (mut ok, mut output) = run_step(step.clone()).await;
+        let aside = if ok || step.kind != StepKind::Install || !output.contains("ERESOLVE") { Vec::new() } else { clean_retry_paths(job, &step) };
+        if !aside.is_empty() {
+            on_event(job.event(JobState::Running, Some(format!("{} (from scratch)", step.label)), Some(lane.clone())));
+            let moved = set_aside(&aside);
+            let (retry_ok, retry_output) = run_step(step.clone()).await;
+            output = format!("{output}\n\n--- Installed again from scratch, without the old lockfile and node_modules ---\n{retry_output}");
+            if retry_ok {
+                ok = true;
+                outcome.notes.push("The old lockfile and node_modules did not fit the new versions, so they were installed from scratch.".into());
+                discard(moved);
+            } else {
+                put_back(moved);
+            }
+        }
         if let Some(ecosystem) = diagnose::ecosystem_of(&step.program) {
             let changes: Vec<PlannedChange> = job.plans.iter().filter(|p| p.ecosystem == ecosystem).flat_map(|p| p.changes.clone()).collect();
             for conflict in diagnose::diagnose(&output, ok, ecosystem, &changes) {
@@ -387,6 +458,7 @@ mod tests {
             repo: repo.map(|r| r.display().to_string()),
             commit_blocked: None,
             branch: None,
+            clean_retry: Vec::new(),
         }
     }
 
@@ -440,6 +512,34 @@ mod tests {
         for (i, x) in runs.iter().enumerate() {
             for y in &runs[i + 1..] {
                 assert!(!overlaps(x, y), "a limit of 1 still ran steps together");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_conflict_retries_the_install_from_scratch() {
+        for retry_works in [true, false] {
+            let dir = temp(if retry_works { "clean-ok" } else { "clean-fail" });
+            let mut p = plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)]);
+            std::fs::write(dir.join("package-lock.json"), "old lock").unwrap();
+            std::fs::create_dir_all(dir.join("node_modules").join("left")).unwrap();
+            p.clean_retry = vec![dir.join("package-lock.json").display().to_string(), dir.join("node_modules").display().to_string()];
+            let calls = std::cell::Cell::new(0);
+            let fake = |_s: Step| {
+                calls.set(calls.get() + 1);
+                let first = calls.get() == 1;
+                async move { if first { (false, "npm error code ERESOLVE".to_string()) } else { (retry_works, "done".to_string()) } }
+            };
+            let opts = BatchOptions { checks: false, commit: false, parallel: 1, stop_on_failure: true };
+            let outcome = run(vec![p], opts, fake, |_| {}).await.remove(0);
+            assert_eq!(calls.get(), 2, "one retry");
+            assert_eq!(outcome.ok, retry_works);
+            if retry_works {
+                assert_eq!(outcome.notes.len(), 1);
+                assert!(!dir.join("node_modules").join("left").exists(), "the retry started without the old node_modules");
+            } else {
+                assert!(dir.join("node_modules").join("left").exists(), "the old node_modules is back");
+                assert_eq!(std::fs::read_to_string(dir.join("package-lock.json")).unwrap(), "old lock");
             }
         }
     }

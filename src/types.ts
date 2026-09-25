@@ -23,6 +23,9 @@ export interface Dependency {
   blockedReason: string | null
   /** For a vulnerable package: the smallest safe update, on the lowest line no advisory covers. */
   fixTarget?: string | null
+  /** Can only move together with others (a framework's parts): the package leading the group, and where this one goes. */
+  group?: string | null
+  groupTarget?: string | null
   status: Status
   vulns: string[]
   note: string | null
@@ -244,6 +247,8 @@ export interface JobOutcome {
   commitSkipped: string | null
   /** Dependency conflicts the package managers reported along the way. */
   conflicts: Conflict[]
+  /** Anything worth knowing about how it went, like a clean install. */
+  notes?: string[]
 }
 
 export interface Conflict {

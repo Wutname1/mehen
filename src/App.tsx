@@ -379,7 +379,16 @@ export default function App() {
     })
   }
 
-  const toggleUsages = (usages: QueueUsage[]) => {
+  /** Usages with every group partner in the same project, which must be picked together. */
+  const withPartners = (usages: QueueUsage[]) => {
+    const wanted = new Set(usages.flatMap((u) => u.together.map((name) => `${u.project.id}\u0000${name}`)))
+    if (!wanted.size) return usages
+    const partners = rows.flatMap((r) => r.usages).filter((u) => wanted.has(`${u.project.id}\u0000${u.dep.name}`))
+    return [...new Map([...usages, ...partners].map((u) => [u.key, u])).values()]
+  }
+
+  const toggleUsages = (picked: QueueUsage[]) => {
+    const usages = withPartners(picked)
     setChosen((prev) => {
       if (!usages.some((u) => prev.has(u.key))) return prev
       const next = new Map(prev)

@@ -101,6 +101,11 @@ pub struct UpdatePlan {
     /// The checked-out branch, where a commit would land.
     #[serde(default)]
     pub branch: Option<String>,
+    /// Set aside and install from scratch if the install finds a peer
+    /// conflict (npm's ERESOLVE): a lockfile and `node_modules` left from
+    /// before a framework moves as a group can refuse a set that fits.
+    #[serde(default)]
+    pub clean_retry: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +165,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         repo: project.repo.clone(),
         commit_blocked: None,
         branch: None,
+        clean_retry: Vec::new(),
     };
     // One edit covers every entry with the same name and spelling (e.g. the
     // package listed in both dependencies and devDependencies).
@@ -312,6 +318,12 @@ fn push_step(plan: &mut UpdatePlan, kind: StepKind, label: &str, program: &str, 
     });
 }
 
+/// Moving to its group's version, which is below the newest it has.
+fn held_in_group(dep: &Dependency, to: &str) -> bool {
+    let newest = dep.newest.as_deref().or(dep.latest.as_deref());
+    dep.group_target.as_deref() == Some(to) && newest.is_some_and(|n| Version::parse(n) > Version::parse(to))
+}
+
 /// Keeps the operator and prefix the author used: `^18.2.0` -> `^19.1.0`.
 fn keep_prefix(old: &str, to: &str) -> Option<String> {
     if old.contains(' ') || old.contains("||") || from_spec(old).is_none() {
@@ -332,7 +344,13 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
     let before = read(manifest)?;
     let mut text = before.clone();
     for (dep, change) in deps {
-        let new_spec = keep_prefix(&dep.requested, &change.to).ok_or_else(|| anyhow!("{}: cannot rewrite the range `{}` automatically", dep.name, dep.requested))?;
+        let mut new_spec = keep_prefix(&dep.requested, &change.to).ok_or_else(|| anyhow!("{}: cannot rewrite the range `{}` automatically", dep.name, dep.requested))?;
+        // Moving with a group but kept below its newest (TypeScript at 6.0.x
+        // for Angular 22): `^` would let npm take a newer minor the group
+        // does not accept, so it stays on the patch line.
+        if held_in_group(dep, &change.to) && new_spec.starts_with('^') {
+            new_spec = format!("~{}", &new_spec[1..]);
+        }
         let re = Regex::new(&format!(r#"("{}"\s*:\s*"){}(")"#, regex::escape(&dep.name), regex::escape(&dep.requested)))?;
         text = replace_middle(&re, &text, &new_spec).ok_or_else(|| anyhow!("{}: `{}` not found in package.json", dep.name, dep.requested))?;
         plan.changes.push(PlannedChange {
@@ -352,6 +370,9 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
     match npm_manager(dir, repo) {
         Some((pm, lock_dir, lockfile)) => {
             plan.snapshots.push(lockfile.display().to_string());
+            if pm == "npm" && deps.iter().any(|(d, c)| d.group_target.as_deref() == Some(c.to.as_str())) {
+                plan.clean_retry = vec![lockfile.display().to_string(), lock_dir.join("node_modules").display().to_string()];
+            }
             let mut args = vec!["install"];
             if pm == "pnpm" {
                 args.push("--no-frozen-lockfile");
@@ -1148,6 +1169,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_group_keeps_a_held_back_member_on_its_patch_line() {
+        let dir = temp("npm-group");
+        std::fs::write(dir.join("package.json"), "{\n  \"devDependencies\": {\n    \"typescript\": \"^5.1\",\n    \"@angular/compiler-cli\": \"~16.2.12\"\n  }\n}\n").unwrap();
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        let mut ts = dep("typescript", Ecosystem::Npm, "^5.1", "5.1.6");
+        (ts.group_target, ts.newest) = (Some("6.0.3".into()), Some("7.0.2".into()));
+        let mut cli = dep("@angular/compiler-cli", Ecosystem::Npm, "~16.2.12", "16.2.12");
+        (cli.group_target, cli.latest) = (Some("22.2.0".into()), Some("22.2.0".into()));
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![ts, cli]);
+        let changes = [Change { from: None, name: "typescript".into(), to: "6.0.3".into() }, Change { from: None, name: "@angular/compiler-cli".into(), to: "22.2.0".into() }];
+        let plan = plan(&p, &changes, |_| None).unwrap();
+        assert!(plan.edits[0].after.contains("\"typescript\": \"~6.0.3\""), "npm must not take a newer 6.x: {}", plan.edits[0].after);
+        assert!(plan.edits[0].after.contains("\"@angular/compiler-cli\": \"~22.2.0\""));
+        assert_eq!(plan.clean_retry.len(), 2, "a group move may need a clean install");
     }
 
     #[test]

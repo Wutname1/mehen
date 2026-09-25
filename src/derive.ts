@@ -223,6 +223,8 @@ export interface QueueUsage {
   dep: Dependency
   /** The version this project would move to: the newest it can use. */
   target: string
+  /** Other packages in this project that must move in the same update. */
+  together: string[]
 }
 
 /** One package that has an update somewhere, with every usage that can take it. */
@@ -275,12 +277,18 @@ export function queueRows(inventory: Inventory, policies: VersionPolicies = {}):
   const rows = new Map<string, QueueRow>()
   for (const project of inventory.projects) {
     const policy = policyFor(policies, project)
+    // A framework's parts move to their group's versions, together, when
+    // the project allows major updates at all.
+    const grouped = (dep: Dependency) => (policy === 'any' && dep.group && dep.groupTarget && canRetarget(dep) ? dep.groupTarget : null)
+    const members = new Map<string, string[]>()
+    for (const dep of project.dependencies) if (grouped(dep)) members.set(dep.group!, [...(members.get(dep.group!) ?? []), dep.name])
     for (const dep of project.dependencies) {
-      const target = updateTarget(dep, policy)
+      const target = grouped(dep) ?? updateTarget(dep, policy)
       if (!target) continue
       const key = `${dep.ecosystem}:${dep.name}`
       const row = rows.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, usages: [], risk: 'patch', vulnIds: [] }
-      row.usages.push({ key: usageKey(project, dep), project, dep, target })
+      const together = grouped(dep) ? [...new Set(members.get(dep.group!) ?? [])].filter((n) => n !== dep.name) : []
+      row.usages.push({ key: usageKey(project, dep), project, dep, target, together })
       for (const id of dep.vulns) if (!row.vulnIds.includes(id)) row.vulnIds.push(id)
       rows.set(key, row)
     }
@@ -395,7 +403,8 @@ export function heldBack(projects: Project[]): HeldBack[] {
   const map = new Map<string, HeldBack>()
   for (const project of projects) {
     for (const dep of project.dependencies) {
-      if (!dep.newest || !dep.blockedReason || !dep.current) continue
+      // A group member is offered in the list, moving with the others.
+      if (!dep.newest || !dep.blockedReason || !dep.current || dep.groupTarget === dep.newest) continue
       const key = `${dep.ecosystem}:${dep.name}`
       const group = map.get(key) ?? { key, name: dep.name, ecosystem: dep.ecosystem, newest: dep.newest, entries: [] }
       if (compareVersions(dep.newest, group.newest) > 0) group.newest = dep.newest

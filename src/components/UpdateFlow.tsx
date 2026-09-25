@@ -630,6 +630,11 @@ export function UpdateFlow({
                       {warned[0].summary}.{warned.length > 1 && ` (+${warned.length - 1} more)`}
                     </span>
                   )}
+                  {(o.notes ?? []).map((note) => (
+                    <span key={note} className="mt-0.5 block text-muted">
+                      {note}
+                    </span>
+                  ))}
                 </small>
               ) : blocking.length ? (
                 <>
