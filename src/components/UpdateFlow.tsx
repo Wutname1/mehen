@@ -1,4 +1,4 @@
-import { AlertTriangle, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal } from 'lucide-react'
+import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal, X } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { bumpOf, folderName, relativePath, runLabel } from '../derive'
@@ -174,6 +174,8 @@ export function UpdateFlow({
   const [ran, setRan] = useState({ checks, commit })
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  /** Jobs asked to stop (by key, lowercased); `*` when all were. */
+  const [stopping, setStopping] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     let cancelled = false
@@ -212,8 +214,14 @@ export function UpdateFlow({
   const busy = stage === 'planning' || stage === 'running'
   const close = () => !busy && onClose(refreshed)
 
+  const cancel = (job: Job | null) => {
+    setStopping((prev) => new Set([...prev, job ? job.key.toLowerCase() : '*']))
+    api.cancelUpdate(job ? job.key : null).catch((e) => setError(String(e)))
+  }
+
   const run = async () => {
     setRan({ checks, commit })
+    setStopping(new Set())
     setStage('running')
     setError(null)
     try {
@@ -251,7 +259,8 @@ export function UpdateFlow({
 
   const outcomeOf = (job: Job) => outcomes.find((o) => o.projects.some((id) => job.plans.some((p) => p.projectId === id)))
   const passed = jobs.filter((j) => outcomeOf(j)?.ok)
-  const broke = jobs.filter((j) => outcomeOf(j) && !outcomeOf(j)!.ok)
+  const broke = jobs.filter((j) => outcomeOf(j) && !outcomeOf(j)!.ok && !outcomeOf(j)!.cancelled)
+  const stopped = jobs.filter((j) => outcomeOf(j)?.cancelled)
   const commitOf = (job: Job) => commits.find((c) => c.job.toLowerCase() === job.key.toLowerCase())
   const committable = passed.filter((j) => !j.blocked && !outcomeOf(j)?.committed && !commitOf(j)?.committed)
 
@@ -485,28 +494,49 @@ export function UpdateFlow({
         size="wide"
         busy
         onClose={close}
-        footer={<span className="mr-auto text-[12.5px] text-muted">Working. This window closes when you choose, once everything is done.</span>}
+        footer={
+          <>
+            <span className="mr-auto text-[12.5px] text-muted">{stopping.has('*') ? 'Stopping and putting files back…' : 'Working. This window closes when you choose, once everything is done.'}</span>
+            {!outcomes.length && (
+              <Button onClick={() => cancel(null)} disabled={stopping.has('*')} title="Stop every project that has not finished and put its files back">
+                <Ban size={15} />
+                {stopping.has('*') ? 'Cancelling…' : 'Cancel all'}
+              </Button>
+            )}
+          </>
+        }
       >
         {jobs.map((job) => {
           const states = job.plans.map((p) => live[p.projectId.toLowerCase()]).filter(Boolean)
           const now = states.find((s) => s.state === 'running' || s.state === 'committing') ?? states.find((s) => s.state === 'waiting') ?? states[0]
           const state = now?.state ?? 'queued'
+          const asked = stopping.has('*') || stopping.has(job.key.toLowerCase())
+          const stoppable = !outcomes.length && (state === 'queued' || state === 'waiting' || state === 'running')
           return (
-            <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-center gap-2.5 border-b border-line py-2.5">
+            <div key={job.key} className="grid grid-cols-[24px_1fr_auto_28px] items-center gap-2.5 border-b border-line py-2.5">
               <Avatar name={job.name} repo={job.key} />
               <span className="flex min-w-0 flex-col">
                 <b className="text-[13px]">{job.name}</b>
-                <small className="truncate text-[12px] text-muted">{state === 'queued' ? `${changesOf(job).length} package${changesOf(job).length === 1 ? '' : 's'}` : (now?.label ?? '')}</small>
+                <small className="truncate text-[12px] text-muted">{state === 'queued' ? `${changesOf(job).length} package${changesOf(job).length === 1 ? '' : 's'}` : state === 'cancelled' ? 'Files put back' : (now?.label ?? '')}</small>
               </span>
               {state === 'done' ? (
                 <StateChip tone="ok">
                   <Check size={14} />
                   Done
                 </StateChip>
+              ) : state === 'cancelled' ? (
+                <StateChip tone="wait">
+                  <Ban size={14} />
+                  Cancelled
+                </StateChip>
               ) : state === 'failed' || state === 'rolled-back' ? (
                 <StateChip tone="fail">
                   <AlertTriangle size={14} />
                   Failed
+                </StateChip>
+              ) : asked ? (
+                <StateChip tone="wait" spin>
+                  Cancelling
                 </StateChip>
               ) : state === 'running' || state === 'committing' ? (
                 <StateChip tone="run" spin>
@@ -514,6 +544,19 @@ export function UpdateFlow({
                 </StateChip>
               ) : (
                 <StateChip tone="wait">Waiting</StateChip>
+              )}
+              {stoppable && !asked ? (
+                <button
+                  type="button"
+                  onClick={() => cancel(job)}
+                  aria-label={`Cancel ${job.name}`}
+                  title={`Stop ${job.name} and put its files back`}
+                  className="grid size-7 place-items-center rounded-[3px] text-muted hover:bg-sunken hover:text-ink"
+                >
+                  <X size={15} />
+                </button>
+              ) : (
+                <span />
               )}
             </div>
           )
@@ -565,7 +608,7 @@ export function UpdateFlow({
   const anyCommitted = passed.some((j) => outcomeOf(j)?.committed || commitOf(j)?.committed)
   return (
     <Dialog
-      title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : 'Update finished'}
+      title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : stopped.length && !passed.length ? 'Update cancelled' : 'Update finished'}
       description={
         anyCommitted ? 'Each committed project has a new local commit. Nothing was pushed.' : passed.length ? 'Changed files are ready to commit. Nothing has been committed yet.' : 'Nothing on disk was changed.'
       }
@@ -593,18 +636,28 @@ export function UpdateFlow({
         <div
           className={cx(
             'mb-2 flex items-center gap-3 rounded-[3px] px-3.5 py-3',
-            broke.length || (!ran.checks && !filesOnly) ? 'bg-[color-mix(in_oklab,var(--risk-review)_12%,transparent)]' : 'bg-[color-mix(in_oklab,var(--ok)_12%,transparent)]',
+            broke.length || stopped.length || (!ran.checks && !filesOnly) ? 'bg-[color-mix(in_oklab,var(--risk-review)_12%,transparent)]' : 'bg-[color-mix(in_oklab,var(--ok)_12%,transparent)]',
           )}
         >
-          {broke.length || (!ran.checks && !filesOnly) ? <AlertTriangle size={22} className="shrink-0 text-risk-review" /> : <ShieldCheck size={22} className="shrink-0 text-ok" />}
+          {stopped.length && !broke.length ? (
+            <Ban size={22} className="shrink-0 text-muted" />
+          ) : broke.length || (!ran.checks && !filesOnly) ? (
+            <AlertTriangle size={22} className="shrink-0 text-risk-review" />
+          ) : (
+            <ShieldCheck size={22} className="shrink-0 text-ok" />
+          )}
           <div>
             <b className="block text-[14px]">
-              {broke.length ? `${passed.length} of ${total} projects updated` : `${total} project${total === 1 ? '' : 's'} updated${anyCommitted ? ' and committed' : ''}`}
+              {broke.length || stopped.length
+                ? `${passed.length} of ${total} project${total === 1 ? '' : 's'} updated${stopped.length ? `, ${stopped.length} cancelled` : ''}`
+                : `${total} project${total === 1 ? '' : 's'} updated${anyCommitted ? ' and committed' : ''}`}
             </b>
             <span className="text-[12.5px] text-muted">
               {broke.length
                 ? `${broke.map((j) => j.name).join(', ')} could not be updated and ${broke.length === 1 ? 'was' : 'were'} put back as ${broke.length === 1 ? 'it was' : 'they were'}.`
-                : filesOnly
+                : stopped.length
+                  ? `Cancelled ${stopped.length === 1 ? 'project is' : 'projects are'} back as ${stopped.length === 1 ? 'it was' : 'they were'}.`
+                  : filesOnly
                   ? 'Workflow files updated. They take effect the next time your CI runs.'
                   : ran.checks
                   ? 'Every build and test passed.'
@@ -631,7 +684,9 @@ export function UpdateFlow({
             <Avatar name={job.name} repo={job.key} />
             <span className="flex min-w-0 flex-col gap-0.5">
               <b className="text-[13px]">{job.name}</b>
-              {o.ok ? (
+              {o.cancelled ? (
+                <small className="text-[12px] text-muted">{o.rolledBack ? 'Cancelled. Files put back as they were; the updates are still selected.' : o.error}</small>
+              ) : o.ok ? (
                 <small className="text-[12px] text-muted">
                   {changes.map((ch) => `${ch.name} ${ch.to}`).join(', ')}
                   {hash && ` · committed ${hash}${job.branch ? ` on ${job.branch}` : ''}`}
@@ -711,6 +766,11 @@ export function UpdateFlow({
                   </Button>
                 )}
               </span>
+            ) : o.cancelled ? (
+              <StateChip tone="wait">
+                <Ban size={14} />
+                Cancelled
+              </StateChip>
             ) : (
               <StateChip tone="fail">
                 <RotateCcw size={14} />

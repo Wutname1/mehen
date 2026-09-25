@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mehen_core::cancel::Cancels;
 use mehen_core::check;
 use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcome};
 use mehen_core::status::{self, Fresh};
@@ -40,6 +42,8 @@ struct AppState {
     store: Store,
     /// Set while a check runs, so background and manual checks never overlap.
     checking: AtomicBool,
+    /// Stop switches for the update running now.
+    cancels: std::sync::Mutex<Arc<Cancels>>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -513,7 +517,9 @@ struct BatchResult {
 async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: bool, commit: bool, stop_on_failure: Option<bool>) -> Result<BatchResult, String> {
     let parallel = app.state::<AppState>().update_parallel();
     let options = BatchOptions { build, test, commit, parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
-    let outcomes = batch::run(plans, options, |step| async move { update::run_step(&step).await }, |e: BatchEvent| {
+    let cancels = Arc::new(Cancels::default());
+    *app.state::<AppState>().cancels.lock().unwrap_or_else(|e| e.into_inner()) = cancels.clone();
+    let outcomes = batch::run(plans, options, &cancels, |step, cancel| async move { update::run_step(&step, &cancel).await }, |e: BatchEvent| {
         let _ = app.emit("mehen://batch", e);
     })
     .await;
@@ -543,6 +549,12 @@ async fn move_with(app: AppHandle, project_id: String, name: String, version: St
 #[tauri::command]
 async fn release_dates(ecosystem: Ecosystem, name: String) -> Result<HashMap<String, String>, String> {
     mehen_core::registry::release_dates(&mehen_core::registry::http_client(), ecosystem, &name).await.map_err(|e| format!("{e:#}"))
+}
+
+/// Stops one repository's update (`job`), or all of them.
+#[tauri::command]
+fn cancel_update(state: State<'_, AppState>, job: Option<String>) {
+    state.cancels.lock().unwrap_or_else(|e| e.into_inner()).cancel(job.as_deref());
 }
 
 #[tauri::command]
@@ -598,7 +610,7 @@ pub fn run() {
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("mehen.db");
             let store = Store::open(&db).map_err(|e| e.to_string())?;
-            app.manage(AppState { store, checking: AtomicBool::new(false) });
+            app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default() });
             build_tray(app)?;
             start_background_loop(app.handle().clone());
             gitwyrm::set_pending(gitwyrm::repo_from_args(std::env::args()));
@@ -628,6 +640,7 @@ pub fn run() {
             scan_and_check,
             plan_update,
             apply_batch,
+            cancel_update,
             check_commands,
             set_check_commands,
             commit_update,

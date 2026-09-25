@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use yaml_rust2::YamlLoader;
 
+use crate::cancel::Cancel;
 use crate::model::{Dependency, Ecosystem, Project, Status};
 use crate::registry::PackageInfo;
 use crate::version::{Version, from_spec};
@@ -1046,24 +1047,61 @@ pub(crate) fn resolve_program(program: &str) -> PathBuf {
 }
 
 /// Runs one step and returns whether it succeeded plus the end of its output.
-pub async fn run_step(step: &Step) -> (bool, String) {
+/// Cancelling stops the step and everything it started.
+pub async fn run_step(step: &Step, cancel: &Cancel) -> (bool, String) {
+    use std::process::Stdio;
     let mut cmd = tokio::process::Command::new(resolve_program(&step.program));
     cmd.args(&step.args);
-    cmd.current_dir(&step.cwd).kill_on_drop(true).stdin(std::process::Stdio::null());
+    cmd.current_dir(&step.cwd).kill_on_drop(true).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if step.kind == StepKind::Test {
         // Test runners that watch for changes by default run once under CI.
         cmd.env("CI", "true");
     }
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
+    // Its own process group, so stopping it reaches what it starts.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
-    match tokio::time::timeout(STEP_TIMEOUT, cmd.output()).await {
-        Err(_) => (false, format!("Timed out after {} minutes", STEP_TIMEOUT.as_secs() / 60)),
-        Ok(Err(e)) => (false, format!("Could not start `{}`: {e}", step.program)),
-        Ok(Ok(out)) => {
-            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-            (out.status.success(), text)
-        }
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return (false, format!("Could not start `{}`: {e}", step.program)),
+    };
+    let pid = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let text = |out: &std::process::Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stopped = tokio::select! {
+        done = tokio::time::timeout(STEP_TIMEOUT, &mut output) => match done {
+            Ok(Ok(out)) => return (out.status.success(), text(&out)),
+            Ok(Err(e)) => return (false, format!("`{}` failed to run: {e}", step.program)),
+            Err(_) => format!("Timed out after {} minutes", STEP_TIMEOUT.as_secs() / 60),
+        },
+        _ = cancel.cancelled() => "Cancelled.".to_string(),
+    };
+    if let Some(pid) = pid {
+        kill_tree(pid).await;
+    }
+    // What it printed before it was stopped.
+    let partial = match tokio::time::timeout(Duration::from_secs(15), &mut output).await {
+        Ok(Ok(out)) => text(&out),
+        _ => String::new(),
+    };
+    (false, format!("{partial}\n\n{stopped}").trim_start().to_string())
+}
+
+/// Stops a process and every process it started: a package manager runs
+/// through a shell, and stopping only the shell leaves the install running.
+async fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(0x0800_0000);
+        let _ = cmd.output().await;
+    }
+    #[cfg(unix)]
+    {
+        let _ = tokio::process::Command::new("kill").args(["-KILL", &format!("-{pid}")]).output().await;
     }
 }
 
@@ -1116,7 +1154,7 @@ pub async fn apply(plan: &UpdatePlan, run_verify: bool, commit_message: Option<&
         }
         on_event(UpdateEvent { index, label: step.label.clone(), state: "running".into() });
         let started = Instant::now();
-        let (ok, output) = run_step(step).await;
+        let (ok, output) = run_step(step, &Cancel::default()).await;
         let output = tail(&output);
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output, ms: started.elapsed().as_millis() as u64 });
         on_event(UpdateEvent { index, label: step.label.clone(), state: if ok { "ok" } else { "failed" }.into() });

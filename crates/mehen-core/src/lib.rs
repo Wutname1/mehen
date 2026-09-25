@@ -3,6 +3,7 @@
 //! desktop app today, a VS Code extension later) only call `scan` and `check`.
 
 pub mod batch;
+pub mod cancel;
 pub mod check;
 pub mod compat;
 pub mod dart;

@@ -13,6 +13,7 @@ use futures::future::join_all;
 use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 
+use crate::cancel::{Cancel, Cancels};
 use crate::diagnose::{self, Conflict};
 use crate::update::{self, PlannedChange, Step, StepKind, StepResult, UpdatePlan};
 
@@ -49,6 +50,8 @@ pub enum JobState {
     Done,
     Failed,
     RolledBack,
+    /// Stopped on request, with its files put back.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +76,8 @@ pub struct JobOutcome {
     pub projects: Vec<String>,
     pub ok: bool,
     pub rolled_back: bool,
+    /// Stopped on request rather than failed.
+    pub cancelled: bool,
     pub error: Option<String>,
     pub steps: Vec<StepResult>,
     /// Short hash of the commit made for this repository.
@@ -261,11 +266,14 @@ pub fn group(plans: Vec<UpdatePlan>) -> Vec<Job> {
     jobs
 }
 
+const CANCELLED: &str = "Cancelled";
+
 /// Runs every plan. `run_step` executes one command (tests pass a fake);
-/// `on_event` reports progress per repository.
-pub async fn run<R, F, E>(plans: Vec<UpdatePlan>, options: BatchOptions, run_step: R, on_event: E) -> Vec<JobOutcome>
+/// `on_event` reports progress per repository. A job stops, and its files
+/// are put back, when its switch in `cancels` is thrown.
+pub async fn run<R, F, E>(plans: Vec<UpdatePlan>, options: BatchOptions, cancels: &Cancels, run_step: R, on_event: E) -> Vec<JobOutcome>
 where
-    R: Fn(Step) -> F,
+    R: Fn(Step, Cancel) -> F,
     F: Future<Output = (bool, String)>,
     E: Fn(BatchEvent),
 {
@@ -276,20 +284,22 @@ where
     for job in &jobs {
         on_event(job.event(JobState::Queued, None, None));
     }
-    join_all(jobs.iter().zip(steps).map(|(job, steps)| run_job(job, steps, options, &lanes, &limit, &run_step, &on_event))).await
+    join_all(jobs.iter().zip(steps).map(|(job, steps)| run_job(job, steps, options, cancels.job(&job.key), &lanes, &limit, &run_step, &on_event))).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_job<R, F, E>(
     job: &Job,
     steps: Vec<Step>,
     options: BatchOptions,
+    cancel: Cancel,
     lanes: &HashMap<String, Mutex<()>>,
     limit: &Semaphore,
     run_step: &R,
     on_event: &E,
 ) -> JobOutcome
 where
-    R: Fn(Step) -> F,
+    R: Fn(Step, Cancel) -> F,
     F: Future<Output = (bool, String)>,
     E: Fn(BatchEvent),
 {
@@ -300,6 +310,7 @@ where
         projects: job.projects(),
         ok: false,
         rolled_back: false,
+        cancelled: false,
         error: None,
         steps: Vec::new(),
         committed: None,
@@ -312,6 +323,13 @@ where
         outcome.error = Some(error.clone());
         on_event(job.event(JobState::Failed, Some(error), None));
     };
+
+    if cancel.is_cancelled() {
+        outcome.cancelled = true;
+        outcome.error = Some(CANCELLED.into());
+        on_event(job.event(JobState::Cancelled, None, None));
+        return outcome;
+    }
 
     for edit in job.plans.iter().flat_map(|p| &p.edits) {
         match std::fs::read_to_string(&edit.path) {
@@ -330,6 +348,8 @@ where
     let paths = job.touched_paths();
     let snapshots = update::snapshot(&paths);
     let roll_back = |outcome: &mut JobOutcome, reason: String| {
+        outcome.cancelled = cancel.is_cancelled();
+        let reason = if outcome.cancelled { CANCELLED.to_string() } else { reason };
         match update::restore(&snapshots) {
             Ok(()) => outcome.rolled_back = true,
             Err(e) => outcome.error = Some(format!("{reason}. Restoring files also failed: {e}")),
@@ -337,7 +357,12 @@ where
         if outcome.error.is_none() {
             outcome.error = Some(reason.clone());
         }
-        on_event(job.event(if outcome.rolled_back { JobState::RolledBack } else { JobState::Failed }, Some(reason), None));
+        let state = match (outcome.cancelled, outcome.rolled_back) {
+            (true, true) => JobState::Cancelled,
+            (_, true) => JobState::RolledBack,
+            _ => JobState::Failed,
+        };
+        on_event(job.event(state, Some(reason), None));
     };
 
     for edit in job.plans.iter().flat_map(|p| &p.edits) {
@@ -355,24 +380,36 @@ where
             Ok(guard) => guard,
             Err(_) => {
                 on_event(job.event(JobState::Waiting, Some(format!("Waiting for {lane}")), Some(lane.clone())));
-                lane_lock.lock().await
+                tokio::select! {
+                    guard = lane_lock.lock() => guard,
+                    _ = cancel.cancelled() => {
+                        roll_back(&mut outcome, CANCELLED.into());
+                        return outcome;
+                    }
+                }
             }
         };
         let _permit = match limit.try_acquire() {
             Ok(permit) => permit,
             Err(_) => {
                 on_event(job.event(JobState::Waiting, Some("Waiting for a free slot".into()), Some(lane.clone())));
-                limit.acquire().await.expect("the batch semaphore is never closed")
+                tokio::select! {
+                    permit = limit.acquire() => permit.expect("the batch semaphore is never closed"),
+                    _ = cancel.cancelled() => {
+                        roll_back(&mut outcome, CANCELLED.into());
+                        return outcome;
+                    }
+                }
             }
         };
         on_event(job.event(JobState::Running, Some(step.label.clone()), Some(lane.clone())));
         let started = Instant::now();
-        let (mut ok, mut output) = run_step(step.clone()).await;
-        let aside = if ok || step.kind != StepKind::Install || !output.contains("ERESOLVE") { Vec::new() } else { clean_retry_paths(job, &step) };
+        let (mut ok, mut output) = run_step(step.clone(), cancel.clone()).await;
+        let aside = if ok || cancel.is_cancelled() || step.kind != StepKind::Install || !output.contains("ERESOLVE") { Vec::new() } else { clean_retry_paths(job, &step) };
         if !aside.is_empty() {
             on_event(job.event(JobState::Running, Some(format!("{} (from scratch)", step.label)), Some(lane.clone())));
             let moved = set_aside(&aside);
-            let (retry_ok, retry_output) = run_step(step.clone()).await;
+            let (retry_ok, retry_output) = run_step(step.clone(), cancel.clone()).await;
             output = format!("{output}\n\n--- Installed again from scratch, without the old lockfile and node_modules ---\n{retry_output}");
             if retry_ok {
                 ok = true;
@@ -391,6 +428,10 @@ where
             }
         }
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output: update::tail(&output), ms: started.elapsed().as_millis() as u64 });
+        if cancel.is_cancelled() {
+            roll_back(&mut outcome, CANCELLED.into());
+            return outcome;
+        }
         if !ok {
             if step.kind.is_check() && !options.stop_on_failure {
                 failed_checks.push(step.label.clone());
@@ -406,6 +447,10 @@ where
         return outcome;
     }
 
+    if cancel.is_cancelled() {
+        roll_back(&mut outcome, CANCELLED.into());
+        return outcome;
+    }
     outcome.ok = true;
     if options.commit {
         match (job.commit_blocked(), &job.repo) {
@@ -467,8 +512,8 @@ mod tests {
     type Log = RefCell<Vec<(String, Instant, Instant)>>;
 
     /// Records when each step ran, by lane; `fails` names a program that fails.
-    fn recorder<'a>(log: &'a Log, fails: &'a str) -> impl Fn(Step) -> std::pin::Pin<Box<dyn Future<Output = (bool, String)> + 'a>> + 'a {
-        move |s: Step| {
+    fn recorder<'a>(log: &'a Log, fails: &'a str) -> impl Fn(Step, Cancel) -> std::pin::Pin<Box<dyn Future<Output = (bool, String)> + 'a>> + 'a {
+        move |s: Step, _: Cancel| {
             Box::pin(async move {
                 let start = Instant::now();
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -499,7 +544,7 @@ mod tests {
 
         let log = Log::default();
         let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true };
-        let outcomes = run(plans(), opts, recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans(), opts, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok));
         let runs = log.borrow();
         let npm: Vec<_> = runs.iter().filter(|r| r.0 == "npm").collect();
@@ -509,7 +554,7 @@ mod tests {
 
         let log = Log::default();
         let opts = BatchOptions { parallel: 1, ..opts };
-        run(plans(), opts, recorder(&log, ""), |_| {}).await;
+        run(plans(), opts, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         let runs = log.borrow();
         for (i, x) in runs.iter().enumerate() {
             for y in &runs[i + 1..] {
@@ -527,13 +572,13 @@ mod tests {
             std::fs::create_dir_all(dir.join("node_modules").join("left")).unwrap();
             p.clean_retry = vec![dir.join("package-lock.json").display().to_string(), dir.join("node_modules").display().to_string()];
             let calls = std::cell::Cell::new(0);
-            let fake = |_s: Step| {
+            let fake = |_s: Step, _: Cancel| {
                 calls.set(calls.get() + 1);
                 let first = calls.get() == 1;
                 async move { if first { (false, "npm error code ERESOLVE".to_string()) } else { (retry_works, "done".to_string()) } }
             };
             let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
-            let outcome = run(vec![p], opts, fake, |_| {}).await.remove(0);
+            let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
             assert_eq!(calls.get(), 2, "one retry");
             assert_eq!(outcome.ok, retry_works);
             if retry_works {
@@ -553,7 +598,7 @@ mod tests {
         let output = "npm error Could not resolve dependency:
 npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
-        let outcomes = run(plans, opts, |_| async move { (false, output.to_string()) }, |_| {}).await;
+        let outcomes = run(plans, opts, &Cancels::default(), |_, _| async move { (false, output.to_string()) }, |_| {}).await;
         let conflicts = &outcomes[0].conflicts;
         assert!(outcomes[0].rolled_back);
         assert_eq!(conflicts.len(), 1);
@@ -582,7 +627,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(kinds(true, false), [StepKind::Install, StepKind::Install, StepKind::Verify], "the build without tests");
 
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(log.borrow().len(), 2);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "after");
@@ -601,7 +646,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         ];
         let events = RefCell::new(Vec::new());
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
         let bad_outcome = outcomes.iter().find(|o| o.name == "bad").unwrap();
         assert!(!bad_outcome.ok && bad_outcome.rolled_back, "{:?}", bad_outcome.error);
         assert_eq!(std::fs::read_to_string(bad.join("Cargo.toml")).unwrap(), "before");
@@ -624,7 +669,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         git(&["commit", "-q", "-m", "init"]);
 
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![]), plan(&dir, "app.csproj", Some(&dir), vec![])];
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, parallel: 2, stop_on_failure: true }, |_| async { (true, String::new()) }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, parallel: 2, stop_on_failure: true }, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await;
         assert!(outcomes[0].committed.is_some(), "{:?}", outcomes[0].commit_error);
         let log = String::from_utf8(git(&["log", "-1", "--format=%s%n%b"]).stdout).unwrap();
         assert!(log.starts_with("Updated 2 Dependencies"), "{log}");
@@ -639,7 +684,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("vitest", StepKind::Verify, &dir), step("npm", StepKind::Test, &dir)])];
         let log = Log::default();
         let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: false };
-        let outcomes = run(plans, opts, recorder(&log, "vitest"), |_| {}).await;
+        let outcomes = run(plans, opts, &Cancels::default(), recorder(&log, "vitest"), |_| {}).await;
         assert_eq!(log.borrow().len(), 3, "the test step still ran after the build failed");
         assert!(!outcomes[0].ok && outcomes[0].rolled_back);
         assert!(outcomes[0].error.as_deref().is_some_and(|e| e.contains("vitest")), "{:?}", outcomes[0].error);
@@ -662,8 +707,67 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let npm = Step { kind: StepKind::Install, label: "npm version".into(), program: "npm".into(), args: vec!["--version".into()], cwd: d.display().to_string() };
         let plans = vec![plan(&a, "package.json", None, vec![sleep(&a)]), plan(&b, "package.json", None, vec![sleep(&b)]), plan(&c, "x.csproj", None, vec![git]), plan(&d, "y.csproj", None, vec![npm])];
         let started = Instant::now();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, |s| async move { update::run_step(&s).await }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |s, c| async move { update::run_step(&s, &c).await }, |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok), "{:?}", outcomes.iter().map(|o| &o.error).collect::<Vec<_>>());
         assert!(started.elapsed() >= Duration::from_millis(1500), "the two node steps overlapped: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_a_running_step_and_puts_the_files_back() {
+        let (a, b) = (temp("cancel-a"), temp("cancel-b"));
+        let slow = |d: &Path| Step { kind: StepKind::Install, label: "node wait".into(), program: "node".into(), args: vec!["-e".into(), "setTimeout(()=>{},30000)".into()], cwd: d.display().to_string() };
+        let plans = vec![plan(&a, "package.json", Some(&a), vec![slow(&a)]), plan(&b, "package.json", Some(&b), vec![slow(&b)])];
+        let before = std::fs::read_to_string(a.join("package.json")).unwrap();
+        let cancels = Cancels::default();
+        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true };
+        let started = Instant::now();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            cancels.cancel(None);
+        };
+        let (outcomes, ()) = tokio::join!(run(plans, opts, &cancels, |s, c| async move { update::run_step(&s, &c).await }, |_| {}), stop);
+        assert!(started.elapsed() < Duration::from_secs(20), "the 30 second steps were stopped");
+        for o in &outcomes {
+            assert!(o.cancelled && o.rolled_back && !o.ok, "{o:?}");
+        }
+        assert_eq!(std::fs::read_to_string(a.join("package.json")).unwrap(), before, "files put back");
+    }
+
+    #[tokio::test]
+    async fn a_job_cancelled_while_waiting_never_runs() {
+        let (a, b) = (temp("wait-a"), temp("wait-b"));
+        let log: Log = Default::default();
+        let plans = vec![plan(&a, "package.json", Some(&a), vec![step("npm", StepKind::Install, &a)]), plan(&b, "package.json", Some(&b), vec![step("npm", StepKind::Install, &b)])];
+        let jobs = group(plans.clone());
+        let cancels = Cancels::default();
+        cancels.cancel(Some(&jobs[1].key));
+        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true };
+        let outcomes = run(plans, opts, &cancels, recorder(&log, ""), |_| {}).await;
+        assert!(outcomes[0].ok && !outcomes[0].cancelled);
+        assert!(outcomes[1].cancelled && !outcomes[1].ok);
+        assert_eq!(log.borrow().len(), 1, "only the first job ran its install");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_stops_what_a_shell_started() {
+        let dir = temp("cancel-tree");
+        let late = dir.join("late.txt");
+        // No spaces or `>`: cmd reads those itself.
+        let script = "setTimeout(function(){require('fs').writeFileSync('late.txt','x')},2000)";
+        let step = Step { kind: StepKind::Install, label: "cmd node".into(), program: "cmd".into(), args: vec!["/c".into(), "node".into(), "-e".into(), script.into()], cwd: dir.display().to_string() };
+        let (ok, output) = update::run_step(&step, &Cancel::default()).await;
+        assert!(ok && late.exists(), "left alone, node writes the file: {output}");
+        std::fs::remove_file(&late).unwrap();
+
+        let cancel = Cancel::default();
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            cancel.cancel();
+        };
+        let ((ok, _), ()) = tokio::join!(update::run_step(&step, &cancel), stop);
+        assert!(!ok);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!late.exists(), "node, started by the shell, was stopped too");
     }
 }

@@ -253,6 +253,18 @@ export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<Un
 
 const mockBatchListeners = new Set<(e: BatchEvent) => void>()
 
+/** Jobs asked to stop in the browser preview; `*` is all of them. */
+const mockCancelled = new Set<string>()
+
+/** Stops one repository's running update, or every one when `job` is null. Its files are put back. */
+export async function cancelUpdate(job: string | null): Promise<void> {
+  if (!inTauri) {
+    mockCancelled.add(job?.toLowerCase() ?? '*')
+    return
+  }
+  return invoke<void>('cancel_update', { job })
+}
+
 export async function storeStats(): Promise<StoreStats | null> {
   if (!inTauri) return null
   return invoke<StoreStats>('store_stats')
@@ -483,10 +495,16 @@ const mock = (() => {
         const key = p.repo ?? p.projectId.replace(/[\\/][^\\/]*$/, '')
         jobs.set(key, [...(jobs.get(key) ?? []), p])
       }
+      mockCancelled.clear()
       const lanes = new Map<string, Promise<void>>()
       const runJob = async ([job, list]: [string, UpdatePlan[]]): Promise<JobOutcome> => {
         const projects = list.map((p) => p.projectId)
         const results: StepResult[] = []
+        const stopped = () => mockCancelled.has('*') || mockCancelled.has(job.toLowerCase())
+        const cancelled = (): JobOutcome => {
+          emit({ job, projects, state: 'cancelled', label: 'Cancelled', lane: null })
+          return { job, name: job.split(/[\\/]/).pop() ?? job, repo: list[0].repo, projects, ok: false, rolledBack: true, cancelled: true, error: 'Cancelled', steps: results, committed: null, commitError: null, commitSkipped: null, conflicts: [] }
+        }
         const major = (a: string, b: string) => a.replace(/^\D+/, '').split('.')[0] !== b.replace(/^\D+/, '').split('.')[0]
         const clash = list.flatMap((p) => p.changes).find((c) => /eslint/.test(c.name) && major(c.from, c.to))
         if (clash) {
@@ -509,6 +527,7 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
             projects,
             ok: false,
             rolledBack: true,
+            cancelled: false,
             error: '`npm install` failed',
             steps: [{ label: 'npm install', kind: 'install', ok: false, output, ms: 900 }],
             committed: null,
@@ -529,14 +548,19 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
           lanes.set(step.program, previous.then(() => new Promise<void>((r) => (release = r))))
           emit({ job, projects, state: 'waiting', label: `Waiting for ${step.program}`, lane: step.program })
           await previous
+          if (stopped()) {
+            release()
+            return cancelled()
+          }
           emit({ job, projects, state: 'running', label: step.label, lane: step.program })
-          await new Promise((r) => setTimeout(r, 700))
+          for (let t = 0; t < 14 && !stopped(); t++) await new Promise((r) => setTimeout(r, 200))
           release()
-          results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 700 })
+          if (stopped()) return cancelled()
+          results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 2800 })
         }
         emit({ job, projects, state: 'done', label: null, lane: null })
         const repo = list[0].repo
-        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null, conflicts: [] }
+        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, cancelled: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null, conflicts: [] }
       }
       for (const [job, list] of jobs) emit({ job, projects: list.map((p) => p.projectId), state: 'queued', label: null, lane: null })
       const outcomes = await Promise.all([...jobs].map(runJob))

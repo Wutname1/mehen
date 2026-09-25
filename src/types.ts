@@ -219,7 +219,7 @@ export interface StepResult {
 }
 
 
-export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'done' | 'failed' | 'rolled-back'
+export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'done' | 'failed' | 'rolled-back' | 'cancelled'
 
 /** Progress for one repository's share of a batch update. */
 export interface BatchEvent {
@@ -239,6 +239,8 @@ export interface JobOutcome {
   projects: string[]
   ok: boolean
   rolledBack: boolean
+  /** Stopped on request rather than failed; its files were put back. */
+  cancelled: boolean
   error: string | null
   steps: StepResult[]
   committed: string | null
