@@ -1,11 +1,14 @@
-import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, ShieldCheck, Terminal, X } from 'lucide-react'
+import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { bumpOf, folderName, relativePath, runLabel } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
+import { FeedbackDialog } from './FeedbackDialog'
 import { Checkbox } from './Queue'
+import { sendReport, type Report } from '../lib/telemetry'
+import { batchErrorReport, planFailureReport, updateFailureReport } from '../lib/updateReport'
 import { RepoAvatar } from './RepoAvatar'
 
 export interface UpdateTarget {
@@ -171,7 +174,9 @@ export function UpdateFlow({
   const [commits, setCommits] = useState<CommitOutcome[]>([])
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
   const checks = build || test
-  const [ran, setRan] = useState({ checks, commit })
+  const [ran, setRan] = useState({ checks, build, test, commit })
+  /** A failure report being written up in the full feedback form. */
+  const [note, setNote] = useState<(Report & { title: string }) | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   /** Jobs asked to stop (by key, lowercased); `*` when all were. */
@@ -220,7 +225,7 @@ export function UpdateFlow({
   }
 
   const run = async () => {
-    setRan({ checks, commit })
+    setRan({ checks, build, test, commit })
     setStopping(new Set())
     setStage('running')
     setError(null)
@@ -310,6 +315,8 @@ export function UpdateFlow({
     </div>
   )
 
+  if (note) return <FeedbackDialog preset={note} onClose={() => setNote(null)} />
+
   if (stage === 'planning') {
     return (
       <Dialog title="Working out the changes" size="wide" busy onClose={close} icon={<Loader2 size={22} className="animate-spin" />}>
@@ -378,7 +385,7 @@ export function UpdateFlow({
             </section>
           )
         })}
-        {failed.length > 0 && <Unplannable failed={failed} roots={roots} />}
+        {failed.length > 0 && <Unplannable failed={failed} roots={roots} onNote={setNote} />}
       </Dialog>
     )
   }
@@ -403,7 +410,7 @@ export function UpdateFlow({
           </>
         }
       >
-        {failed.length > 0 && <Unplannable failed={failed} roots={roots} />}
+        {failed.length > 0 && <Unplannable failed={failed} roots={roots} onNote={setNote} />}
         <div className="grid gap-2.5">
           {jobs.map((job) => {
             const changes = changesOf(job)
@@ -631,7 +638,12 @@ export function UpdateFlow({
       }
     >
       {error ? (
-        <pre className="rounded-[3px] bg-vuln-row p-3 font-mono text-[12px] whitespace-pre-wrap text-risk-security">{error}</pre>
+        <>
+          <pre className="rounded-[3px] bg-vuln-row p-3 font-mono text-[12px] whitespace-pre-wrap text-risk-security">{error}</pre>
+          <div className="mt-2">
+            <ReportButton make={() => batchErrorReport(error, plans, ran)} onNote={setNote} />
+          </div>
+        </>
       ) : (
         <div
           className={cx(
@@ -752,6 +764,11 @@ export function UpdateFlow({
                   </pre>
                 </>
               )}
+              {!o.ok && !o.cancelled && (
+                <div className="mt-1.5">
+                  <ReportButton make={() => updateFailureReport(job, o, ran)} onNote={setNote} />
+                </div>
+              )}
             </span>
             {o.ok ? (
               <span className="flex flex-col items-end gap-1.5">
@@ -860,7 +877,40 @@ function PlanFiles({ job }: { job: Job }) {
   )
 }
 
-function Unplannable({ failed, roots }: { failed: { project: Project; error: string }[]; roots: string[] }) {
+/**
+ * A failed update is Mehen not doing its job, so saying so takes one click:
+ * the report carries the update's output. "Add a note" opens the full form.
+ */
+function ReportButton({ make, onNote }: { make: () => Report & { title: string }; onNote: (report: Report & { title: string }) => void }) {
+  const [state, setState] = useState<{ step: 'idle' | 'sending' | 'sent' | 'failed'; message?: string }>({ step: 'idle' })
+  const send = async () => {
+    setState({ step: 'sending' })
+    const result = await sendReport(make())
+    setState(result.ok ? { step: 'sent' } : { step: 'failed', message: result.message })
+  }
+  if (state.step === 'sent') {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
+        <Check size={13} />
+        Report sent. Thanks, this is how it gets fixed.
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-2.5 gap-y-1">
+      <Button onClick={send} disabled={state.step === 'sending'} title="Sends what was being updated and the output, with your user name taken out of paths" className="h-7 px-2.5 text-[12px]">
+        <Send size={13} />
+        {state.step === 'sending' ? 'Sending…' : state.step === 'failed' ? 'Try again' : 'Report this failure'}
+      </Button>
+      <button type="button" onClick={() => onNote(make())} disabled={state.step === 'sending'} className="text-[12px] text-muted underline underline-offset-2 hover:text-ink">
+        Add a note first
+      </button>
+      {state.step === 'failed' && <span className="text-[12px] text-risk-security">{state.message}</span>}
+    </span>
+  )
+}
+
+function Unplannable({ failed, roots, onNote }: { failed: { project: Project; error: string }[]; roots: string[]; onNote: (report: Report & { title: string }) => void }) {
   return (
     <div className="mb-3 rounded-[3px] border border-[color-mix(in_oklab,var(--risk-review)_35%,var(--line))] px-3 py-2.5">
       <b className="flex items-center gap-2 text-[13px] text-risk-review">
@@ -874,6 +924,9 @@ function Unplannable({ failed, roots }: { failed: { project: Project; error: str
           </li>
         ))}
       </ul>
+      <div className="mt-2">
+        <ReportButton make={() => planFailureReport(failed)} onNote={onNote} />
+      </div>
     </div>
   )
 }

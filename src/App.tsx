@@ -1,7 +1,9 @@
-import { Moon, Search, Settings2, Sun, TriangleAlert, Undo2, X } from 'lucide-react'
+import { MessageSquareText, Moon, Search, Settings2, Sun, TriangleAlert, Undo2, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api'
 import { AdvisoryDialog } from './components/AdvisoryDialog'
+import { FeedbackDialog } from './components/FeedbackDialog'
+import { setErrorReporting } from './lib/telemetry'
 import { AppUpdateButton, AppUpdateDialog, useAppUpdate } from './components/AppUpdate'
 import { GitWyrmMark, Logo, cx } from './components/bits'
 import { ProjectRecord, Tray, type TrayGroup } from './components/Inspector'
@@ -47,6 +49,7 @@ type Dialog =
   | { kind: 'package'; row: QueueRow; usages: QueueUsage[] }
   | { kind: 'held-back'; packageKey: string | null }
   | { kind: 'app-update' }
+  | { kind: 'feedback' }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
@@ -145,6 +148,10 @@ export default function App() {
   useEffect(() => {
     if (firstRun) api.gitwyrmFolders().then(setGitwyrmFolders).catch(() => {})
   }, [firstRun])
+
+  useEffect(() => {
+    if (settings) setErrorReporting(settings.errorReports)
+  }, [settings])
 
   useEffect(() => {
     if (!notice) return
@@ -664,6 +671,15 @@ export default function App() {
           </button>
           <button
             type="button"
+            onClick={() => setDialog({ kind: 'feedback' })}
+            aria-label="Send feedback"
+            title="Send feedback or report a problem"
+            className="grid size-[34px] place-items-center rounded-[3px] border border-rail-border text-rail-ink hover:border-rail-border-strong hover:bg-rail-field-hover"
+          >
+            <MessageSquareText size={16} />
+          </button>
+          <button
+            type="button"
             onClick={() => setDialog({ kind: 'settings' })}
             disabled={!settings}
             aria-label="Settings"
@@ -795,6 +811,8 @@ export default function App() {
       )}
 
       {dialog?.kind === 'app-update' && <AppUpdateDialog update={appUpdate} onClose={() => setDialog(null)} />}
+
+      {dialog?.kind === 'feedback' && <FeedbackDialog onClose={() => setDialog(null)} />}
 
       {dialog?.kind === 'settings' && settings && (
         <SettingsDialog

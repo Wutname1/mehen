@@ -19,7 +19,9 @@ use tauri_plugin_notification::NotificationExt;
 
 mod background;
 mod gitwyrm;
+mod scrub;
 mod self_update;
+mod telemetry;
 
 pub use background::requested as background_check_requested;
 pub use background::run as run_background_check;
@@ -69,6 +71,7 @@ struct Settings {
     /// Windows runs a quick check at sign-in and daily, with Mehen closed.
     scheduled_check: bool,
     scheduled_check_supported: bool,
+    error_reports: bool,
 }
 
 /// The user's own build and test commands for one scope, and where to run them.
@@ -93,7 +96,13 @@ impl AppState {
             app_update_check: self.store.setting(APP_UPDATE_CHECK).is_none_or(|v| v != "false"),
             scheduled_check: self.scheduled_check(),
             scheduled_check_supported: background::schedule_supported(),
+            error_reports: self.error_reports(),
         }
+    }
+
+    /// On unless turned off in settings.
+    fn error_reports(&self) -> bool {
+        self.store.setting(telemetry::ERROR_REPORTS).is_none_or(|v| v != "false")
     }
 
     /// Off unless turned on in settings.
@@ -324,6 +333,13 @@ fn set_notify(state: State<'_, AppState>, notify: bool) -> Result<Settings, Stri
 async fn set_scheduled_check(state: State<'_, AppState>, enabled: bool) -> Result<Settings, String> {
     tauri::async_runtime::spawn_blocking(move || background::set_scheduled(enabled)).await.map_err(err)??;
     state.store.set_setting(background::SCHEDULED_CHECK, if enabled { "true" } else { "false" }).map_err(err)?;
+    Ok(state.settings())
+}
+
+#[tauri::command]
+fn set_error_reports(state: State<'_, AppState>, enabled: bool) -> Result<Settings, String> {
+    state.store.set_setting(telemetry::ERROR_REPORTS, if enabled { "true" } else { "false" }).map_err(err)?;
+    telemetry::set_enabled(enabled);
     Ok(state.settings())
 }
 
@@ -592,6 +608,8 @@ fn gitwyrm_folders(state: State<'_, AppState>) -> Vec<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Lives until the app exits, so a panic's report is sent before it goes.
+    let _telemetry = telemetry::init();
     tauri::Builder::default()
         // Registered first, as the plugin requires. A second launch (GitWyrm
         // asking to show a repository, say) hands its folder to this window
@@ -611,6 +629,7 @@ pub fn run() {
             let db = app.path().app_data_dir()?.join("mehen.db");
             let store = Store::open(&db).map_err(|e| e.to_string())?;
             app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default() });
+            telemetry::set_enabled(app.state::<AppState>().error_reports());
             build_tray(app)?;
             start_background_loop(app.handle().clone());
             // Re-created on every start, so the task follows Mehen when it is
@@ -643,6 +662,7 @@ pub fn run() {
             set_notify,
             set_app_update_check,
             set_scheduled_check,
+            set_error_reports,
             add_ignore,
             remove_ignore,
             discover,

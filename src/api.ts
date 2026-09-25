@@ -176,6 +176,12 @@ export async function setAppUpdateCheck(check: boolean): Promise<Settings> {
   return invoke<Settings>('set_app_update_check', { check })
 }
 
+/** Turns crash and error reports on or off, for this window and the app behind it. */
+export async function setErrorReports(enabled: boolean): Promise<Settings> {
+  if (!inTauri) return mock.setErrorReports(enabled)
+  return invoke<Settings>('set_error_reports', { enabled })
+}
+
 /** The running version of Mehen. */
 export async function appVersion(): Promise<string> {
   if (!inTauri) return '0.1.0'
@@ -332,7 +338,7 @@ export async function openLink(url: string) {
 // plain browser. Uses a saved real scan (survey example with --json) and a
 // rough copy of the ignore matching.
 const mock = (() => {
-  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true, appUpdateCheck: true, scheduledCheck: false, scheduledCheckSupported: true }
+  let state: Settings = { folders: ['C:\\code'], rules: [], backgroundHours: 0, updateParallel: 0, updateParallelAuto: 2, notify: true, appUpdateCheck: true, scheduledCheck: false, scheduledCheckSupported: true, errorReports: true }
   let nextId = 1
   let cached: Inventory | null = null
 
@@ -389,6 +395,7 @@ const mock = (() => {
     setNotify: async (notify: boolean) => (state = { ...state, notify }),
     setAppUpdateCheck: async (appUpdateCheck: boolean) => (state = { ...state, appUpdateCheck }),
     setScheduledCheck: async (scheduledCheck: boolean) => (state = { ...state, scheduledCheck }),
+    setErrorReports: async (errorReports: boolean) => (state = { ...state, errorReports }),
     appUpdate: {
       version: '0.2.0',
       listeners: new Set<(p: AppUpdateProgress) => void>(),

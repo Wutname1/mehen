@@ -368,6 +368,21 @@ export function SettingsDialog({
                     label="Look for new versions of Mehen"
                   />
                 </SettingRow>
+                <SettingRow
+                  title="Send error reports"
+                  help="When Mehen crashes or hits an error, it tells us what broke so it can be fixed. Your user name is taken out of paths, and tokens and email addresses are removed. Feedback you send yourself is separate."
+                >
+                  <Switch
+                    checked={settings.errorReports}
+                    onChange={(v) =>
+                      api
+                        .setErrorReports(v)
+                        .then(onSettings)
+                        .catch((err) => setError(String(err)))
+                    }
+                    label="Send error reports"
+                  />
+                </SettingRow>
               </>
             )}
 

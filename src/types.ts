@@ -136,6 +136,8 @@ export interface Settings {
   scheduledCheck: boolean
   /** Whether this computer can run that check (Windows only for now). */
   scheduledCheckSupported: boolean
+  /** Send crash and error reports (release builds only). */
+  errorReports: boolean
 }
 
 /** A repository someone asked Mehen to show, from GitWyrm or the command line. */
