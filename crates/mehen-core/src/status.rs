@@ -66,6 +66,10 @@ pub struct RepoStatus {
     /// level. Readers pick a level and add up everything at or above it.
     #[serde(default)]
     pub attention: Attention,
+    /// The packages behind `attention`, most urgent first, so a reader can
+    /// list what it counts.
+    #[serde(default)]
+    pub flagged: Vec<Flagged>,
     /// Fixable packages first, then by how serious they are.
     pub problems: Vec<Problem>,
 }
@@ -95,6 +99,26 @@ pub struct Attention {
     pub minor: u32,
     pub patch: u32,
 }
+
+/// One package counted in [`Attention`], at the level it was counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Flagged {
+    pub name: String,
+    pub ecosystem: String,
+    /// `critical`, `high`, `moderate`, `low`, `major`, `minor` or `patch`.
+    pub level: String,
+    pub version: Option<String>,
+    /// Where to move: the smallest fix for a security problem, otherwise the
+    /// newest version this repository can use.
+    pub target: Option<String>,
+    /// The worst advisory's summary, for a security problem.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+/// Most urgent first; the order readers add levels up in.
+const LEVELS: [&str; 7] = ["critical", "high", "moderate", "low", "major", "minor", "patch"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +236,7 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
             let mut problems = Vec::new();
             let mut outdated = 0;
             let mut attention = Attention::default();
+            let mut flagged: Vec<Flagged> = Vec::new();
             for ((ecosystem, name), usages) in &packages {
                 let update = usages.iter().map(|d| d.status).filter(|s| matches!(s, Status::Patch | Status::Minor | Status::Major)).max();
                 if update.is_some() {
@@ -223,17 +248,39 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
                     .filter_map(|(d, id)| advisories.get(id.as_str()).map(|v| (d, *v)))
                     .max_by_key(|(_, v)| rank(v.severity.as_deref()));
                 let fixed_in = worst.and_then(|_| usages.iter().filter(|d| !d.vulns.is_empty()).find_map(|d| d.fix_target.clone()));
-                match (worst, &fixed_in, update) {
+                let level = match (worst, &fixed_in, update) {
                     (Some((_, advisory)), Some(_), _) => match rank(advisory.severity.as_deref()) {
-                        4 => attention.critical += 1,
-                        3 => attention.high += 1,
-                        2 => attention.moderate += 1,
-                        _ => attention.low += 1,
+                        4 => Some("critical"),
+                        3 => Some("high"),
+                        2 => Some("moderate"),
+                        _ => Some("low"),
                     },
-                    (_, _, Some(Status::Major)) => attention.major += 1,
-                    (_, _, Some(Status::Minor)) => attention.minor += 1,
-                    (_, _, Some(_)) => attention.patch += 1,
-                    _ => {}
+                    (_, _, Some(Status::Major)) => Some("major"),
+                    (_, _, Some(Status::Minor)) => Some("minor"),
+                    (_, _, Some(_)) => Some("patch"),
+                    _ => None,
+                };
+                if let Some(level) = level {
+                    match level {
+                        "critical" => attention.critical += 1,
+                        "high" => attention.high += 1,
+                        "moderate" => attention.moderate += 1,
+                        "low" => attention.low += 1,
+                        "major" => attention.major += 1,
+                        "minor" => attention.minor += 1,
+                        _ => attention.patch += 1,
+                    }
+                    let security = LEVELS.iter().position(|l| *l == level).is_some_and(|i| i <= 3);
+                    // The usage that is most behind speaks for the package.
+                    let lead = usages.iter().max_by_key(|d| d.status).copied().unwrap_or(usages[0]);
+                    flagged.push(Flagged {
+                        name: name.clone(),
+                        ecosystem: ecosystem.clone(),
+                        level: level.to_string(),
+                        version: lead.current.clone().or_else(|| lead.installed.clone()),
+                        target: if security { fixed_in.clone() } else { lead.latest.clone() },
+                        summary: if security { worst.map(|(_, a)| a.summary.clone()) } else { None },
+                    });
                 }
                 let Some((dep, advisory)) = worst else {
                     continue;
@@ -265,7 +312,11 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
             problems.truncate(PROBLEMS_KEPT);
-            RepoStatus { path, checked_at, checked_commit, vulnerable, fixable, severity, outdated, attention, problems }
+            flagged.sort_by(|a, b| {
+                let at = |l: &str| LEVELS.iter().position(|x| *x == l).unwrap_or(LEVELS.len());
+                at(&a.level).cmp(&at(&b.level)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            RepoStatus { path, checked_at, checked_commit, vulnerable, fixable, severity, outdated, attention, flagged, problems }
         })
         .collect();
 
@@ -358,6 +409,9 @@ mod tests {
         assert_eq!(repo.problems[0].advisory, "HIGH-1");
         // Nothing here has a fix, so every package counts at its update level.
         assert_eq!(repo.attention, Attention { major: 1, minor: 1, patch: 1, ..Default::default() });
+        let listed: Vec<(&str, &str)> = repo.flagged.iter().map(|f| (f.name.as_str(), f.level.as_str())).collect();
+        assert_eq!(listed, vec![("react", "major"), ("lodash", "minor"), ("left-pad", "patch")], "most urgent first");
+        assert!(repo.flagged.iter().all(|f| f.summary.is_none()), "updates carry no advisory");
         assert_eq!(repo.checked_at, Some(100));
     }
 
@@ -374,6 +428,9 @@ mod tests {
         assert_eq!((repo.vulnerable, repo.fixable), (2, 1));
         // The fixed one counts at its severity; the stuck one has no update.
         assert_eq!(repo.attention, Attention { low: 1, ..Default::default() });
+        assert_eq!(repo.flagged.len(), 1);
+        assert_eq!((repo.flagged[0].name.as_str(), repo.flagged[0].level.as_str(), repo.flagged[0].target.as_deref()), ("fixed", "low", Some("1.0.1")));
+        assert_eq!(repo.flagged[0].summary.as_deref(), Some("LOW-1 summary"));
         assert_eq!(repo.problems[0].name, "fixed");
         assert_eq!(repo.problems[0].fixed_in.as_deref(), Some("1.0.1"));
         assert_eq!(repo.problems[1].fixed_in, None);
@@ -396,6 +453,7 @@ mod tests {
                 fixable: 0,
                 severity: SeverityCounts::default(),
                 attention: Attention::default(),
+                flagged: Vec::new(),
                 outdated: 0,
                 problems: Vec::new(),
             }],
