@@ -62,6 +62,10 @@ pub struct RepoStatus {
     pub severity: SeverityCounts,
     /// Packages with a newer version available.
     pub outdated: u32,
+    /// Every package that needs something, counted once at its most urgent
+    /// level. Readers pick a level and add up everything at or above it.
+    #[serde(default)]
+    pub attention: Attention,
     /// Fixable packages first, then by how serious they are.
     pub problems: Vec<Problem>,
 }
@@ -74,6 +78,22 @@ pub struct SeverityCounts {
     pub moderate: u32,
     pub low: u32,
     pub unknown: u32,
+}
+
+/// Packages by the most urgent thing about them. A known security problem
+/// counts only when it has a fix, at its worst advisory's severity (`low`
+/// includes advisories with no severity). A package with no fixable problem
+/// counts at its newest available update instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Attention {
+    pub critical: u32,
+    pub high: u32,
+    pub moderate: u32,
+    pub low: u32,
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,27 +211,40 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
             let mut severity = SeverityCounts::default();
             let mut problems = Vec::new();
             let mut outdated = 0;
+            let mut attention = Attention::default();
             for ((ecosystem, name), usages) in &packages {
-                if usages.iter().any(|d| matches!(d.status, Status::Patch | Status::Minor | Status::Major)) {
+                let update = usages.iter().map(|d| d.status).filter(|s| matches!(s, Status::Patch | Status::Minor | Status::Major)).max();
+                if update.is_some() {
                     outdated += 1;
                 }
-                let Some(worst) = usages
+                let worst = usages
                     .iter()
                     .flat_map(|d| d.vulns.iter().map(move |id| (*d, id)))
                     .filter_map(|(d, id)| advisories.get(id.as_str()).map(|v| (d, *v)))
-                    .max_by_key(|(_, v)| rank(v.severity.as_deref()))
-                else {
+                    .max_by_key(|(_, v)| rank(v.severity.as_deref()));
+                let fixed_in = worst.and_then(|_| usages.iter().filter(|d| !d.vulns.is_empty()).find_map(|d| d.fix_target.clone()));
+                match (worst, &fixed_in, update) {
+                    (Some((_, advisory)), Some(_), _) => match rank(advisory.severity.as_deref()) {
+                        4 => attention.critical += 1,
+                        3 => attention.high += 1,
+                        2 => attention.moderate += 1,
+                        _ => attention.low += 1,
+                    },
+                    (_, _, Some(Status::Major)) => attention.major += 1,
+                    (_, _, Some(Status::Minor)) => attention.minor += 1,
+                    (_, _, Some(_)) => attention.patch += 1,
+                    _ => {}
+                }
+                let Some((dep, advisory)) = worst else {
                     continue;
                 };
-                match rank(worst.1.severity.as_deref()) {
+                match rank(advisory.severity.as_deref()) {
                     4 => severity.critical += 1,
                     3 => severity.high += 1,
                     2 => severity.moderate += 1,
                     1 => severity.low += 1,
                     _ => severity.unknown += 1,
                 }
-                let (dep, advisory) = worst;
-                let fixed_in = usages.iter().filter(|d| !d.vulns.is_empty()).find_map(|d| d.fix_target.clone());
                 problems.push(Problem {
                     name: name.clone(),
                     ecosystem: ecosystem.clone(),
@@ -232,7 +265,7 @@ pub fn build(inventory: &Inventory, fresh: Fresh, previous: Option<&StatusFile>,
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
             problems.truncate(PROBLEMS_KEPT);
-            RepoStatus { path, checked_at, checked_commit, vulnerable, fixable, severity, outdated, problems }
+            RepoStatus { path, checked_at, checked_commit, vulnerable, fixable, severity, outdated, attention, problems }
         })
         .collect();
 
@@ -323,6 +356,8 @@ mod tests {
         let names: Vec<&str> = repo.problems.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["lodash", "left-pad"]);
         assert_eq!(repo.problems[0].advisory, "HIGH-1");
+        // Nothing here has a fix, so every package counts at its update level.
+        assert_eq!(repo.attention, Attention { major: 1, minor: 1, patch: 1, ..Default::default() });
         assert_eq!(repo.checked_at, Some(100));
     }
 
@@ -337,6 +372,8 @@ mod tests {
         );
         let repo = &build(&inv, Fresh::All, None, "Mehen test", None).repos[0];
         assert_eq!((repo.vulnerable, repo.fixable), (2, 1));
+        // The fixed one counts at its severity; the stuck one has no update.
+        assert_eq!(repo.attention, Attention { low: 1, ..Default::default() });
         assert_eq!(repo.problems[0].name, "fixed");
         assert_eq!(repo.problems[0].fixed_in.as_deref(), Some("1.0.1"));
         assert_eq!(repo.problems[1].fixed_in, None);
@@ -358,6 +395,7 @@ mod tests {
                 vulnerable: 0,
                 fixable: 0,
                 severity: SeverityCounts::default(),
+                attention: Attention::default(),
                 outdated: 0,
                 problems: Vec::new(),
             }],
