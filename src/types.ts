@@ -219,6 +219,8 @@ export interface UpdatePlan {
   repo: string | null
   /** Why this update can't be committed, if it can't. */
   commitBlocked: string | null
+  /** Files it touches that already had uncommitted changes; committing them takes forcing. */
+  uncommitted?: string[]
   /** The checked-out branch, where a commit would land. */
   branch: string | null
 }

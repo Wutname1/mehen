@@ -222,13 +222,13 @@ export async function onAppUpdateProgress(handler: (p: AppUpdateProgress) => voi
 const mockCheckCommands: CheckCommands = {}
 
 /** Commits updates that were applied without committing, one commit per repository. */
-export async function commitUpdate(plans: UpdatePlan[]): Promise<CommitOutcome[]> {
+export async function commitUpdate(plans: UpdatePlan[], force = false): Promise<CommitOutcome[]> {
   if (!inTauri) {
     await new Promise((r) => setTimeout(r, 500))
     const repos = [...new Set(plans.map((p) => p.repo ?? p.projectId))]
     return repos.map((job, i) => ({ job, name: job.split(/[\\/]/).pop() ?? job, committed: plans.find((p) => (p.repo ?? p.projectId) === job)?.repo ? `${(0xa04d173 + i * 977).toString(16)}` : null, error: null }))
   }
-  return invoke<CommitOutcome[]>('commit_update', { plans })
+  return invoke<CommitOutcome[]>('commit_update', { plans, force })
 }
 
 export async function planUpdate(projectId: string, changes: Change[]): Promise<UpdatePlan> {
@@ -242,9 +242,9 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
  * where two need the same tool. `run` picks the builds and tests; `commit`
  * commits each repository that succeeds.
  */
-export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true): Promise<BatchResult> {
+export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true, forceCommit = false): Promise<BatchResult> {
   if (!inTauri) return mock.applyBatch(plans, run, commit)
-  return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure })
+  return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure, forceCommit })
 }
 
 export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {
@@ -498,6 +498,8 @@ const mock = (() => {
         warnings: [],
         repo: project.repo,
         commitBlocked: project.repo ? null : 'not inside a git repository',
+        // Pretend opencode's files already have changes, so forcing a commit can be tried here.
+        uncommitted: /opencode/i.test(project.repo ?? '') ? ['package.json', 'package-lock.json'] : [],
         branch: project.repo ? 'main' : null,
       }
     },

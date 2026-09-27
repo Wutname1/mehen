@@ -514,8 +514,8 @@ fn remove_hold(state: State<'_, AppState>, id: i64) -> Result<Vec<Hold>, String>
 
 /// Commits already-applied updates, one commit per repository.
 #[tauri::command]
-fn commit_update(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
-    batch::commit(plans)
+fn commit_update(plans: Vec<UpdatePlan>, force: Option<bool>) -> Vec<CommitOutcome> {
+    batch::commit(plans, force.unwrap_or(false))
 }
 
 #[derive(Serialize)]
@@ -530,9 +530,9 @@ struct BatchResult {
 /// side by side except where two need the same tool. Progress arrives as
 /// `mehen://batch` events; results are re-checked once at the end.
 #[tauri::command]
-async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: bool, commit: bool, stop_on_failure: Option<bool>) -> Result<BatchResult, String> {
+async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: bool, commit: bool, stop_on_failure: Option<bool>, force_commit: Option<bool>) -> Result<BatchResult, String> {
     let parallel = app.state::<AppState>().update_parallel();
-    let options = BatchOptions { build, test, commit, parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
+    let options = BatchOptions { build, test, commit, force_commit: force_commit.unwrap_or(false), parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
     let cancels = Arc::new(Cancels::default());
     *app.state::<AppState>().cancels.lock().unwrap_or_else(|e| e.into_inner()) = cancels.clone();
     let outcomes = batch::run(plans, options, &cancels, |step, cancel| async move { update::run_step(&step, &cancel).await }, |e: BatchEvent| {

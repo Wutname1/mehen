@@ -25,6 +25,8 @@ interface Job {
   branch: string | null
   /** Why this repository can't be committed. */
   blocked: string | null
+  /** Files it touches that already had uncommitted changes. */
+  dirty: string[]
 }
 
 interface Live {
@@ -38,13 +40,14 @@ function jobsOf(plans: UpdatePlan[], nameOf: (key: string) => string): Job[] {
   const map = new Map<string, Job>()
   for (const plan of plans) {
     const key = jobKey(plan)
-    const job = map.get(key.toLowerCase()) ?? { key, name: nameOf(key), plans: [], branch: plan.branch, blocked: null }
+    const job = map.get(key.toLowerCase()) ?? { key, name: nameOf(key), plans: [], branch: plan.branch, blocked: null, dirty: [] }
     job.plans.push(plan)
     map.set(key.toLowerCase(), job)
   }
   for (const job of map.values()) {
     const reasons = [...new Set(job.plans.map((p) => p.commitBlocked).filter((r): r is string => !!r))]
     job.blocked = reasons.length ? reasons.join('; ') : null
+    job.dirty = [...new Set(job.plans.flatMap((p) => p.uncommitted ?? []))]
   }
   return [...map.values()]
 }
@@ -179,6 +182,8 @@ export function UpdateFlow({
   const [note, setNote] = useState<(Report & { title: string }) | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  /** Commit even where files already had changes, which then go in too. Asked per update, never remembered. */
+  const [forceCommit, setForceCommit] = useState(false)
   /** Jobs asked to stop (by key, lowercased); `*` when all were. */
   const [stopping, setStopping] = useState<Set<string>>(new Set())
 
@@ -230,7 +235,7 @@ export function UpdateFlow({
     setStage('running')
     setError(null)
     try {
-      const result = await api.applyBatch(plans, { build, test }, commit, stopOnFailure)
+      const result = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit)
       setOutcomes(result.outcomes)
       if (result.inventory) setRefreshed(result.inventory)
     } catch (e) {
@@ -267,12 +272,15 @@ export function UpdateFlow({
   const broke = jobs.filter((j) => outcomeOf(j) && !outcomeOf(j)!.ok && !outcomeOf(j)!.cancelled)
   const stopped = jobs.filter((j) => outcomeOf(j)?.cancelled)
   const commitOf = (job: Job) => commits.find((c) => c.job.toLowerCase() === job.key.toLowerCase())
-  const committable = passed.filter((j) => !j.blocked && !outcomeOf(j)?.committed && !commitOf(j)?.committed)
+  /** Whether Mehen will commit this repository, given the force choice. */
+  const willCommit = (j: Job) => !j.blocked && (forceCommit || !j.dirty.length)
+  const dirtyJobs = jobs.filter((j) => !j.blocked && j.dirty.length > 0)
+  const committable = passed.filter((j) => willCommit(j) && !outcomeOf(j)?.committed && !commitOf(j)?.committed)
 
   const commitNow = async () => {
     setStage('running')
     try {
-      setCommits(await api.commitUpdate(committable.flatMap((j) => j.plans)))
+      setCommits(await api.commitUpdate(committable.flatMap((j) => j.plans), forceCommit))
     } catch (e) {
       setError(String(e))
     }
@@ -284,7 +292,7 @@ export function UpdateFlow({
       .map((job) => {
         const { install, checks: steps } = stepsOf(job, build, test)
         const lines = [`# ${job.name}${job.branch ? ` (${job.branch})` : ''}`, `cd ${job.key}`, ...[...install, ...steps].map((s) => [s.program, ...s.args].join(' '))]
-        if (commit && !job.blocked) lines.push(`git commit -m "${commitSubject(changesOf(job).length)}" -- <changed files>`)
+        if (commit && willCommit(job)) lines.push(`git commit -m "${commitSubject(changesOf(job).length)}" -- <changed files>`)
         return lines.join('\n')
       })
       .join('\n\n')
@@ -312,6 +320,15 @@ export function UpdateFlow({
         <Checkbox checked={commit} onChange={() => onOptions({ commit: !commit })} label="Commit each repository" />
         Commit each repository
       </label>
+      {commit && dirtyJobs.length > 0 && (
+        <label
+          className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]"
+          title={`${dirtyJobs.map((j) => `${j.name}: ${j.dirty.join(', ')}`).join('\n')}\n\nThose earlier changes go into the same commit as the update.`}
+        >
+          <Checkbox checked={forceCommit} onChange={() => setForceCommit(!forceCommit)} label="Commit anyway where files already had changes" />
+          Commit anyway ({dirtyJobs.length} with other changes)
+        </label>
+      )}
     </div>
   )
 
@@ -455,22 +472,26 @@ export function UpdateFlow({
                         ? `Install: ${labels(install)}. Checks skipped.`
                         : 'Files are edited only; nothing to run.'}
                   </li>
-                  {commit && !job.blocked && (
+                  {commit && willCommit(job) && (
                     <li className="flex items-center gap-2 text-muted">
                       <GitCommitHorizontal size={14} className="shrink-0" />
                       Commit on {job.branch ?? 'the current branch'}: “{commitSubject(changes.length)}”
                     </li>
                   )}
                 </ul>
-                {job.blocked && (commit || /uncommitted/.test(job.blocked)) && (
+                {((job.blocked && commit) || (!job.blocked && job.dirty.length > 0)) && (
                   <div className="mx-3 mb-2.5 flex gap-2 rounded-[3px] bg-[color-mix(in_oklab,var(--risk-review)_10%,transparent)] px-2.5 py-2 text-[12.5px] text-risk-review">
                     <AlertTriangle size={15} className="mt-px shrink-0" />
                     <span>
-                      {/uncommitted/.test(job.blocked)
-                        ? commit
-                          ? `Won't be committed: ${job.blocked.replace(/^uncommitted changes in /, '')} already ${job.blocked.includes(',') ? 'have' : 'has'} changes you haven't committed. Commit or stash them first to include this project.`
-                          : `${job.blocked.replace(/^uncommitted changes in /, '')} already ${job.blocked.includes(',') ? 'have' : 'has'} changes you haven't committed; they will sit alongside this update.`
-                        : `Won't be committed: ${job.blocked}.`}
+                      {job.blocked
+                        ? `Won't be committed: ${job.blocked}.`
+                        : (() => {
+                            const files = job.dirty.join(', ')
+                            const have = job.dirty.length === 1 ? 'has' : 'have'
+                            if (!commit) return `${files} already ${have} changes you haven't committed; they will sit alongside this update.`
+                            if (forceCommit) return `${files} already ${have} changes you haven't committed. They go into this commit too.`
+                            return `Won't be committed: ${files} already ${have} changes you haven't committed. Tick "Commit anyway" to include them, or commit or stash them first.`
+                          })()}
                     </span>
                   </div>
                 )}

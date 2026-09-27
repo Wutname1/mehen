@@ -95,10 +95,13 @@ pub struct UpdatePlan {
     /// The git repo the project lives in, if any.
     #[serde(default)]
     pub repo: Option<String>,
-    /// Why the update cannot be committed (not a repo, or the files already
-    /// have uncommitted changes that would be swept into the commit).
+    /// Why the update can never be committed (not in a git repository).
     #[serde(default)]
     pub commit_blocked: Option<String>,
+    /// Files this update touches that already had uncommitted changes.
+    /// Committing sweeps those changes in too, so it only happens when forced.
+    #[serde(default)]
+    pub uncommitted: Vec<String>,
     /// The checked-out branch, where a commit would land.
     #[serde(default)]
     pub branch: Option<String>,
@@ -165,6 +168,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         warnings: Vec::new(),
         repo: project.repo.clone(),
         commit_blocked: None,
+        uncommitted: Vec::new(),
         branch: None,
         clean_retry: Vec::new(),
     };
@@ -202,10 +206,8 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
     for edit in &mut plan.edits {
         edit.diff = unified_diff(&edit.path, &edit.before, &edit.after, repo.as_deref().unwrap_or(&dir));
     }
-    plan.commit_blocked = match &repo {
-        None => Some("not inside a git repository".into()),
-        Some(r) => dirty_files(r, &touched_paths(&plan)).map(|dirty| format!("uncommitted changes in {dirty}")),
-    };
+    plan.commit_blocked = repo.is_none().then(|| "not inside a git repository".into());
+    plan.uncommitted = repo.as_deref().map(|r| dirty_files(r, &touched_paths(&plan))).unwrap_or_default();
     plan.branch = repo.as_deref().and_then(current_branch);
     Ok(plan)
 }
@@ -261,14 +263,13 @@ fn git(repo: &Path) -> std::process::Command {
 
 /// Names of files that already differ from HEAD, so committing them would
 /// also commit someone else's work. `None` when all are clean.
-fn dirty_files(repo: &Path, paths: &[String]) -> Option<String> {
-    let out = git(repo).args(["status", "--porcelain", "--"]).args(paths).output().ok()?;
-    let dirty: Vec<String> = String::from_utf8_lossy(&out.stdout)
+fn dirty_files(repo: &Path, paths: &[String]) -> Vec<String> {
+    let Ok(out) = git(repo).args(["status", "--porcelain", "--"]).args(paths).output() else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.starts_with("??"))
         .filter_map(|l| l.get(3..).map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()))
-        .collect();
-    (!dirty.is_empty()).then(|| dirty.join(", "))
+        .collect()
 }
 
 /// Commits exactly the files this update touched, on the current branch.
@@ -1509,7 +1510,7 @@ mod tests {
         std::fs::write(dir.join("package.json"), "{ \"dependencies\": { \"react\": \"^19.1.0\" }, \"x\": 1 }").unwrap();
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^19.1.0", "19.1.0")]);
         let second = plan(&p, &[Change { from: None, name: "react".into(), to: "19.2.0".into() }], |_| None).unwrap();
-        assert!(second.commit_blocked.as_deref().is_some_and(|r| r.contains("package.json")), "{:?}", second.commit_blocked);
+        assert!(second.commit_blocked.is_none() && second.uncommitted == ["package.json"], "{:?} {:?}", second.commit_blocked, second.uncommitted);
     }
 
     #[tokio::test]

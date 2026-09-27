@@ -32,6 +32,9 @@ pub struct BatchOptions {
     pub test: bool,
     /// Commit each repository once its work succeeds.
     pub commit: bool,
+    /// Commit even where the files already had uncommitted changes, which
+    /// then go into the same commit.
+    pub force_commit: bool,
     /// Steps running at once across every repository; at least 1.
     pub parallel: usize,
     /// Stop a repository at its first failed check. When off, the remaining
@@ -145,11 +148,16 @@ impl Job {
         (subject, body)
     }
 
-    fn commit_blocked(&self) -> Option<String> {
+    fn commit_blocked(&self, force: bool) -> Option<String> {
         if self.repo.is_none() {
             return Some("not inside a git repository".into());
         }
-        let reasons: Vec<&str> = self.plans.iter().filter_map(|p| p.commit_blocked.as_deref()).collect();
+        let mut reasons: Vec<String> = self.plans.iter().filter_map(|p| p.commit_blocked.clone()).collect();
+        let mut seen = HashSet::new();
+        let dirty: Vec<&str> = self.plans.iter().flat_map(|p| &p.uncommitted).map(String::as_str).filter(|f| seen.insert(f.to_lowercase())).collect();
+        if !force && !dirty.is_empty() {
+            reasons.push(format!("uncommitted changes in {}", dirty.join(", ")));
+        }
         (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 }
@@ -219,11 +227,11 @@ fn remove_path(path: &Path) {
 
 /// Commits already-applied plans, one commit per repository, as the batch
 /// runner would have with commit on.
-pub fn commit(plans: Vec<UpdatePlan>) -> Vec<CommitOutcome> {
+pub fn commit(plans: Vec<UpdatePlan>, force: bool) -> Vec<CommitOutcome> {
     group(plans)
         .into_iter()
         .map(|job| {
-            let result = match (job.commit_blocked(), &job.repo) {
+            let result = match (job.commit_blocked(force), &job.repo) {
                 (Some(reason), _) => Err(reason),
                 (None, None) => Err("not inside a git repository".into()),
                 (None, Some(repo)) => {
@@ -453,7 +461,7 @@ where
     }
     outcome.ok = true;
     if options.commit {
-        match (job.commit_blocked(), &job.repo) {
+        match (job.commit_blocked(options.force_commit), &job.repo) {
             (Some(reason), _) => outcome.commit_skipped = Some(reason),
             (None, None) => outcome.commit_skipped = Some("not inside a git repository".into()),
             (None, Some(repo)) => {
@@ -504,6 +512,7 @@ mod tests {
             warnings: Vec::new(),
             repo: repo.map(|r| r.display().to_string()),
             commit_blocked: None,
+            uncommitted: Vec::new(),
             branch: None,
             clean_retry: Vec::new(),
         }
@@ -543,7 +552,7 @@ mod tests {
         };
 
         let log = Log::default();
-        let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans(), opts, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok));
         let runs = log.borrow();
@@ -577,7 +586,7 @@ mod tests {
                 let first = calls.get() == 1;
                 async move { if first { (false, "npm error code ERESOLVE".to_string()) } else { (retry_works, "done".to_string()) } }
             };
-            let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
+            let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
             let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
             assert_eq!(calls.get(), 2, "one retry");
             assert_eq!(outcome.ok, retry_works);
@@ -597,7 +606,7 @@ mod tests {
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)])];
         let output = "npm error Could not resolve dependency:
 npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
-        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 1, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
         let outcomes = run(plans, opts, &Cancels::default(), |_, _| async move { (false, output.to_string()) }, |_| {}).await;
         let conflicts = &outcomes[0].conflicts;
         assert!(outcomes[0].rolled_back);
@@ -627,7 +636,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(kinds(true, false), [StepKind::Install, StepKind::Install, StepKind::Verify], "the build without tests");
 
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(log.borrow().len(), 2);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "after");
@@ -646,7 +655,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         ];
         let events = RefCell::new(Vec::new());
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
         let bad_outcome = outcomes.iter().find(|o| o.name == "bad").unwrap();
         assert!(!bad_outcome.ok && bad_outcome.rolled_back, "{:?}", bad_outcome.error);
         assert_eq!(std::fs::read_to_string(bad.join("Cargo.toml")).unwrap(), "before");
@@ -669,7 +678,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         git(&["commit", "-q", "-m", "init"]);
 
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![]), plan(&dir, "app.csproj", Some(&dir), vec![])];
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, parallel: 2, stop_on_failure: true }, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await;
         assert!(outcomes[0].committed.is_some(), "{:?}", outcomes[0].commit_error);
         let log = String::from_utf8(git(&["log", "-1", "--format=%s%n%b"]).stdout).unwrap();
         assert!(log.starts_with("Updated 2 Dependencies"), "{log}");
@@ -683,7 +692,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let dir = temp("keep-going");
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("vitest", StepKind::Verify, &dir), step("npm", StepKind::Test, &dir)])];
         let log = Log::default();
-        let opts = BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: false };
+        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: false };
         let outcomes = run(plans, opts, &Cancels::default(), recorder(&log, "vitest"), |_| {}).await;
         assert_eq!(log.borrow().len(), 3, "the test step still ran after the build failed");
         assert!(!outcomes[0].ok && outcomes[0].rolled_back);
@@ -707,7 +716,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let npm = Step { kind: StepKind::Install, label: "npm version".into(), program: "npm".into(), args: vec!["--version".into()], cwd: d.display().to_string() };
         let plans = vec![plan(&a, "package.json", None, vec![sleep(&a)]), plan(&b, "package.json", None, vec![sleep(&b)]), plan(&c, "x.csproj", None, vec![git]), plan(&d, "y.csproj", None, vec![npm])];
         let started = Instant::now();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |s, c| async move { update::run_step(&s, &c).await }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |s, c| async move { update::run_step(&s, &c).await }, |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok), "{:?}", outcomes.iter().map(|o| &o.error).collect::<Vec<_>>());
         assert!(started.elapsed() >= Duration::from_millis(1500), "the two node steps overlapped: {:?}", started.elapsed());
     }
@@ -719,7 +728,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let plans = vec![plan(&a, "package.json", Some(&a), vec![slow(&a)]), plan(&b, "package.json", Some(&b), vec![slow(&b)])];
         let before = std::fs::read_to_string(a.join("package.json")).unwrap();
         let cancels = Cancels::default();
-        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
         let started = Instant::now();
         let stop = async {
             tokio::time::sleep(Duration::from_millis(600)).await;
@@ -741,7 +750,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let jobs = group(plans.clone());
         let cancels = Cancels::default();
         cancels.cancel(Some(&jobs[1].key));
-        let opts = BatchOptions { build: false, test: false, commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans, opts, &cancels, recorder(&log, ""), |_| {}).await;
         assert!(outcomes[0].ok && !outcomes[0].cancelled);
         assert!(outcomes[1].cancelled && !outcomes[1].ok);
@@ -769,5 +778,28 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert!(!ok);
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!late.exists(), "node, started by the shell, was stopped too");
+    }
+
+    #[tokio::test]
+    async fn forcing_commits_files_that_already_had_changes() {
+        let dir = temp("force-commit");
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("package.json"), "before").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let dirty = || {
+            let mut p = plan(&dir, "package.json", Some(&dir), vec![]);
+            p.uncommitted = vec!["package.json".into()];
+            p
+        };
+        let opts = |force_commit| BatchOptions { build: false, test: false, commit: true, force_commit, parallel: 1, stop_on_failure: true };
+        let held = run(vec![dirty()], opts(false), &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await.remove(0);
+        assert!(held.ok && held.committed.is_none() && held.commit_skipped.as_deref().is_some_and(|r| r.contains("package.json")), "{held:?}");
+        std::fs::write(dir.join("package.json"), "before").unwrap();
+        let forced = run(vec![dirty()], opts(true), &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await.remove(0);
+        assert!(forced.committed.is_some(), "{forced:?}");
     }
 }
