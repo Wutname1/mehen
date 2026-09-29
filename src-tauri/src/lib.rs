@@ -184,6 +184,13 @@ impl AppState {
     }
 }
 
+/// Sends a damaged-database report with the end of the database trace, so
+/// the report shows which processes were working on the file just before.
+fn report_damage(message: &str) {
+    let trace = mehen_core::trace::tail(200);
+    sentry::with_scope(|scope| scope.set_extra("db_trace", trace.into()), || sentry::capture_message(message, sentry::Level::Error));
+}
+
 /// Scans the watched folders (minus ignored ones) and checks every package.
 /// With `only`, scans just those folders and folds the result into the last one.
 async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) -> Result<Inventory, String> {
@@ -195,8 +202,16 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
         let _ = app.emit("mehen://progress", p);
     };
     let full = only.is_none();
-    let checked = background::run_check(&state.store, &dir, refresh, only, state.remembered(), emit).await?;
+    mehen_core::trace::line(format!("check start: {}", only.as_ref().map_or_else(|| "full".to_string(), |o| format!("only {o:?}"))));
+    let started = std::time::Instant::now();
+    let checked = background::run_check(&state.store, &dir, refresh, only, state.remembered(), emit).await;
+    mehen_core::trace::line(format!("check end: {} in {} ms", if checked.is_ok() { "ok" } else { "failed" }, started.elapsed().as_millis()));
+    let checked = checked?;
     state.remember(&checked);
+    let health = state.store.health();
+    if !health.ok {
+        report_damage(&format!("Mehen's saved data was damaged during a check: {}", health.detail));
+    }
     if full {
         // Only a full check knows everything still in use. Awaited, so the
         // cleanup finishes while this check still holds the lock and no
@@ -204,8 +219,12 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
         let app = app.clone();
         let snapshot = checked.clone();
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            if let Err(e) = app.state::<AppState>().store.prune(&snapshot) {
-                eprintln!("Cleaning the cache failed: {e:#}");
+            match app.state::<AppState>().store.prune(&snapshot) {
+                Ok(pruned) => mehen_core::trace::line(format!("pruned: {pruned:?}")),
+                Err(e) => {
+                    mehen_core::trace::line(format!("prune failed: {e:#}"));
+                    eprintln!("Cleaning the cache failed: {e:#}");
+                }
             }
         })
         .await;
@@ -660,14 +679,17 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(self_update::Pending::default())
         .setup(|app| {
-            let db = app.path().app_data_dir()?.join("mehen.db");
-            let (store, repaired) = Store::open_or_repair(&db).map_err(|e| e.to_string())?;
+            let dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            // Before the database opens: SQLite only takes its log callback then.
+            mehen_core::trace::init(&dir, "app");
+            let (store, repaired) = Store::open_or_repair(&dir.join("mehen.db")).map_err(|e| e.to_string())?;
             let inventory = std::sync::Mutex::new(store.last_inventory());
             app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default(), inventory });
             telemetry::set_enabled(app.state::<AppState>().error_reports());
             if let Some(note) = repaired {
                 eprintln!("{note}");
-                sentry::capture_message(&note, sentry::Level::Warning);
+                report_damage(&note);
             }
             build_tray(app)?;
             start_background_loop(app.handle().clone());

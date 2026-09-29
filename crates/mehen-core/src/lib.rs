@@ -22,6 +22,7 @@ pub mod scan;
 pub mod status;
 pub mod store;
 pub mod together;
+pub mod trace;
 pub mod update;
 pub mod version;
 

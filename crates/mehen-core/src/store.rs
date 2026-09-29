@@ -48,6 +48,23 @@ impl Hold {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The database file; `None` in memory.
+    path: Option<PathBuf>,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if self.path.is_some() {
+            crate::trace::line(format!("closed: {}", self.state()));
+        }
+    }
+}
+
+/// A database's health: `ok` or SQLite's first complaint.
+#[derive(Debug, Clone)]
+pub struct Health {
+    pub ok: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -78,24 +95,37 @@ fn fresh_after(max_age: Duration) -> i64 {
     now() - max_age.as_secs() as i64
 }
 
+/// `PRAGMA quick_check`: `ok`, or SQLite's first complaint.
+fn check(conn: &Connection) -> Health {
+    match conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0)) {
+        Ok(s) if s == "ok" => Health { ok: true, detail: s },
+        Ok(s) => Health { ok: false, detail: s.trim_start_matches("*** in database main ***").trim().to_string() },
+        Err(e) => Health { ok: false, detail: e.to_string() },
+    }
+}
+
 /// `20260928-204437` in UTC, for folder names.
 fn stamp() -> String {
     stamp_at(now())
 }
 
 fn stamp_at(secs: i64) -> String {
-    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rest / 3600, rest % 3600 / 60, rest % 60)
+    let (date, time) = crate::trace::civil(secs);
+    format!("{}-{}", date.replace('-', ""), time.replace(':', ""))
+}
+
+/// The `-wal` file's size, reset count and generation (its first salt),
+/// read from its header: a reset bumps both counters.
+fn wal_header(path: &Path) -> Option<String> {
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let size = std::fs::metadata(&wal).ok()?.len();
+    let mut header = [0u8; 32];
+    let read = std::fs::File::open(&wal).and_then(|mut f| std::io::Read::read(&mut f, &mut header)).unwrap_or(0);
+    if read < 32 {
+        return Some(format!("wal={size}B"));
+    }
+    let be = |at: usize| u32::from_be_bytes(header[at..at + 4].try_into().unwrap_or_default());
+    Some(format!("wal={size}B wal_resets={} wal_salt={:08x}", be(12), be(16)))
 }
 
 /// Moves a damaged database (with its `-wal` and `-shm`) into a
@@ -176,7 +206,9 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Self::init(Connection::open(path)?)
+        let store = Self::init(Connection::open(path)?, Some(path.to_path_buf()))?;
+        crate::trace::line(format!("opened: {}", store.state()));
+        Ok(store)
     }
 
     /// Opens the database, rebuilding it first when SQLite finds it damaged:
@@ -188,37 +220,81 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let problem = {
+        let health = {
             let conn = Connection::open(path)?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
-            let found: rusqlite::Result<String> = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0));
-            match found {
-                Ok(s) if s == "ok" => None,
-                Ok(s) => Some(s.trim_start_matches("*** in database main ***").trim().to_string()),
-                Err(e) => Some(e.to_string()),
-            }
+            check(&conn)
         };
-        let Some(problem) = problem else { return Ok((Self::open(path)?, None)) };
-        match rebuild(path) {
-            Ok((store, backup, kept, lost)) => Ok((
-                store,
-                Some(format!("Mehen's saved data was damaged ({problem}) and has been rebuilt: {kept} rows kept, {lost} could not be read. The damaged copy is in {}.", backup.display())),
-            )),
-            Err(e) => Ok((Self::open(path)?, Some(format!("Mehen's saved data is damaged ({problem}) and could not be rebuilt: {e:#}")))),
+        if health.ok {
+            return Ok((Self::open(path)?, None));
         }
+        let problem = health.detail;
+        crate::trace::line(format!("damaged at start: {problem} ({})", wal_header(path).unwrap_or_default()));
+        let note = match rebuild(path) {
+            Ok((store, backup, kept, lost)) => {
+                let note = format!("Mehen's saved data was damaged ({problem}) and has been rebuilt: {kept} rows kept, {lost} could not be read. The damaged copy is in {}.", backup.display());
+                crate::trace::line(format!("rebuilt: kept={kept} lost={lost} backup={}", backup.display()));
+                return Ok((store, Some(note)));
+            }
+            Err(e) => format!("Mehen's saved data is damaged ({problem}) and could not be rebuilt: {e:#}"),
+        };
+        crate::trace::line(&note);
+        Ok((Self::open(path)?, Some(note)))
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> anyhow::Result<Self> {
+    /// One line on the file's state for the trace: journal mode, sizes,
+    /// free pages and the WAL header.
+    pub fn state(&self) -> String {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let text = |pragma: &str| match conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get::<_, rusqlite::types::Value>(0)) {
+            Ok(rusqlite::types::Value::Text(s)) => s,
+            Ok(rusqlite::types::Value::Integer(i)) => i.to_string(),
+            Ok(other) => format!("{other:?}"),
+            Err(e) => format!("error({e})"),
+        };
+        let wal = self.path.as_deref().and_then(wal_header).unwrap_or_else(|| "wal=none".into());
+        format!(
+            "journal={} auto_vacuum={} pages={} free={} user_version={} data_version={} {wal}",
+            text("journal_mode"),
+            text("auto_vacuum"),
+            text("page_count"),
+            text("freelist_count"),
+            text("user_version"),
+            text("data_version")
+        )
+    }
+
+    /// Checks the whole file for damage (`PRAGMA quick_check`), and records
+    /// the result in the trace with the file's state.
+    pub fn health(&self) -> Health {
+        let health = check(&self.conn.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::trace::line(format!("health: {} {}", if health.ok { "ok" } else { "DAMAGED" }, if health.ok { self.state() } else { format!("{} | {}", health.detail, self.state()) }));
+        health
+    }
+
+    fn init(conn: Connection, path: Option<PathBuf>) -> anyhow::Result<Self> {
         // The app and a background check (from GitWyrm or the daily task) can
         // have the database open at once; wait for the other writer rather
         // than failing straight away.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Not WAL: SQLite 3.53.0 to 3.53.3 (3.53.2 is bundled today) have
+        // the WAL-reset bug, where a checkpoint racing another connection's
+        // commit skips transactions and the WAL then restarts over them
+        // (https://www.sqlite.org/wal.html#walresetbug). The app and background
+        // runs write at the same time, and both damaged databases showed
+        // exactly that: a whole WAL generation never copied into the file.
+        // Leaving WAL needs every other connection closed; until it works, the
+        // file stays in WAL and the switch is tried again on the next open.
+        // TODO: go back to WAL once libsqlite3-sys bundles SQLite 3.53.4 or later.
+        let journal: String = conn.query_row("PRAGMA journal_mode = TRUNCATE", [], |r| r.get(0)).unwrap_or_else(|e| format!("unchanged ({e})"));
+        if path.is_some() && !journal.eq_ignore_ascii_case("truncate") {
+            crate::trace::line(format!("journal mode not switched: {journal}"));
+        }
+        conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version < 1 {
             conn.execute_batch(
@@ -314,18 +390,21 @@ impl Store {
             conn.execute_batch("DELETE FROM advisory; PRAGMA user_version = 10;")?;
         }
         if version < 11 {
-            // Both damaged databases seen so far were broken in the pages
-            // incremental auto-vacuum keeps, so files go back to plain pages
-            // (freed pages are reused, not handed back). The change needs a
-            // VACUUM, which waits for other connections; when it cannot run
-            // now it is tried again on the next start.
+            // Incremental auto-vacuum is no longer used: freed pages are reused
+            // rather than handed back, and there is one less structure to keep
+            // consistent. The change needs a VACUUM, which waits for other
+            // connections; when it cannot run now it is tried again next start.
             conn.execute_batch("PRAGMA auto_vacuum = NONE;")?;
             let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
-            if mode == 0 || conn.execute_batch("VACUUM;").is_ok() {
+            let vacuumed = if mode == 0 { Ok(()) } else { conn.execute_batch("VACUUM;") };
+            if path.is_some() && mode != 0 {
+                crate::trace::line(format!("auto-vacuum off: {}", vacuumed.as_ref().map_or_else(|e| format!("VACUUM failed, retried next start ({e})"), |()| "done".into())));
+            }
+            if vacuumed.is_ok() {
                 conn.execute_batch("PRAGMA user_version = 11;")?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Mutex::new(conn), path })
     }
 
     /// A cached lookup that is still fresh: `Ok` for a found package, `Err`
@@ -855,6 +934,54 @@ mod repair {
         assert!(backups[0].path().join("mehen.db").exists(), "the damaged copy is kept");
         let (_, again) = Store::open_or_repair(&path).unwrap();
         assert!(again.is_none(), "the rebuilt file is healthy");
+    }
+
+    fn journal(path: &Path) -> String {
+        Connection::open(path).unwrap().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_wal_database_leaves_wal_when_nothing_else_has_it_open() {
+        let dir = temp("leave-wal");
+        let path = dir.join("mehen.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE x (y);").unwrap();
+        }
+        assert_eq!(journal(&path), "wal");
+        drop(Store::open(&path).unwrap());
+        // Only WAL is kept in the file; a plain connection reads the rest as "delete".
+        assert_ne!(journal(&path), "wal");
+    }
+
+    #[test]
+    fn another_process_in_wal_does_not_stop_it_opening() {
+        let dir = temp("held-wal");
+        let path = dir.join("mehen.db");
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE x (y); INSERT INTO x VALUES (1);").unwrap();
+        let store = Store::open(&path).expect("opens while another connection holds the file in WAL");
+        store.add_folder("C:\\code").unwrap();
+        assert_eq!(store.folders(), ["C:\\code"]);
+        drop(other);
+        drop(store);
+        drop(Store::open(&path).unwrap());
+        assert_ne!(journal(&path), "wal", "switched on the next open, once alone");
+    }
+
+    #[test]
+    fn the_trace_records_opens_and_health() {
+        let dir = temp("trace");
+        crate::trace::init(&dir, "test");
+        let store = Store::open(&dir.join("mehen.db")).unwrap();
+        assert!(store.health().ok);
+        drop(store);
+        // Another test may have started the trace first; either way the log has these lines.
+        let text = std::fs::read_to_string(dir.join("db-trace.log")).unwrap_or_else(|_| crate::trace::tail(10_000));
+        let all = format!("{text}\n{}", crate::trace::tail(10_000));
+        assert!(all.contains("opened: journal="), "{all}");
+        assert!(all.contains("health: ok"), "{all}");
+        assert!(all.contains("closed:"), "{all}");
     }
 
     #[test]

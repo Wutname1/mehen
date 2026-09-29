@@ -145,8 +145,19 @@ fn only_paths(args: &[String]) -> Option<Vec<String>> {
 /// does nothing when another check is running or no folders are set up.
 pub fn run(args: &[String]) -> i32 {
     let Some(dir) = data_dir() else { return 1 };
-    let Some(_lock) = CheckLock::try_take(&dir) else { return 0 };
-    let Ok(store) = Store::open(&dir.join("mehen.db")) else { return 1 };
+    let _ = std::fs::create_dir_all(&dir);
+    mehen_core::trace::init(&dir, "background");
+    let Some(_lock) = CheckLock::try_take(&dir) else {
+        mehen_core::trace::line("skipped: another check holds the lock");
+        return 0;
+    };
+    let store = match Store::open(&dir.join("mehen.db")) {
+        Ok(store) => store,
+        Err(e) => {
+            mehen_core::trace::line(format!("open failed: {e:#}"));
+            return 1;
+        }
+    };
     if store.folders().is_empty() {
         return 0;
     }
@@ -155,7 +166,11 @@ pub fn run(args: &[String]) -> i32 {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 1 };
     // No cache cleanup here: it rewrites the database's free-page lists, so it
     // stays with the app, one process, under the check lock.
-    if runtime.block_on(run_check(&store, &dir, false, only, None, |_| {})).is_err() {
+    let started = std::time::Instant::now();
+    let checked = runtime.block_on(run_check(&store, &dir, false, only, None, |_| {}));
+    mehen_core::trace::line(format!("check end: {} in {} ms", checked.as_ref().map_or_else(|e| format!("failed ({e})"), |_| "ok".into()), started.elapsed().as_millis()));
+    store.health();
+    if checked.is_err() {
         return 0;
     }
     if args.iter().any(|a| a == SCHEDULED_FLAG) && store.setting(NOTIFY).is_none_or(|v| v != "false") {
