@@ -10,7 +10,7 @@ use mehen_core::batch::{self, BatchEvent, BatchOptions, CommitOutcome, JobOutcom
 use mehen_core::status::Fresh;
 use mehen_core::store::{Hold, StoreStats};
 use mehen_core::update::{self, Change, UpdatePlan};
-use mehen_core::{DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Store};
+use mehen_core::{DiscoveredProject, Ecosystem, IgnoreKind, IgnoreRule, IgnoreSet, Inventory, Progress, Project, Store};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -50,6 +50,41 @@ struct AppState {
     checking: AtomicBool,
     /// Stop switches for the update running now.
     cancels: std::sync::Mutex<Arc<Cancels>>,
+    /// The last result this app ran or loaded, for when the saved one cannot
+    /// be read back.
+    inventory: std::sync::Mutex<Option<Inventory>>,
+}
+
+impl AppState {
+    fn remember(&self, inventory: &Inventory) {
+        *self.inventory.lock().unwrap_or_else(|e| e.into_inner()) = Some(inventory.clone());
+    }
+
+    fn remembered(&self) -> Option<Inventory> {
+        self.inventory.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The newest result: the saved one, or the one in memory when the saved
+    /// one cannot be read.
+    fn last_result(&self) -> Option<Inventory> {
+        self.store.last_inventory().or_else(|| self.remembered())
+    }
+
+    /// A project as the last check saw it. Falls back to the result in memory
+    /// when the saved one cannot be read or lacks the project, and otherwise
+    /// says why there is nothing to go on.
+    fn project(&self, id: &str) -> Result<Project, String> {
+        let find = |inventory: &Inventory| inventory.projects.iter().find(|p| p.id == id).cloned();
+        let saved = self.store.read_last_inventory();
+        if let Some(project) = saved.as_ref().ok().and_then(|i| i.as_ref()).and_then(find).or_else(|| self.remembered().as_ref().and_then(find)) {
+            return Ok(project);
+        }
+        Err(match saved {
+            Err(e) => format!("Mehen could not read its last check ({e:#}). Check again, then try once more."),
+            Ok(None) => "Run a check first".into(),
+            Ok(Some(_)) => "That project is not in the last check. Check again first.".into(),
+        })
+    }
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -160,7 +195,8 @@ async fn check_now(app: &AppHandle, refresh: bool, only: Option<Vec<String>>) ->
         let _ = app.emit("mehen://progress", p);
     };
     let full = only.is_none();
-    let checked = background::run_check(&state.store, &dir, refresh, only, emit).await?;
+    let checked = background::run_check(&state.store, &dir, refresh, only, state.remembered(), emit).await?;
+    state.remember(&checked);
     if full {
         // Only a full check knows everything still in use. Awaited, so the
         // cleanup finishes while this check still holds the lock and no
@@ -362,11 +398,12 @@ struct IgnoreResult {
 #[tauri::command]
 fn add_ignore(app: AppHandle, state: State<'_, AppState>, kind: IgnoreKind, value: String, note: Option<String>) -> Result<IgnoreResult, String> {
     state.store.add_ignore_rule(kind, &value, note.as_deref()).map_err(err)?;
-    let inventory = state.store.last_inventory().map(|mut inv| {
+    let inventory = state.last_result().map(|mut inv| {
         IgnoreSet::new(&state.store.ignore_rules(), &state.roots()).apply(&mut inv);
         inv
     });
     if let Some(inv) = &inventory {
+        state.remember(inv);
         state.store.replace_last_inventory(inv).map_err(err)?;
         publish_status(&app, inv, Fresh::None);
     }
@@ -390,7 +427,7 @@ async fn discover(state: State<'_, AppState>) -> Result<Vec<DiscoveredProject>, 
 /// The last saved result, so the app opens with data instead of a spinner.
 #[tauri::command]
 fn last_inventory(state: State<'_, AppState>) -> Option<Inventory> {
-    state.store.last_inventory()
+    state.last_result()
 }
 
 /// With `refresh`, cached registry and vulnerability answers are ignored.
@@ -403,9 +440,8 @@ async fn scan_and_check(app: AppHandle, refresh: bool, only: Option<Vec<String>>
 /// Works out exactly what an update would change, without writing anything.
 #[tauri::command]
 fn plan_update(state: State<'_, AppState>, project_id: String, changes: Vec<Change>) -> Result<UpdatePlan, String> {
-    let inventory = state.store.last_inventory().ok_or("Run a check first")?;
-    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
-    let mut plan = update::plan(project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))?;
+    let project = state.project(&project_id)?;
+    let mut plan = update::plan(&project, &changes, |name| state.store.package_any_age(Ecosystem::GithubActions, name)).map_err(|e| format!("{e:#}"))?;
     let commands = state.check_commands();
     let repo = project.repo.clone().unwrap_or_else(|| project.dir.clone());
     let chosen = match commands.iter().find(|(scope, _)| scope.eq_ignore_ascii_case(&repo)) {
@@ -547,19 +583,17 @@ async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: 
 /// what it asks for.
 #[tauri::command]
 async fn package_versions(app: AppHandle, project_id: String, name: String) -> Result<Vec<check::VersionView>, String> {
-    let store = &app.state::<AppState>().store;
-    let inventory = store.last_inventory().ok_or("Run a check first")?;
-    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
-    check::project_context(store, project).await.versions(&name).ok_or_else(|| format!("Mehen has no version list for {name} yet. Check again first."))
+    let state = app.state::<AppState>();
+    let project = state.project(&project_id)?;
+    check::project_context(&state.store, &project).await.versions(&name).ok_or_else(|| format!("Mehen has no version list for {name} yet. Check again first."))
 }
 
 /// What else has to move for `name` to go to `version` in one project.
 #[tauri::command]
 async fn move_with(app: AppHandle, project_id: String, name: String, version: String) -> Result<Vec<check::Move>, String> {
-    let store = &app.state::<AppState>().store;
-    let inventory = store.last_inventory().ok_or("Run a check first")?;
-    let project = inventory.projects.iter().find(|p| p.id == project_id).ok_or("That project is not in the last check")?;
-    check::project_context(store, project).await.move_with(&name, &version)
+    let state = app.state::<AppState>();
+    let project = state.project(&project_id)?;
+    check::project_context(&state.store, &project).await.move_with(&name, &version)
 }
 
 #[tauri::command]
@@ -627,9 +661,14 @@ pub fn run() {
         .manage(self_update::Pending::default())
         .setup(|app| {
             let db = app.path().app_data_dir()?.join("mehen.db");
-            let store = Store::open(&db).map_err(|e| e.to_string())?;
-            app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default() });
+            let (store, repaired) = Store::open_or_repair(&db).map_err(|e| e.to_string())?;
+            let inventory = std::sync::Mutex::new(store.last_inventory());
+            app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default(), inventory });
             telemetry::set_enabled(app.state::<AppState>().error_reports());
+            if let Some(note) = repaired {
+                eprintln!("{note}");
+                sentry::capture_message(&note, sentry::Level::Warning);
+            }
             build_tray(app)?;
             start_background_loop(app.handle().clone());
             // Re-created on every start, so the task follows Mehen when it is

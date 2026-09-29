@@ -3,7 +3,7 @@
 //! each scan is kept so the app can open on the last results.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -78,6 +78,80 @@ fn fresh_after(max_age: Duration) -> i64 {
     now() - max_age.as_secs() as i64
 }
 
+/// `20260928-204437` in UTC, for folder names.
+fn stamp() -> String {
+    stamp_at(now())
+}
+
+fn stamp_at(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rest / 3600, rest % 3600 / 60, rest % 60)
+}
+
+/// Moves a damaged database (with its `-wal` and `-shm`) into a
+/// `backup-corrupt-<time>` folder, then copies every row that can still be
+/// read into a fresh file at `path`, one row at a time so a damaged page
+/// only loses the rows on it. Returns the store, the backup folder, and how
+/// many rows were kept and lost.
+fn rebuild(path: &Path) -> anyhow::Result<(Store, PathBuf, usize, usize)> {
+    let dir = path.parent().ok_or_else(|| anyhow::anyhow!("no folder for {}", path.display()))?;
+    let backup = dir.join(format!("backup-corrupt-{}", stamp()));
+    std::fs::create_dir_all(&backup)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "mehen.db".into());
+    let old = backup.join(&name);
+    // Main file first: if another process holds it open, nothing has moved.
+    if let Err(e) = std::fs::rename(path, &old) {
+        let _ = std::fs::remove_dir(&backup);
+        return Err(e.into());
+    }
+    for suffix in ["-wal", "-shm"] {
+        let side = dir.join(format!("{name}{suffix}"));
+        if side.exists() {
+            let _ = std::fs::rename(&side, backup.join(format!("{name}{suffix}")));
+        }
+    }
+    let store = Store::open(path)?;
+    let (mut kept, mut lost) = (0, 0);
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute("ATTACH DATABASE ?1 AS old", params![old.display().to_string()])?;
+        let tables: Vec<String> = conn.prepare("SELECT name FROM main.sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let columns = |schema: &str, table: &str| -> Vec<String> {
+            conn.prepare(&format!("PRAGMA {schema}.table_info(\"{table}\")"))
+                .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>())
+                .unwrap_or_default()
+        };
+        for table in tables {
+            let old_columns = columns("old", &table);
+            let shared: Vec<String> = columns("main", &table).into_iter().filter(|c| old_columns.contains(c)).map(|c| format!("\"{c}\"")).collect();
+            if shared.is_empty() {
+                continue;
+            }
+            let Ok(max) = conn.query_row(&format!("SELECT max(rowid) FROM old.\"{table}\""), [], |r| r.get::<_, Option<i64>>(0)) else { continue };
+            let list = shared.join(", ");
+            let sql = format!("INSERT OR IGNORE INTO main.\"{table}\" ({list}) SELECT {list} FROM old.\"{table}\" WHERE rowid = ?1");
+            for rowid in 1..=max.unwrap_or(0) {
+                match conn.execute(&sql, params![rowid]) {
+                    Ok(n) => kept += n,
+                    Err(_) => lost += 1,
+                }
+            }
+        }
+        conn.execute_batch("DETACH DATABASE old")?;
+    }
+    Ok((store, backup, kept, lost))
+}
+
 /// Lowercase with backslashes and no trailing separator, so one folder is one row.
 fn repo_key(path: &str) -> String {
     path.replace('/', "\\").trim_end_matches('\\').to_lowercase()
@@ -103,6 +177,35 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         Self::init(Connection::open(path)?)
+    }
+
+    /// Opens the database, rebuilding it first when SQLite finds it damaged:
+    /// the damaged files move to a `backup-corrupt-<time>` folder beside it,
+    /// and every row that can still be read is copied into a fresh file.
+    /// Returns what was done when it had to rebuild. When the damaged file
+    /// cannot be moved (another process has it open) it is opened as it is.
+    pub fn open_or_repair(path: &Path) -> anyhow::Result<(Self, Option<String>)> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let problem = {
+            let conn = Connection::open(path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let found: rusqlite::Result<String> = conn.query_row("PRAGMA quick_check(1)", [], |r| r.get(0));
+            match found {
+                Ok(s) if s == "ok" => None,
+                Ok(s) => Some(s.trim_start_matches("*** in database main ***").trim().to_string()),
+                Err(e) => Some(e.to_string()),
+            }
+        };
+        let Some(problem) = problem else { return Ok((Self::open(path)?, None)) };
+        match rebuild(path) {
+            Ok((store, backup, kept, lost)) => Ok((
+                store,
+                Some(format!("Mehen's saved data was damaged ({problem}) and has been rebuilt: {kept} rows kept, {lost} could not be read. The damaged copy is in {}.", backup.display())),
+            )),
+            Err(e) => Ok((Self::open(path)?, Some(format!("Mehen's saved data is damaged ({problem}) and could not be rebuilt: {e:#}")))),
+        }
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
@@ -203,12 +306,24 @@ impl Store {
             conn.execute_batch("ALTER TABLE package ADD COLUMN kept_from TEXT; PRAGMA user_version = 8;")?;
         }
         if version < 9 {
-            // Lets `prune` hand freed pages back to the disk; takes effect after one VACUUM.
-            conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM; PRAGMA user_version = 9;")?;
+            // Once turned on incremental auto-vacuum; version 11 turns it off again.
+            conn.execute_batch("PRAGMA user_version = 9;")?;
         }
         if version < 10 {
             // Advisories saved before affected ranges were kept are fetched again.
             conn.execute_batch("DELETE FROM advisory; PRAGMA user_version = 10;")?;
+        }
+        if version < 11 {
+            // Both damaged databases seen so far were broken in the pages
+            // incremental auto-vacuum keeps, so files go back to plain pages
+            // (freed pages are reused, not handed back). The change needs a
+            // VACUUM, which waits for other connections; when it cannot run
+            // now it is tried again on the next start.
+            conn.execute_batch("PRAGMA auto_vacuum = NONE;")?;
+            let mode: i64 = conn.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
+            if mode == 0 || conn.execute_batch("VACUUM;").is_ok() {
+                conn.execute_batch("PRAGMA user_version = 11;")?;
+            }
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -336,13 +451,18 @@ impl Store {
     }
 
     pub fn last_inventory(&self) -> Option<Inventory> {
+        self.read_last_inventory().ok().flatten()
+    }
+
+    /// The newest saved scan; an error says why it could not be read, which
+    /// `last_inventory` would report as no scan at all.
+    pub fn read_last_inventory(&self) -> anyhow::Result<Option<Inventory>> {
         let conn = self.conn.lock().unwrap();
-        let json: String = conn
-            .query_row("SELECT inventory_json FROM scan ORDER BY finished_at DESC, id DESC LIMIT 1", [], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()?;
-        serde_json::from_str(&json).ok()
+        let json: Option<String> = conn.query_row("SELECT inventory_json FROM scan ORDER BY finished_at DESC, id DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+        Ok(match json {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            None => None,
+        })
     }
 
     pub fn setting(&self, key: &str) -> Option<String> {
@@ -563,7 +683,6 @@ impl Store {
             pruned.icons += 1;
         }
         tx.commit()?;
-        conn.execute_batch("PRAGMA incremental_vacuum;")?;
         Ok(pruned)
     }
 
@@ -677,6 +796,82 @@ mod tests {
         assert!(store.package(Ecosystem::Npm, "kept", PACKAGE_TTL).is_some(), "a held package stays");
         assert!(store.advisory("GHSA-now").is_some() && store.advisory("GHSA-old").is_none());
         assert_eq!(store.prune(&inventory).unwrap(), Pruned::default(), "a second pass has nothing to do");
+    }
+}
+
+#[cfg(test)]
+mod repair {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mehen-store-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_healthy_database_opens_as_it_is() {
+        let dir = temp("healthy");
+        let path = dir.join("mehen.db");
+        Store::open(&path).unwrap().add_folder("C:\\code").unwrap();
+        let (store, note) = Store::open_or_repair(&path).unwrap();
+        assert!(note.is_none());
+        assert_eq!(store.folders(), ["C:\\code"]);
+        let mode: i64 = store.conn.lock().unwrap().pragma_query_value(None, "auto_vacuum", |r| r.get(0)).unwrap();
+        assert_eq!(mode, 0, "new files do not use auto-vacuum");
+    }
+
+    #[test]
+    fn a_damaged_database_is_rebuilt_keeping_what_can_be_read() {
+        let dir = temp("damaged");
+        let path = dir.join("mehen.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.add_folder("C:\\code").unwrap();
+            store.add_ignore_rule(IgnoreKind::Pattern, "_spikes", None).unwrap();
+            let info = PackageInfo { latest: Some("1.0.0".into()), versions: vec!["1.0.0".into(); 40], tags: Vec::new(), requirements: Vec::new() };
+            for i in 0..400 {
+                store.put_package(Ecosystem::Npm, &format!("package-{i}"), &info);
+            }
+            store.save_inventory(&Inventory { roots: vec!["C:\\code".into()], ..Default::default() }).unwrap();
+            store.conn.lock().unwrap().execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        // Scribble over a page near the end, where the package rows are.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let page = 4096;
+        let at = (bytes.len() / page - 3) * page;
+        bytes[at..at + page].fill(0x5a);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (store, note) = Store::open_or_repair(&path).unwrap();
+        let note = note.expect("the damage was found");
+        assert!(note.contains("rebuilt"), "{note}");
+        assert_eq!(store.folders(), ["C:\\code"], "settings-like rows survive");
+        assert_eq!(store.ignore_rules().len(), 1);
+        assert!(store.read_last_inventory().unwrap().is_some(), "the last check can be read again");
+        let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("backup-corrupt-")).collect();
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].path().join("mehen.db").exists(), "the damaged copy is kept");
+        let (_, again) = Store::open_or_repair(&path).unwrap();
+        assert!(again.is_none(), "the rebuilt file is healthy");
+    }
+
+    #[test]
+    fn stamps_are_utc_dates() {
+        assert_eq!(stamp_at(0), "19700101-000000");
+        assert_eq!(stamp_at(951_782_400), "20000229-000000");
+        assert_eq!(stamp_at(1_709_251_199), "20240229-235959");
+    }
+
+    /// `MEHEN_DB=<copy of a damaged mehen.db> cargo test -p mehen-core repair_real -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn repair_real_copy() {
+        let path = PathBuf::from(std::env::var("MEHEN_DB").expect("MEHEN_DB"));
+        let (store, note) = Store::open_or_repair(&path).unwrap();
+        println!("{note:?}");
+        println!("{:?}, folders {:?}, last check readable: {}", store.stats().unwrap(), store.folders(), store.read_last_inventory().is_ok_and(|i| i.is_some()));
     }
 }
 

@@ -95,8 +95,10 @@ pub fn publish(dir: &Path, inventory: &Inventory, fresh: Fresh) {
 /// saves the result and publishes the summary. With `only`, checks just those
 /// folders and folds the result into the last one; folders outside every
 /// watched folder are left alone. The caller holds the [`CheckLock`] and
-/// prunes the cache after a full check.
-pub async fn run_check(store: &Store, dir: &Path, refresh: bool, only: Option<Vec<String>>, emit: impl Fn(Progress)) -> Result<Inventory, String> {
+/// prunes the cache after a full check. `fallback` stands in for the last
+/// result when the saved one cannot be read, so a partial check still has
+/// the rest of the projects to fold into.
+pub async fn run_check(store: &Store, dir: &Path, refresh: bool, only: Option<Vec<String>>, fallback: Option<Inventory>, emit: impl Fn(Progress)) -> Result<Inventory, String> {
     emit(Progress { phase: "Finding projects".into(), done: 0, total: 0 });
     let folders = store.folders();
     if folders.is_empty() {
@@ -108,7 +110,7 @@ pub async fn run_check(store: &Store, dir: &Path, refresh: bool, only: Option<Ve
     }
     let roots: Vec<PathBuf> = folders.iter().map(PathBuf::from).collect();
     let ignore = IgnoreSet::new(&store.ignore_rules(), &roots);
-    let previous = only.as_ref().and_then(|_| store.last_inventory());
+    let previous = only.as_ref().and_then(|_| store.last_inventory().or(fallback));
     let scan_roots: Vec<PathBuf> = match &only {
         Some(paths) => paths.iter().map(PathBuf::from).collect(),
         None => roots,
@@ -153,7 +155,7 @@ pub fn run(args: &[String]) -> i32 {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 1 };
     // No cache cleanup here: it rewrites the database's free-page lists, so it
     // stays with the app, one process, under the check lock.
-    if runtime.block_on(run_check(&store, &dir, false, only, |_| {})).is_err() {
+    if runtime.block_on(run_check(&store, &dir, false, only, None, |_| {})).is_err() {
         return 0;
     }
     if args.iter().any(|a| a == SCHEDULED_FLAG) && store.setting(NOTIFY).is_none_or(|v| v != "false") {
