@@ -1,4 +1,4 @@
-import type { Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
+import type { Change, Conflict, Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
 
 export const ECOSYSTEMS: Ecosystem[] = ['npm', 'pypi', 'cargo', 'nuget', 'go', 'pub', 'packagist', 'rubygems', 'github-actions']
 
@@ -406,6 +406,60 @@ export function projectTypes(projects: Project[]): ProjectType[] {
 export function holdLine(version: string): string {
   const parts = version.replace(/^v/i, '').split(/[.-]/)
   return parts[0] === '0' && parts[1] ? `0.${parts[1]}` : parts[0]
+}
+
+/** A package an update left behind after it broke the project, and what went in instead. */
+export interface Fallback {
+  name: string
+  /** The version that was tried. */
+  tried: string
+  /** The newest release on the line it was on, or null when it stayed as it was. */
+  to: string | null
+  /** The version it stays on when `to` is null. */
+  stays: string
+  /** Set when this package only went with `with`, which is the one that broke it. */
+  with: string | null
+  keep: NonNullable<Conflict['keep']>
+}
+
+/**
+ * The same update without the packages a failure points at. Each one moves to
+ * the newest release on the line it was already on, when that is newer than
+ * what the project has, and otherwise stays out. A package that only moves
+ * together with a culprit (a framework's parts) is held back too when its own
+ * update also leaves its line; one that stays on its line goes ahead. `null`
+ * when nothing would change or nothing would be left to update.
+ */
+export function withoutCulprits(targets: { project: Project; changes: Change[] }[], culprits: NonNullable<Conflict['keep']>[]): { targets: { project: Project; changes: Change[] }[]; fallbacks: Fallback[] } | null {
+  const lower = (s: string) => s.toLowerCase()
+  const bare = (v: string) => v.replace(/^[^\d]*/, '')
+  const deps = targets.flatMap((t) => t.project.dependencies)
+  const leaderOf = (name: string) => deps.find((d) => lower(d.name) === lower(name))?.group ?? name
+  const culpritOf = (name: string) => culprits.find((k) => lower(k.name) === lower(name))
+  const partner = (name: string) => culprits.find((k) => lower(leaderOf(k.name)) === lower(leaderOf(name)))
+  const fallbacks: Fallback[] = []
+  let changed = false
+  const next = targets
+    .map((t) => ({
+      ...t,
+      changes: t.changes.flatMap((c) => {
+        const dep = t.project.dependencies.find((d) => lower(d.name) === lower(c.name))
+        const from = dep?.current ?? bare(c.from)
+        const leaves = holdLine(from) !== holdLine(bare(c.to))
+        const own = culpritOf(c.name)
+        const mate = own ? null : partner(c.name)
+        // Only an update that leaves its line is held back.
+        if (!leaves || !(own || mate)) return [c]
+        changed = true
+        const keep = own ?? { ecosystem: t.project.ecosystem, name: c.name, line: holdLine(from), from, to: c.to }
+        const safe = dep?.safeLatest
+        const to = safe && dep?.current && holdLine(safe) === keep.line && isBehind(dep.current, safe) && safe !== c.to ? safe : null
+        if (!fallbacks.some((f) => lower(f.name) === lower(c.name))) fallbacks.push({ name: c.name, tried: c.to, to, stays: from, with: mate?.name ?? null, keep })
+        return to ? [{ ...c, to }] : []
+      }),
+    }))
+    .filter((t) => t.changes.length > 0)
+  return changed && next.length ? { targets: next, fallbacks } : null
 }
 
 /** The engine's reason, as a sentence: "kept on 5.x" -> "Kept on 5.x". */

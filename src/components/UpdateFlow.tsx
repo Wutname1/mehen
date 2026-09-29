@@ -1,7 +1,7 @@
 import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import { bumpOf, folderName, relativePath, runLabel } from '../derive'
+import { bumpOf, folderName, relativePath, runLabel, withoutCulprits, type Fallback } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
@@ -17,6 +17,9 @@ export interface UpdateTarget {
 }
 
 type Stage = 'planning' | 'preview' | 'confirm' | 'running' | 'done' | 'commit'
+
+/** How many times a repository runs again after its failure points at a package. */
+const FALLBACK_ROUNDS = 2
 
 interface Job {
   key: string
@@ -186,6 +189,12 @@ export function UpdateFlow({
   const [forceCommit, setForceCommit] = useState(false)
   /** Jobs asked to stop (by key, lowercased); `*` when all were. */
   const [stopping, setStopping] = useState<Set<string>>(new Set())
+  /** The same, read between runs: a stopped job is not run again. */
+  const stopAsked = useRef<Set<string>>(new Set())
+  /** The updates as last run, after any packages were held back. */
+  const [tried, setTried] = useState(targets)
+  /** Packages held back after a failure, by job key (lowercased). */
+  const [fallbacks, setFallbacks] = useState<Record<string, Fallback[]>>({})
 
   useEffect(() => {
     let cancelled = false
@@ -200,6 +209,8 @@ export function UpdateFlow({
       if (cancelled) return
       setPlans(results.flatMap((r) => ('plan' in r && r.plan ? [r.plan] : [])))
       setFailed(results.flatMap((r) => ('error' in r && r.error ? [{ project: r.project, error: r.error }] : [])))
+      setTried(current)
+      setFallbacks({})
       setStage(start)
     })
     return () => {
@@ -225,19 +236,60 @@ export function UpdateFlow({
   const close = () => !busy && onClose(refreshed)
 
   const cancel = (job: Job | null) => {
-    setStopping((prev) => new Set([...prev, job ? job.key.toLowerCase() : '*']))
+    const key = job ? job.key.toLowerCase() : '*'
+    stopAsked.current.add(key)
+    setStopping((prev) => new Set([...prev, key]))
     api.cancelUpdate(job ? job.key : null).catch((e) => setError(String(e)))
   }
 
   const run = async () => {
     setRan({ checks, build, test, commit })
     setStopping(new Set())
+    stopAsked.current = new Set()
+    setFallbacks({})
     setStage('running')
     setError(null)
     try {
-      const result = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit)
-      setOutcomes(result.outcomes)
-      if (result.inventory) setRefreshed(result.inventory)
+      const first = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit)
+      let all = first.outcomes
+      let inventory = first.inventory
+      let shown = plans
+      let now = current
+      const left: Record<string, Fallback[]> = {}
+      // A repository that broke on a package the failure points at runs again
+      // with that package on its old line, or without it.
+      for (let round = 0; round < FALLBACK_ROUNDS; round++) {
+        const redo = all.filter((o) => !o.ok && !o.cancelled && o.rolledBack && o.failedBefore !== true && !stopAsked.current.has('*') && !stopAsked.current.has(o.job.toLowerCase()))
+        const again: { ids: Set<string>; targets: UpdateTarget[]; plans: UpdatePlan[]; key: string; fallbacks: Fallback[] }[] = []
+        for (const o of redo) {
+          const culprits = o.conflicts.filter((x) => x.blocking && x.keep).map((x) => x.keep!)
+          const ids = new Set(o.projects.map((id) => id.toLowerCase()))
+          const next = culprits.length ? withoutCulprits(now.filter((t) => ids.has(t.project.id.toLowerCase())), culprits) : null
+          if (!next) continue
+          const planned = await Promise.all(next.targets.map((t) => api.planUpdate(t.project.id, t.changes).catch(() => null)))
+          if (planned.some((p) => !p)) continue
+          again.push({ ids, targets: next.targets, plans: planned as UpdatePlan[], key: o.job.toLowerCase(), fallbacks: next.fallbacks })
+        }
+        if (!again.length || stopAsked.current.has('*')) break
+        const redone = (id: string) => again.some((a) => a.ids.has(id.toLowerCase()))
+        shown = [...shown.filter((p) => !redone(p.projectId)), ...again.flatMap((a) => a.plans)]
+        now = [...now.filter((t) => !redone(t.project.id)), ...again.flatMap((a) => a.targets)]
+        for (const a of again) left[a.key] = [...(left[a.key] ?? []), ...a.fallbacks]
+        setPlans(shown)
+        setFallbacks({ ...left })
+        const result = await api.applyBatch(
+          again.flatMap((a) => a.plans),
+          { build, test },
+          commit,
+          stopOnFailure,
+          forceCommit,
+        )
+        all = [...all.filter((o) => !o.projects.some(redone)), ...result.outcomes]
+        inventory = result.inventory ?? inventory
+      }
+      setTried(now)
+      setOutcomes(all)
+      if (inventory) setRefreshed(inventory)
     } catch (e) {
       setError(String(e))
     }
@@ -247,7 +299,7 @@ export function UpdateFlow({
   /** Plans the repository again without `names`, keeping the rest of its updates. */
   const retry = (job: Job, names: string[]) => {
     const ids = new Set(job.plans.map((p) => p.projectId.toLowerCase()))
-    const next = current
+    const next = tried
       .filter((t) => ids.has(t.project.id.toLowerCase()))
       .map((t) => ({ ...t, changes: t.changes.filter((c) => !names.includes(c.name)) }))
       .filter((t) => t.changes.length > 0)
@@ -712,11 +764,43 @@ export function UpdateFlow({
         const culprits = [...new Set(blocking.flatMap((x) => (x.keep ? [x.keep.name] : [])))]
         const rest = changes.filter((ch) => !culprits.includes(ch.name)).length
         const log = [o.error, ...failing.map((s) => s.output)].filter(Boolean).join('\n\n')
+        const failNotes = (o.notes ?? []).map((note) => (
+          <small key={note} className="mt-0.5 block text-[12px] text-muted">
+            {note}
+          </small>
+        ))
+        const held = fallbacks[job.key.toLowerCase()] ?? []
         return (
           <div key={job.key} className="grid grid-cols-[24px_1fr_auto] items-start gap-2.5 border-b border-line py-2.5">
             <Avatar name={job.name} repo={job.key} />
             <span className="flex min-w-0 flex-col gap-0.5">
               <b className="text-[13px]">{job.name}</b>
+              {held.length > 0 && !o.cancelled && (
+                <ul className="m-0 mb-0.5 grid list-none gap-1.5 p-0">
+                  {held.map((f) => {
+                    const done = kept.has(`${job.key.toLowerCase()}|${f.keep.name}`)
+                    return (
+                      <li key={f.name} className="flex items-center gap-2 text-[12.5px]">
+                        <RotateCcw size={14} className="shrink-0 text-risk-review" />
+                        <span className="min-w-0 flex-1">
+                          {f.with ? `${f.name} ${f.tried} only goes with the new ${f.with}` : `${f.name} ${f.tried} broke it`}, so Mehen {f.to ? `used ${f.to} instead` : `left it on ${f.stays}`} and tried again.
+                        </span>
+                        {done ? (
+                          <span className="inline-flex items-center gap-1 text-[12px] whitespace-nowrap text-state">
+                            <Pin size={13} />
+                            Kept on {f.keep.line}.x
+                          </span>
+                        ) : (
+                          <Button onClick={() => keep(f.keep, job.key)} title={`Stop offering ${f.name} updates past ${f.keep.line}.x in ${job.name}. You can change this in Settings.`}>
+                            <Pin size={14} />
+                            Keep {f.name} on {f.keep.line}.x
+                          </Button>
+                        )}
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
               {o.cancelled ? (
                 <small className="text-[12px] text-muted">{o.rolledBack ? 'Cancelled. Files put back as they were; the updates are still selected.' : o.error}</small>
               ) : o.ok ? (
@@ -764,6 +848,7 @@ export function UpdateFlow({
                       )
                     })}
                   </ul>
+                  {failNotes}
                   {culprits.length > 0 && rest > 0 && (
                     <div className="mt-1.5">
                       <Button onClick={() => retry(job, culprits)}>
@@ -780,6 +865,7 @@ export function UpdateFlow({
               ) : (
                 <>
                   <small className="text-[12px] text-risk-security">{o.rolledBack ? 'Files restored. The updates are still selected so you can try again.' : o.error}</small>
+                  {failNotes}
                   <pre className="mt-1 max-h-60 overflow-auto rounded-[3px] bg-sunken px-2.5 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-ink">
                     {log}
                   </pre>
