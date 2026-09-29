@@ -266,6 +266,8 @@ export interface JobOutcome {
   conflicts: Conflict[]
   /** Anything worth knowing about how it went, like a clean install. */
   notes?: string[]
+  /** After a failure, whether what failed also fails without the update (the project was already broken). */
+  failedBefore?: boolean | null
 }
 
 export interface Conflict {

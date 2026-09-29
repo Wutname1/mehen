@@ -37,7 +37,7 @@ export function updateFailureReport(job: { name: string; key: string; plans: Upd
     title: `Report the failed update in ${job.name}`,
     message: `Update failed in ${job.name}: ${o.error ?? 'failed'}. ${packages} package${packages === 1 ? '' : 's'} (${ecosystems.join(', ')}).`,
     attachments: [{ filename: 'update.txt', data: text, contentType: 'text/plain' }],
-    tags: { ecosystem: ecosystems.join(','), failed_step: failed[0]?.kind ?? (o.conflicts.length ? 'conflict' : 'none'), rolled_back: o.rolledBack ? 'yes' : 'no' },
+    tags: { ecosystem: ecosystems.join(','), failed_step: failed[0]?.kind ?? (o.conflicts.length ? 'conflict' : 'none'), rolled_back: o.rolledBack ? 'yes' : 'no', failed_before: o.failedBefore == null ? 'unknown' : o.failedBefore ? 'yes' : 'no' },
     context: { packages, manifests: job.plans.length, steps: o.steps.length, conflicts: o.conflicts.length },
   }
 }

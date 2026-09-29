@@ -11,10 +11,11 @@ use std::time::Instant;
 
 use futures::future::join_all;
 use serde::Serialize;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
 
 use crate::cancel::{Cancel, Cancels};
 use crate::diagnose::{self, Conflict};
+use crate::model::Ecosystem;
 use crate::update::{self, PlannedChange, Step, StepKind, StepResult, UpdatePlan};
 
 /// How many steps may run at once when the user leaves it on automatic:
@@ -93,6 +94,10 @@ pub struct JobOutcome {
     pub conflicts: Vec<Conflict>,
     /// Anything worth knowing about how it went, like a clean install.
     pub notes: Vec<String>,
+    /// After a failure, whether what failed also fails without the update:
+    /// `Some(true)` means the project was already broken. `None` when it was
+    /// not tried.
+    pub failed_before: Option<bool>,
 }
 
 /// One repository's share of the batch.
@@ -134,6 +139,22 @@ impl Job {
             }
         }
         steps
+    }
+
+    /// Big version jumps that a failed check's output points at.
+    fn suspects(&self, step: &Step, output: &str) -> Vec<Conflict> {
+        let mut ecosystems: Vec<Ecosystem> = match diagnose::ecosystem_of(&step.program) {
+            Some(e) => vec![e],
+            None => self.plans.iter().map(|p| p.ecosystem).collect(),
+        };
+        ecosystems.dedup();
+        ecosystems
+            .into_iter()
+            .flat_map(|e| {
+                let changes: Vec<(&str, &PlannedChange)> = self.plans.iter().filter(|p| p.ecosystem == e).flat_map(|p| p.changes.iter().map(move |c| (p.project_id.as_str(), c))).collect();
+                diagnose::suspects(output, e, &changes)
+            })
+            .collect()
     }
 
     /// `Updated 2 Dependencies`, then one line per package.
@@ -326,6 +347,7 @@ where
         commit_skipped: None,
         conflicts: Vec::new(),
         notes: Vec::new(),
+        failed_before: None,
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -381,34 +403,16 @@ where
     }
 
     let mut failed_checks: Vec<String> = Vec::new();
+    // Installs that changed what is installed, and every step that failed:
+    // after a failure the first run again on the restored files, the second
+    // to see whether they failed before the update too.
+    let mut installed: Vec<Step> = Vec::new();
+    let mut failed: Vec<Step> = Vec::new();
     for step in steps {
         let lane = lane(&step);
-        let lane_lock = &lanes[&lane];
-        let _turn = match lane_lock.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                on_event(job.event(JobState::Waiting, Some(format!("Waiting for {lane}")), Some(lane.clone())));
-                tokio::select! {
-                    guard = lane_lock.lock() => guard,
-                    _ = cancel.cancelled() => {
-                        roll_back(&mut outcome, CANCELLED.into());
-                        return outcome;
-                    }
-                }
-            }
-        };
-        let _permit = match limit.try_acquire() {
-            Ok(permit) => permit,
-            Err(_) => {
-                on_event(job.event(JobState::Waiting, Some("Waiting for a free slot".into()), Some(lane.clone())));
-                tokio::select! {
-                    permit = limit.acquire() => permit.expect("the batch semaphore is never closed"),
-                    _ = cancel.cancelled() => {
-                        roll_back(&mut outcome, CANCELLED.into());
-                        return outcome;
-                    }
-                }
-            }
+        let Some(turn) = take_turn(job, &lane, &cancel, lanes, limit, on_event).await else {
+            roll_back(&mut outcome, CANCELLED.into());
+            return outcome;
         };
         on_event(job.event(JobState::Running, Some(step.label.clone()), Some(lane.clone())));
         let started = Instant::now();
@@ -427,13 +431,23 @@ where
                 put_back(moved);
             }
         }
+        let mut found = Vec::new();
         if let Some(ecosystem) = diagnose::ecosystem_of(&step.program) {
             let changes: Vec<PlannedChange> = job.plans.iter().filter(|p| p.ecosystem == ecosystem).flat_map(|p| p.changes.clone()).collect();
-            for conflict in diagnose::diagnose(&output, ok, ecosystem, &changes) {
-                if !outcome.conflicts.contains(&conflict) {
-                    outcome.conflicts.push(conflict);
-                }
+            found = diagnose::diagnose(&output, ok, ecosystem, &changes);
+        }
+        if !ok && step.kind.is_check() && !found.iter().any(|c| c.blocking) {
+            found.extend(job.suspects(&step, &output));
+        }
+        for conflict in found {
+            if !outcome.conflicts.contains(&conflict) {
+                outcome.conflicts.push(conflict);
             }
+        }
+        if ok && step.kind == StepKind::Install {
+            installed.push(step.clone());
+        } else if !ok {
+            failed.push(step.clone());
         }
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output: update::tail(&output), ms: started.elapsed().as_millis() as u64 });
         if cancel.is_cancelled() {
@@ -446,12 +460,16 @@ where
                 continue;
             }
             roll_back(&mut outcome, format!("`{}` failed", step.label));
+            // Hand back this tool and slot: putting things back needs them.
+            drop(turn);
+            settle(job, &installed, &failed, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
             return outcome;
         }
     }
     if !failed_checks.is_empty() {
         let list = failed_checks.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ");
         roll_back(&mut outcome, format!("{list} failed"));
+        settle(job, &installed, &failed, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
         return outcome;
     }
 
@@ -476,6 +494,98 @@ where
     }
     on_event(job.event(JobState::Done, outcome.committed.clone(), None));
     outcome
+}
+
+/// Waits until no other job is using `lane` and a slot is free. `None` when
+/// the job is cancelled first.
+async fn take_turn<'a, E: Fn(BatchEvent)>(job: &Job, lane: &str, cancel: &Cancel, lanes: &'a HashMap<String, Mutex<()>>, limit: &'a Semaphore, on_event: &E) -> Option<(MutexGuard<'a, ()>, SemaphorePermit<'a>)> {
+    let lane_lock = &lanes[lane];
+    let turn = match lane_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            on_event(job.event(JobState::Waiting, Some(format!("Waiting for {lane}")), Some(lane.to_string())));
+            tokio::select! {
+                guard = lane_lock.lock() => guard,
+                _ = cancel.cancelled() => return None,
+            }
+        }
+    };
+    let permit = match limit.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            on_event(job.event(JobState::Waiting, Some("Waiting for a free slot".into()), Some(lane.to_string())));
+            tokio::select! {
+                permit = limit.acquire() => permit.expect("the batch semaphore is never closed"),
+                _ = cancel.cancelled() => return None,
+            }
+        }
+    };
+    Some((turn, permit))
+}
+
+/// Runs once a failed job's files are put back. Its installs already put the
+/// new versions on disk (`node_modules`, NuGet's restore output), so they run
+/// again to match the restored files. Then what failed runs once more on the
+/// original files, to tell a broken update from a project that was already
+/// broken. A failed install the package manager already explained is not
+/// tried again.
+#[allow(clippy::too_many_arguments)]
+async fn settle<R, F, E>(
+    job: &Job,
+    installed: &[Step],
+    failed: &[Step],
+    outcome: &mut JobOutcome,
+    cancel: &Cancel,
+    lanes: &HashMap<String, Mutex<()>>,
+    limit: &Semaphore,
+    run_step: &R,
+    on_event: &E,
+) where
+    R: Fn(Step, Cancel) -> F,
+    F: Future<Output = (bool, String)>,
+    E: Fn(BatchEvent),
+{
+    if !outcome.rolled_back || cancel.is_cancelled() {
+        return;
+    }
+    let mut restored = true;
+    for step in installed {
+        let lane = lane(step);
+        let ok = match take_turn(job, &lane, cancel, lanes, limit, on_event).await {
+            Some(_turn) => {
+                on_event(job.event(JobState::Running, Some(format!("Putting back what was installed: {}", step.label)), Some(lane)));
+                run_step(step.clone(), cancel.clone()).await.0 && !cancel.is_cancelled()
+            }
+            None => false,
+        };
+        if !ok {
+            outcome.notes.push(format!("The files are back as they were, but `{}` did not finish on them, so the new package versions may still be installed. Run it yourself before you build.", step.label));
+            restored = false;
+            break;
+        }
+    }
+    let explained = outcome.conflicts.iter().any(|c| c.blocking);
+    for step in failed {
+        if cancel.is_cancelled() || (step.kind.is_check() && !restored) || (step.kind == StepKind::Install && explained) {
+            continue;
+        }
+        let lane = lane(step);
+        let Some(_turn) = take_turn(job, &lane, cancel, lanes, limit, on_event).await else {
+            break;
+        };
+        on_event(job.event(JobState::Running, Some(format!("Trying without the updates: {}", step.label)), Some(lane)));
+        let (ok, _) = run_step(step.clone(), cancel.clone()).await;
+        if cancel.is_cancelled() {
+            break;
+        }
+        outcome.failed_before = Some(outcome.failed_before.unwrap_or(false) || !ok);
+        outcome.notes.push(if ok {
+            format!("`{}` works without these updates, so one of them broke it.", step.label)
+        } else {
+            format!("`{}` fails without these updates too, so the problem was already in the project.", step.label)
+        });
+    }
+    on_event(job.event(JobState::RolledBack, outcome.error.clone(), None));
 }
 
 #[cfg(test)]
@@ -588,7 +698,8 @@ mod tests {
             };
             let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
             let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
-            assert_eq!(calls.get(), 2, "one retry");
+            // A failed install nothing explained is tried once more on the original files.
+            assert_eq!(calls.get(), if retry_works { 2 } else { 3 }, "one retry");
             assert_eq!(outcome.ok, retry_works);
             if retry_works {
                 assert_eq!(outcome.notes.len(), 1);
@@ -694,10 +805,63 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let log = Log::default();
         let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: false };
         let outcomes = run(plans, opts, &Cancels::default(), recorder(&log, "vitest"), |_| {}).await;
-        assert_eq!(log.borrow().len(), 3, "the test step still ran after the build failed");
+        let lanes: Vec<String> = log.borrow().iter().map(|r| r.0.clone()).collect();
+        // Install, the failed build, the tests; then the install again on the
+        // restored files and the build once more without the update.
+        assert_eq!(lanes, ["npm", "vitest", "npm", "npm", "vitest"], "the test step still ran after the build failed");
         assert!(!outcomes[0].ok && outcomes[0].rolled_back);
+        assert_eq!(outcomes[0].failed_before, Some(true));
         assert!(outcomes[0].error.as_deref().is_some_and(|e| e.contains("vitest")), "{:?}", outcomes[0].error);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "before");
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_reinstalls_the_old_packages_and_checks_without_the_update() {
+        let dir = temp("settle");
+        let manifest = dir.join("package.json");
+        let mut p = plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("npm", StepKind::Verify, &dir)]);
+        p.changes[0] = PlannedChange { name: "typescript".into(), from: "6.0.3".into(), to: "7.0.2".into(), written_before: "^6.0.3".into(), written_after: "^7.0.2".into() };
+        let installed = RefCell::new(Vec::new());
+        // The build only breaks on the updated manifest.
+        let fake = |s: Step, _: Cancel| {
+            let on_disk = std::fs::read_to_string(&manifest).unwrap();
+            let result = if s.kind == StepKind::Install {
+                installed.borrow_mut().push(on_disk);
+                (true, String::new())
+            } else if on_disk == "after" {
+                (false, "tsconfig.json(25,5): error TS5102: Option 'baseUrl' has been removed.".to_string())
+            } else {
+                (true, String::new())
+            };
+            async move { result }
+        };
+        let events = RefCell::new(Vec::new());
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+        let outcome = run(vec![p], opts, &Cancels::default(), fake, |e| events.borrow_mut().push(e)).await.remove(0);
+        assert!(outcome.rolled_back && !outcome.ok);
+        assert_eq!(*installed.borrow(), ["after", "before"], "the old packages were installed again after the files were put back");
+        assert_eq!(outcome.failed_before, Some(false));
+        assert!(outcome.notes.iter().any(|n| n.contains("works without these updates")), "{:?}", outcome.notes);
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].keep.as_ref().map(|k| (k.name.as_str(), k.line.as_str())), Some(("typescript", "6")));
+        assert_eq!(events.borrow().last().map(|e| e.state), Some(JobState::RolledBack), "the job ends rolled back");
+    }
+
+    #[tokio::test]
+    async fn a_failed_install_it_cannot_explain_is_tried_without_the_update() {
+        let dir = temp("broken-before");
+        let p = plan(&dir, "app.csproj", Some(&dir), vec![step("dotnet", StepKind::Install, &dir), step("dotnet", StepKind::Verify, &dir)]);
+        let output = "error NU1101: Unable to find package Company.Internal. No packages exist with this id in source(s): company-feed";
+        let calls = std::cell::Cell::new(0);
+        let fake = |_: Step, _: Cancel| {
+            calls.set(calls.get() + 1);
+            async move { (false, output.to_string()) }
+        };
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+        let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
+        assert_eq!(calls.get(), 2, "the restore, then the restore on the original files; no build");
+        assert_eq!(outcome.failed_before, Some(true));
+        assert!(outcome.notes.iter().any(|n| n.contains("fails without these updates too")), "{:?}", outcome.notes);
     }
 
     /// Runs real processes through the same launcher the app uses. Needs node

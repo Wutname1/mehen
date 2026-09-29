@@ -116,6 +116,70 @@ pub fn diagnose(output: &str, ok: bool, ecosystem: Ecosystem, changes: &[Planned
     conflicts
 }
 
+/// A failed build or test that the package manager said nothing about: the
+/// packages the update moved to a new major version that the output points
+/// at, so the user can keep one back and let the rest through. `changes`
+/// pairs each change with the manifest it was made in.
+///
+/// A mention of `name@version` (a tool saying which copy it loaded) outranks
+/// weaker hints, like a file inside the package or its name and new major
+/// together ("TypeScript 7"). Stack frames are skipped: they name the tools
+/// that ran, not what broke.
+pub fn suspects(output: &str, ecosystem: Ecosystem, changes: &[(&str, &PlannedChange)]) -> Vec<Conflict> {
+    let from_of = |c: &PlannedChange| if c.from.is_empty() { c.written_before.clone() } else { c.from.clone() };
+    let jumps: Vec<(&str, &PlannedChange, String)> = changes
+        .iter()
+        .filter_map(|(manifest, c)| {
+            let c: &PlannedChange = c;
+            let line = release_line(&from_of(c))?;
+            (release_line(&c.to).as_deref() != Some(line.as_str())).then_some((*manifest, c, line))
+        })
+        .collect();
+    if jumps.is_empty() {
+        return Vec::new();
+    }
+    let text: String = output.lines().filter(|l| !l.trim_start().starts_with("at ")).collect::<Vec<_>>().join("\n");
+    let lower = text.to_lowercase();
+    let slashed = lower.replace('\\', "/");
+
+    let loaded = |c: &PlannedChange| lower.contains(&format!("{}@{}", c.name.to_lowercase(), c.to.to_lowercase()));
+    let hinted = |manifest: &str, c: &PlannedChange| {
+        let name = c.name.to_lowercase();
+        let inside = match ecosystem {
+            Ecosystem::Npm => slashed.contains(&format!("node_modules/{name}/")),
+            Ecosystem::Nuget => slashed.contains(&format!("packages/{name}/{}/", c.to.to_lowercase())),
+            _ => false,
+        };
+        let major = Version::parse(&c.to).map(|v| v.part(0)).filter(|m| *m > 0);
+        let named = major.is_some_and(|m| Regex::new(&format!(r"(?i)(?:^|[^\w@/.-]){}\s+{m}\b", regex::escape(&c.name))).is_ok_and(|re| re.is_match(&text)));
+        // The compiler's own diagnostics.
+        let compiler = ecosystem == Ecosystem::Npm && name == "typescript" && Regex::new(r"error TS\d{4,5}\b").is_ok_and(|re| re.is_match(&text));
+        // MSBuild ends each error with the project it came from.
+        let project = ecosystem == Ecosystem::Nuget && {
+            let manifest = manifest.to_lowercase().replace('\\', "/");
+            slashed.lines().any(|l| l.contains(": error ") && l.trim_end().ends_with(&format!("[{manifest}]")))
+        };
+        inside || named || compiler || project
+    };
+
+    let strong: Vec<_> = jumps.iter().filter(|(_, c, _)| loaded(c)).collect();
+    let picked: Vec<_> = if strong.is_empty() { jumps.iter().filter(|(m, c, _)| hinted(m, c)).collect() } else { strong };
+    let mut conflicts: Vec<Conflict> = Vec::new();
+    for &&(_, c, ref line) in &picked {
+        if conflicts.iter().any(|x| x.keep.as_ref().is_some_and(|k| k.name.eq_ignore_ascii_case(&c.name))) {
+            continue;
+        }
+        let from = from_of(c);
+        let jump = if line.starts_with("0.") { "a new 0.x version" } else { "a new major version" };
+        conflicts.push(Conflict {
+            summary: format!("{} {} is {jump} (the project had {from}), and the failure points at it", c.name, c.to),
+            keep: Some(Keep { ecosystem, name: c.name.clone(), line: line.clone(), from, to: c.to.clone() }),
+            blocking: true,
+        });
+    }
+    conflicts
+}
+
 fn rx(pattern: &str) -> Regex {
     Regex::new(pattern).expect("diagnose patterns are valid")
 }
@@ -358,6 +422,64 @@ npm ERR! Conflicting peer dependency: @typescript-eslint/parser@7.18.0"#;
 npm error Found: react@19.0.0"#;
         let c = diagnose(output, false, Ecosystem::Npm, &[change("react", "19.0.0", "19.1.0")]);
         assert!(c[0].keep.is_none());
+    }
+
+    fn keeps(conflicts: &[Conflict]) -> Vec<(String, String)> {
+        conflicts.iter().filter_map(|c| c.keep.as_ref().map(|k| (k.name.clone(), k.line.clone()))).collect()
+    }
+
+    #[test]
+    fn a_tool_naming_the_copy_it_loaded_outranks_other_hints() {
+        let output = r"ncc: Using typescript@7.0.2 (local user-provided)
+Error: Module build failed (from ./node_modules/@vercel/ncc/dist/ncc/loaders/ts-loader.js):
+TypeError: Cannot read properties of undefined (reading 'fileExists')
+    at findConfigFile (C:\app\node_modules\@vercel\ncc\dist\ncc\loaders/ts-loader.js.cache.js:38:11157)";
+        let (ts, ncc, yaml) = (change("typescript", "6.0.3", "7.0.2"), change("@vercel/ncc", "0.44.1", "0.45.0"), change("js-yaml", "5.2.1", "5.4.2"));
+        let c = suspects(output, Ecosystem::Npm, &[("package.json", &ts), ("package.json", &ncc), ("package.json", &yaml)]);
+        assert_eq!(keeps(&c), [("typescript".to_string(), "6".to_string())]);
+        assert!(c[0].blocking);
+        assert_eq!(c[0].summary, "typescript 7.0.2 is a new major version (the project had 6.0.3), and the failure points at it");
+    }
+
+    #[test]
+    fn a_missing_export_points_at_the_package_not_the_bundler_in_the_stack() {
+        let output = r#"vite v8.3.1 building client environment for production...
+[MISSING_EXPORT] "Github" is not exported by "node_modules/lucide-react/dist/esm/lucide-react.mjs".
+    at aggregateBindingErrorsIntoJsError (file:///C:/app/node_modules/rolldown/dist/shared/error.mjs:48:18)
+    at async buildEnvironment (file:///C:/app/node_modules/vite/dist/node/chunks/node.js:34445:66)"#;
+        let (lucide, vite, react) = (change("lucide-react", "0.468.0", "1.48.0"), change("vite", "6.4.3", "8.3.1"), change("react", "18.3.1", "19.3.0"));
+        let c = suspects(output, Ecosystem::Npm, &[("package.json", &lucide), ("package.json", &vite), ("package.json", &react)]);
+        assert_eq!(keeps(&c), [("lucide-react".to_string(), "0.468".to_string())]);
+        assert!(c[0].summary.contains("a new 0.x version"), "{}", c[0].summary);
+    }
+
+    #[test]
+    fn typescript_is_named_by_its_new_major_or_its_own_errors() {
+        let ts = change("typescript", "6.0.3", "7.0.2");
+        let plugin = "Error: [unplugin-dts] The installed \"typescript\" package does not provide the JavaScript Compiler API (this happens with TypeScript 7+)";
+        assert_eq!(keeps(&suspects(plugin, Ecosystem::Npm, &[("package.json", &ts)])), [("typescript".to_string(), "6".to_string())]);
+        let tsc = "tsconfig.json(25,5): error TS5102: Option 'downlevelIteration' has been removed. Please remove it from your configuration.";
+        assert_eq!(suspects(tsc, Ecosystem::Npm, &[("package.json", &ts)]).len(), 1);
+        // The same errors with TypeScript on its old line are not the update's doing.
+        assert!(suspects(tsc, Ecosystem::Npm, &[("package.json", &change("typescript", "6.0.2", "6.0.3"))]).is_empty());
+    }
+
+    #[test]
+    fn dotnet_errors_point_at_the_project_whose_package_jumped() {
+        let unit = r"C:\Code\App\App.Tests\App.Tests.csproj";
+        let output = r"C:\Code\App\App.Web\App.Web.csproj : warning NU1510: PackageReference X will not be pruned.
+C:\Code\App\App.Tests\Services\ApiTests.cs(164,24): error CS1061: 'Task<Exception?>' does not contain a definition for 'Message' [C:\Code\App\App.Tests\App.Tests.csproj]";
+        let (nunit, msal) = (change("NUnit", "4.6.1", "5.0.0"), change("Microsoft.Identity.Client", "4.90.0", "4.90.1"));
+        let c = suspects(output, Ecosystem::Nuget, &[(unit, &nunit), (r"C:\Code\App\App.Data\App.Data.csproj", &msal)]);
+        assert_eq!(keeps(&c), [("NUnit".to_string(), "4".to_string())]);
+        // A project with no big jump in it is left alone.
+        assert!(suspects(output, Ecosystem::Nuget, &[(r"C:\Code\App\App.Web\App.Web.csproj", &nunit)]).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_blamed_without_a_hint() {
+        let output = "src/views/Admin.tsx(237,12): Type '{ children: Element[]; }' is not assignable to type 'TableProps'.";
+        assert!(suspects(output, Ecosystem::Npm, &[("package.json", &change("@types/node", "25.9.1", "26.6.3"))]).is_empty());
     }
 
     #[test]
