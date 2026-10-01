@@ -98,6 +98,8 @@ pub struct JobOutcome {
     /// `Some(true)` means the project was already broken. `None` when it was
     /// not tried.
     pub failed_before: Option<bool>,
+    /// The tool a step needed that is not installed (`npm`, `dotnet`, ...).
+    pub missing_tool: Option<String>,
 }
 
 /// One repository's share of the batch.
@@ -348,6 +350,7 @@ where
         conflicts: Vec::new(),
         notes: Vec::new(),
         failed_before: None,
+        missing_tool: None,
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -449,9 +452,17 @@ where
         } else if !ok {
             failed.push(step.clone());
         }
+        let missing = !ok && output.ends_with(update::NOT_INSTALLED);
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output: update::tail(&output), ms: started.elapsed().as_millis() as u64 });
         if cancel.is_cancelled() {
             roll_back(&mut outcome, CANCELLED.into());
+            return outcome;
+        }
+        // Nothing else can run without it, and trying again without the
+        // updates would only fail the same way.
+        if missing {
+            outcome.missing_tool = Some(lane.clone());
+            roll_back(&mut outcome, format!("`{lane}` {}", update::NOT_INSTALLED.trim_end_matches('.')));
             return outcome;
         }
         if !ok {
@@ -862,6 +873,32 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(calls.get(), 2, "the restore, then the restore on the original files; no build");
         assert_eq!(outcome.failed_before, Some(true));
         assert!(outcome.notes.iter().any(|n| n.contains("fails without these updates too")), "{:?}", outcome.notes);
+    }
+
+    #[tokio::test]
+    async fn a_missing_tool_stops_the_job_without_trying_again() {
+        let dir = temp("missing-tool");
+        let p = plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("npm", StepKind::Verify, &dir)]);
+        let calls = std::cell::Cell::new(0);
+        let fake = |s: Step, _: Cancel| {
+            calls.set(calls.get() + 1);
+            async move { (false, format!("`{}` {}", s.program, update::NOT_INSTALLED)) }
+        };
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: false };
+        let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
+        assert_eq!(calls.get(), 1, "nothing ran after the tool was found missing");
+        assert_eq!(outcome.missing_tool.as_deref(), Some("npm"));
+        assert!(outcome.rolled_back && !outcome.ok);
+        assert_eq!(outcome.failed_before, None);
+        assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "before");
+    }
+
+    #[tokio::test]
+    async fn a_program_that_does_not_exist_reads_as_not_installed() {
+        let dir = temp("no-such-program");
+        let (ok, output) = update::run_step(&step("mehen-no-such-program", StepKind::Install, &dir), &Cancel::default()).await;
+        assert!(!ok);
+        assert!(output.ends_with(update::NOT_INSTALLED), "{output}");
     }
 
     /// Runs real processes through the same launcher the app uses. Needs node

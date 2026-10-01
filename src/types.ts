@@ -268,6 +268,8 @@ export interface JobOutcome {
   notes?: string[]
   /** After a failure, whether what failed also fails without the update (the project was already broken). */
   failedBefore?: boolean | null
+  /** The tool a step needed that is not installed: npm, dotnet... */
+  missingTool?: string | null
 }
 
 export interface Conflict {

@@ -37,6 +37,28 @@ interface Live {
   label: string | null
 }
 
+/** Where to get a tool an update needed but could not find. */
+function installLink(tool: string): { name: string; url: string } {
+  switch (tool.toLowerCase()) {
+    case 'npm':
+    case 'npx':
+    case 'node':
+      return { name: 'Node.js', url: 'https://nodejs.org/en/download' }
+    case 'pnpm':
+      return { name: 'pnpm', url: 'https://pnpm.io/installation' }
+    case 'yarn':
+      return { name: 'Yarn', url: 'https://yarnpkg.com/getting-started/install' }
+    case 'bun':
+      return { name: 'Bun', url: 'https://bun.sh' }
+    case 'dotnet':
+      return { name: 'the .NET SDK', url: 'https://dotnet.microsoft.com/download' }
+    case 'cargo':
+      return { name: 'Rust', url: 'https://rustup.rs' }
+    default:
+      return { name: tool, url: `https://www.google.com/search?q=${encodeURIComponent(`install ${tool}`)}` }
+  }
+}
+
 const jobKey = (p: UpdatePlan) => p.repo ?? p.projectId.replace(/[\\/][^\\/]*$/, '')
 
 function jobsOf(plans: UpdatePlan[], nameOf: (key: string) => string): Job[] {
@@ -820,6 +842,14 @@ export function UpdateFlow({
                     </span>
                   ))}
                 </small>
+              ) : o.missingTool ? (
+                <>
+                  <small className="text-[12px] text-risk-security">`{o.missingTool}` is not installed on this computer, so this project could not be updated. Files restored.</small>
+                  <div className="mt-1.5">
+                    <Button onClick={() => void api.openLink(installLink(o.missingTool!).url)}>Install {installLink(o.missingTool).name}</Button>
+                  </div>
+                  <small className="mt-0.5 block text-[12px] text-muted">After installing it, restart Mehen and run the update again.</small>
+                </>
               ) : blocking.length ? (
                 <>
                   <small className="text-[12px] text-risk-security">
@@ -871,7 +901,7 @@ export function UpdateFlow({
                   </pre>
                 </>
               )}
-              {!o.ok && !o.cancelled && (
+              {!o.ok && !o.cancelled && !o.missingTool && (
                 <div className="mt-1.5">
                   <ReportButton make={() => updateFailureReport(job, o, ran)} onNote={setNote} />
                 </div>

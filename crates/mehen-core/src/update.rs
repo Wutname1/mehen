@@ -1047,6 +1047,9 @@ pub(crate) fn resolve_program(program: &str) -> PathBuf {
         .unwrap_or(given)
 }
 
+/// How a step's output ends when its program could not be found.
+pub const NOT_INSTALLED: &str = "is not installed on this computer.";
+
 /// Runs one step and returns whether it succeeded plus the end of its output.
 /// Cancelling stops the step and everything it started.
 pub async fn run_step(step: &Step, cancel: &Cancel) -> (bool, String) {
@@ -1066,6 +1069,7 @@ pub async fn run_step(step: &Step, cancel: &Cancel) -> (bool, String) {
 
     let child = match cmd.spawn() {
         Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (false, format!("`{}` {NOT_INSTALLED}", step.program)),
         Err(e) => return (false, format!("Could not start `{}`: {e}", step.program)),
     };
     let pid = child.id();
