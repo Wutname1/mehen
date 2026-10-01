@@ -59,7 +59,16 @@ fn installed_exe() -> Option<PathBuf> {
     exe.is_file().then_some(exe)
 }
 
-#[cfg(not(windows))]
+/// GitWyrm's program inside its app bundle, system-wide or in the user's own
+/// Applications folder. It is never on PATH on a Mac.
+#[cfg(target_os = "macos")]
+fn installed_exe() -> Option<PathBuf> {
+    let relative = "GitWyrm.app/Contents/MacOS/gitwyrm";
+    let user = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications").join(relative));
+    std::iter::once(PathBuf::from("/Applications").join(relative)).chain(user).find(|p| p.is_file())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn installed_exe() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths).map(|dir| dir.join("gitwyrm")).find(|p| p.is_file())

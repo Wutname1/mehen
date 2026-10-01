@@ -19,6 +19,8 @@ use tauri_plugin_notification::NotificationExt;
 
 mod background;
 mod gitwyrm;
+#[cfg(target_os = "macos")]
+mod macos_env;
 mod scrub;
 mod self_update;
 mod telemetry;
@@ -639,6 +641,19 @@ fn clear_cache(state: State<'_, AppState>) -> Result<(), String> {
 /// Opens a folder in VS Code (`code` on PATH).
 #[tauri::command]
 fn open_in_editor(path: String) -> Result<(), String> {
+    // A Mac install rarely has `code` on PATH (it is an opt-in menu command in
+    // VS Code), but the app itself is always findable by its bundle id.
+    #[cfg(target_os = "macos")]
+    {
+        let opened = std::process::Command::new("open").args(["-b", "com.microsoft.VSCode"]).arg(&path).status().map_err(err)?;
+        return if opened.success() { Ok(()) } else { Err("Visual Studio Code is not installed".into()) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    open_in_editor_with_code(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_in_editor_with_code(path: String) -> Result<(), String> {
     let mut cmd = std::process::Command::new(if cfg!(windows) { "cmd" } else { "code" });
     if cfg!(windows) {
         cmd.args(["/C", "code", &path]);
@@ -661,6 +676,8 @@ fn gitwyrm_folders(state: State<'_, AppState>) -> Vec<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    macos_env::adopt_login_shell_path();
     // Lives until the app exits, so a panic's report is sent before it goes.
     let _telemetry = telemetry::init();
     tauri::Builder::default()
