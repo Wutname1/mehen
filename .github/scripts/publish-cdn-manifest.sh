@@ -43,6 +43,14 @@ if not platforms:
 if "windows-x86_64" not in platforms and "windows-x86_64-nsis" not in platforms:
     sys.exit(f"::error::manifest has no Windows x64 entry. Present: {', '.join(sorted(platforms))}")
 
+# Both Mac architectures must be present. tauri emits "darwin-aarch64" and
+# "darwin-aarch64-app" for the same updater archive; either spelling counts. A
+# manifest that lost one would publish and quietly strand those Macs on the old
+# version.
+for arch in ("aarch64", "x86_64"):
+    if f"darwin-{arch}" not in platforms and f"darwin-{arch}-app" not in platforms:
+        sys.exit(f"::error::manifest has no macOS {arch} entry. Present: {', '.join(sorted(platforms))}")
+
 # The api.github.com asset URLs tauri-action writes serve JSON metadata, not the
 # installer, and the updater would hand that to NSIS. resolve-updater-urls.sh
 # rewrites them first; this refuses to publish if that ever did not happen.

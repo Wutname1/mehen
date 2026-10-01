@@ -50,7 +50,25 @@ jobs:
 
   release:
     needs: check-version
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            tauri_args: ""
+          # macOS ships a .dmg for first installs and a .app.tar.gz for the
+          # updater. Each architecture builds natively on its own runner.
+          - arch: aarch64-macos
+            os: macos-latest
+            rust_target: aarch64-apple-darwin
+            tauri_args: "--target aarch64-apple-darwin --config src-tauri/tauri.macos.conf.json"
+          - arch: x86_64-macos
+            os: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            tauri_args: "--target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json"
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
 
@@ -63,10 +81,13 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       # Asset filenames and the version Mehen reports come from these files, not
       # from the tag.
       - name: Sync version to tag
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}"
@@ -100,12 +121,54 @@ jobs:
 
           npm version $version --no-git-tag-version --allow-same-version
 
+      # The same four edits as the pwsh step above, for the macOS runners.
+      - name: Sync version to tag (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.ref_name }}"
+          echo "Setting version to $version"
+          tmp=$(mktemp)
+
+          jq --arg v "$version" '.version = $v' src-tauri/tauri.conf.json > "$tmp"
+          mv "$tmp" src-tauri/tauri.conf.json
+
+          # Only the first version= line, which is the [package] one.
+          awk -v v="$version" '
+            !done && /^version[[:space:]]*=/ { print "version = \"" v "\""; done=1; next }
+            { print }
+          ' src-tauri/Cargo.toml > "$tmp"
+          mv "$tmp" src-tauri/Cargo.toml
+
+          python3 - "$version" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          path = pathlib.Path("Cargo.lock")
+          text = path.read_text()
+          replacement = rf'\g<1>"{sys.argv[1]}"'
+          updated, count = re.subn(
+              r'(?m)^(name = "mehen"\r?\nversion = )"[^"]*"',
+              replacement,
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("mehen package entry not found in Cargo.lock")
+          path.write_text(updated)
+          PY
+
+          npm version "$version" --no-git-tag-version --allow-same-version
+
       # After the version sync on purpose: rust-cache hashes Cargo.toml and
       # Cargo.lock into its key when it restores, so restoring first would save
       # under a key no later run can reproduce.
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          key: ${{ matrix.arch }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -119,6 +182,7 @@ jobs:
       # the exact file the download button serves. It only changes when the
       # Build Setup workflow publishes a new one.
       - name: Fetch the published setup program
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -134,6 +198,36 @@ jobs:
           fi
           echo "Bundling the published setup program ($size bytes)"
 
+      # Signs and notarizes the macOS app when the Apple secrets exist, and
+      # builds an ad-hoc signed app (tauri.macos.conf.json) when they do not.
+      #
+      # Exported only when ALL are set: a repository secret that does not exist
+      # reaches the job as an empty string, and the bundler treats a variable
+      # that is merely present as "sign with this", so an empty APPLE_CERTIFICATE
+      # fails the build instead of falling back to ad-hoc signing.
+      - name: Configure Apple signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY                       APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::notice::$name is not set; building an unsigned (ad-hoc) macOS app."
+              exit 0
+            fi
+          done
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY                       APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            echo "$name=${!name}" >> "$GITHUB_ENV"
+          done
+          echo "Apple signing and notarization enabled."
+
       - name: Build and release (installer + updater manifest)
         uses: tauri-apps/tauri-action@v1
         env:
@@ -148,12 +242,14 @@ jobs:
           releaseBody: "Release notes are generated when this release is published."
           # Published by the publish job once everything is attached and checked.
           releaseDraft: true
+          args: ${{ matrix.tauri_args }}
 
       # Fixed-name copy, so /releases/latest/download/Mehen-Setup.exe always
       # serves the current version. The setup program downloads it through the
       # CDN's installers/latest path, which a Cloudflare redirect sends here.
       # /releases/latest ignores drafts, so it only moves when publish runs.
       - name: Attach fixed-name installer
+        if: runner.os == 'Windows'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -167,6 +263,42 @@ jobs:
           cp "$nsis" Mehen-Setup.exe
           gh release upload "${{ github.ref_name }}" Mehen-Setup.exe --clobber
           echo "Attached $nsis as Mehen-Setup.exe"
+
+      # Fixed-name disk image, so /releases/latest/download/<name> always serves
+      # the current version. The updater does not use the .dmg: it downloads the
+      # .app.tar.gz that tauri-action already attached. A build with signing
+      # misconfigured still produces a good-looking .dmg while latest.json
+      # quietly loses the darwin entry, so the archive and its signature are
+      # checked here, while the files are in hand.
+      - name: Attach fixed-name macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          base="target/${{ matrix.rust_target }}/release/bundle"
+
+          updater=$(find "$base/macos" -name '*.app.tar.gz' -type f | head -1)
+          if [ -z "$updater" ] || [ ! -f "${updater}.sig" ]; then
+            echo "::error::No signed .app.tar.gz under $base/macos; the updater would have nothing to install."
+            exit 1
+          fi
+
+          dmg=$(find "$base/dmg" -name '*.dmg' -type f | head -1)
+          if [ -z "$dmg" ]; then
+            echo "::error::No .dmg found under $base/dmg"
+            exit 1
+          fi
+
+          case "${{ matrix.arch }}" in
+            aarch64-macos) dest="Mehen-macOS-arm64.dmg" ;;
+            x86_64-macos)  dest="Mehen-macOS-x64.dmg" ;;
+            *) echo "::error::Unknown macOS arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          cp "$dmg" "$dest"
+          gh release upload "${{ github.ref_name }}" "$dest" --clobber
+          echo "Attached $dmg as $dest"
 
   publish:
     needs: release
@@ -194,16 +326,18 @@ jobs:
           # latest.json is what the updater reads, and Mehen-Setup.exe is what
           # fresh installs download. Publishing without either breaks one of them.
           missing=0
-          for required in latest.json x64-setup.exe; do
+          for required in latest.json x64-setup.exe .dmg .app.tar.gz; do
             if ! echo "$assets" | grep -q -- "$required"; then
               echo "::error::Missing required asset matching '$required'"
               missing=1
             fi
           done
-          if ! echo "$assets" | grep -qxF Mehen-Setup.exe; then
-            echo "::error::Missing fixed-name asset 'Mehen-Setup.exe'"
-            missing=1
-          fi
+          for required in Mehen-Setup.exe Mehen-macOS-arm64.dmg Mehen-macOS-x64.dmg; do
+            if ! echo "$assets" | grep -qxF "$required"; then
+              echo "::error::Missing fixed-name asset '$required'"
+              missing=1
+            fi
+          done
           [ "$missing" -eq 0 ]
 
       # tauri-action points the manifest at api.github.com asset URLs, which
@@ -254,6 +388,9 @@ jobs:
 
           **Most people want [Mehen-Setup.exe](https://cdn.gitwyrm.com/mehen/Mehen-Setup.exe)** - it always
           installs the newest version, and Mehen keeps itself up to date after that.
+
+          **Mac:** [Apple Silicon](https://github.com/Wutname1/mehen/releases/latest/download/Mehen-macOS-arm64.dmg) ·
+          [Intel](https://github.com/Wutname1/mehen/releases/latest/download/Mehen-macOS-x64.dmg)
 
           The installers attached below are pinned to this specific version.
           EOF
