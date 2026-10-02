@@ -2,12 +2,12 @@ import { Asterisk, FileX, FolderMinus, FolderPlus, Pin, Plus, RefreshCw, Undo2, 
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import * as api from '../api'
 import { ECOSYSTEM_LABEL, POLICY_LABEL, isWithin, relativePath, samePath, type Repo } from '../derive'
-import type { Prefs } from '../prefs'
+import { COMMIT_MODES, type Prefs } from '../prefs'
 import type { CheckCommands, CheckConfig, DiscoveredProject, Ecosystem, Hold, IgnoreKind, IgnoreRule, Inventory, Settings, VersionPolicies, VersionPolicy } from '../types'
 import type { AppUpdate } from './AppUpdate'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
-import { SectionTitle, Select, SettingRow, Switch, TextInput } from './controls'
+import { SectionTitle, Segmented, Select, SettingRow, Switch, TextInput } from './controls'
 
 export type SettingsTab = 'general' | 'scanning' | 'updates' | 'security'
 
@@ -519,8 +519,8 @@ export function SettingsDialog({
                 <SettingRow title="Stop at the first failed check" help="When off, the remaining checks still run so you see every failure at once. The project is put back either way.">
                   <Switch checked={prefs.stopOnFailure} onChange={(v) => onPrefs({ stopOnFailure: v })} label="Stop at the first failed check" />
                 </SettingRow>
-                <SettingRow title="Commit each repository" help="Commits only the files Mehen changed, as “Updated N Dependencies”. Never pushes.">
-                  <Switch checked={prefs.commit} onChange={(v) => onPrefs({ commit: v })} label="Commit each repository" />
+                <SettingRow title="After updating" help="Commits only the files Mehen changed, as “Updated N Dependencies”. Commit & push then pushes the branch to its remote.">
+                  <Segmented value={prefs.commit} options={COMMIT_MODES} onChange={(v) => onPrefs({ commit: v })} label="After updating" />
                 </SettingRow>
                 <SectionTitle>Checks by dependency type</SectionTitle>
                 <p className="mb-1 text-[12.5px] text-muted">Change what counts as a passing update for every project of a kind. A project's own settings win over these.</p>

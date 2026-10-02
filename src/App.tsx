@@ -937,7 +937,7 @@ export default function App() {
           roots={inventory.roots}
           build={prefs.build}
               test={prefs.test}
-          commit={prefs.commit}
+          commitMode={prefs.commit}
           stopOnFailure={prefs.stopOnFailure}
           onOptions={setPrefs}
           nameOf={nameOf}

@@ -221,14 +221,14 @@ export async function onAppUpdateProgress(handler: (p: AppUpdateProgress) => voi
 
 const mockCheckCommands: CheckCommands = {}
 
-/** Commits updates that were applied without committing, one commit per repository. */
-export async function commitUpdate(plans: UpdatePlan[], force = false): Promise<CommitOutcome[]> {
+/** Commits updates that were applied without committing, one commit per repository; `push` then pushes each. */
+export async function commitUpdate(plans: UpdatePlan[], force = false, push = false): Promise<CommitOutcome[]> {
   if (!inTauri) {
     await new Promise((r) => setTimeout(r, 500))
     const repos = [...new Set(plans.map((p) => p.repo ?? p.projectId))]
-    return repos.map((job, i) => ({ job, name: job.split(/[\\/]/).pop() ?? job, committed: plans.find((p) => (p.repo ?? p.projectId) === job)?.repo ? `${(0xa04d173 + i * 977).toString(16)}` : null, error: null }))
+    return repos.map((job, i) => ({ job, name: job.split(/[\\/]/).pop() ?? job, committed: plans.find((p) => (p.repo ?? p.projectId) === job)?.repo ? `${(0xa04d173 + i * 977).toString(16)}` : null, error: null, pushed: push && !!plans.find((p) => (p.repo ?? p.projectId) === job)?.repo }))
   }
-  return invoke<CommitOutcome[]>('commit_update', { plans, force })
+  return invoke<CommitOutcome[]>('commit_update', { plans, force, push })
 }
 
 export async function planUpdate(projectId: string, changes: Change[]): Promise<UpdatePlan> {
@@ -240,11 +240,11 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
 /**
  * Updates many projects at once: one job per repository, side by side except
  * where two need the same tool. `run` picks the builds and tests; `commit`
- * commits each repository that succeeds.
+ * commits each repository that succeeds, and `push` pushes those commits.
  */
-export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true, forceCommit = false): Promise<BatchResult> {
-  if (!inTauri) return mock.applyBatch(plans, run, commit)
-  return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure, forceCommit })
+export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true, forceCommit = false, push = false): Promise<BatchResult> {
+  if (!inTauri) return mock.applyBatch(plans, run, commit, push)
+  return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure, forceCommit, push })
 }
 
 export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {
@@ -504,7 +504,7 @@ const mock = (() => {
       }
     },
     // Mirrors the Rust runner: one job per repository, one step per tool at a time.
-    applyBatch: async (plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean): Promise<BatchResult> => {
+    applyBatch: async (plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, push = false): Promise<BatchResult> => {
       const emit = (e: BatchEvent) => mockBatchListeners.forEach((l) => l(e))
       const jobs = new Map<string, UpdatePlan[]>()
       for (const p of plans) {
@@ -576,7 +576,7 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
         }
         emit({ job, projects, state: 'done', label: null, lane: null })
         const repo = list[0].repo
-        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, cancelled: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null, conflicts: [] }
+        return { job, name: job.split(/[\\/]/).pop() ?? job, repo, projects, ok: true, rolledBack: false, cancelled: false, error: null, steps: results, committed: commit && repo ? 'abc1234' : null, commitError: null, commitSkipped: commit && !repo ? 'not inside a git repository' : null, pushed: push && commit && !!repo, conflicts: [] }
       }
       for (const [job, list] of jobs) emit({ job, projects: list.map((p) => p.projectId), state: 'queued', label: null, lane: null })
       const outcomes = await Promise.all([...jobs].map(runJob))

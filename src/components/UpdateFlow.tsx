@@ -7,6 +7,8 @@ import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { FeedbackDialog } from './FeedbackDialog'
 import { Checkbox } from './Queue'
+import { Segmented } from './controls'
+import { COMMIT_MODES, type CommitMode } from '../prefs'
 import { sendReport, type Report } from '../lib/telemetry'
 import { batchErrorReport, planFailureReport, updateFailureReport } from '../lib/updateReport'
 import { RepoAvatar } from './RepoAvatar'
@@ -166,7 +168,7 @@ export function UpdateFlow({
   roots,
   build,
   test,
-  commit,
+  commitMode,
   stopOnFailure,
   onOptions,
   nameOf,
@@ -180,9 +182,9 @@ export function UpdateFlow({
   roots: string[]
   build: boolean
   test: boolean
-  commit: boolean
+  commitMode: CommitMode
   stopOnFailure: boolean
-  onOptions: (patch: { build?: boolean; test?: boolean; commit?: boolean }) => void
+  onOptions: (patch: { build?: boolean; test?: boolean; commit?: CommitMode }) => void
   nameOf: (key: string) => string
   icons: Record<string, string>
   /** Keeps a package on its line in `scope` (a repository) from now on. */
@@ -202,7 +204,9 @@ export function UpdateFlow({
   const [commits, setCommits] = useState<CommitOutcome[]>([])
   const [refreshed, setRefreshed] = useState<Inventory | null>(null)
   const checks = build || test
-  const [ran, setRan] = useState({ checks, build, test, commit })
+  const commit = commitMode !== 'off'
+  const push = commitMode === 'push'
+  const [ran, setRan] = useState({ checks, build, test, commit, push })
   /** A failure report being written up in the full feedback form. */
   const [note, setNote] = useState<(Report & { title: string }) | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -265,14 +269,14 @@ export function UpdateFlow({
   }
 
   const run = async () => {
-    setRan({ checks, build, test, commit })
+    setRan({ checks, build, test, commit, push })
     setStopping(new Set())
     stopAsked.current = new Set()
     setFallbacks({})
     setStage('running')
     setError(null)
     try {
-      const first = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit)
+      const first = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit, push)
       let all = first.outcomes
       let inventory = first.inventory
       let shown = plans
@@ -305,6 +309,7 @@ export function UpdateFlow({
           commit,
           stopOnFailure,
           forceCommit,
+          push,
         )
         all = [...all.filter((o) => !o.projects.some(redone)), ...result.outcomes]
         inventory = result.inventory ?? inventory
@@ -354,7 +359,7 @@ export function UpdateFlow({
   const commitNow = async () => {
     setStage('running')
     try {
-      setCommits(await api.commitUpdate(committable.flatMap((j) => j.plans), forceCommit))
+      setCommits(await api.commitUpdate(committable.flatMap((j) => j.plans), forceCommit, push))
     } catch (e) {
       setError(String(e))
     }
@@ -367,6 +372,7 @@ export function UpdateFlow({
         const { install, checks: steps } = stepsOf(job, build, test)
         const lines = [`# ${job.name}${job.branch ? ` (${job.branch})` : ''}`, `cd ${job.key}`, ...[...install, ...steps].map((s) => [s.program, ...s.args].join(' '))]
         if (commit && willCommit(job)) lines.push(`git commit -m "${commitSubject(changesOf(job).length)}" -- <changed files>`)
+        if (push && willCommit(job)) lines.push('git push')
         return lines.join('\n')
       })
       .join('\n\n')
@@ -390,10 +396,7 @@ export function UpdateFlow({
           </label>
         </>
       )}
-      <label className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]">
-        <Checkbox checked={commit} onChange={() => onOptions({ commit: !commit })} label="Commit each repository" />
-        Commit each repository
-      </label>
+      <Segmented value={commitMode} options={COMMIT_MODES} onChange={(next) => onOptions({ commit: next })} label="After updating" />
       {commit && dirtyJobs.length > 0 && (
         <label
           className="inline-flex cursor-pointer items-center gap-2 text-[12.5px]"
@@ -486,7 +489,7 @@ export function UpdateFlow({
     return (
       <Dialog
         title={`Update ${total} project${total === 1 ? '' : 's'}`}
-        description={`${packages} package${packages === 1 ? '' : 's'} will change. Mehen edits the files below${filesOnly ? '' : ` and refreshes lockfiles${checks ? ", then runs each project's checks" : ''}`}${commit ? ', then commits' : ''}.`}
+        description={`${packages} package${packages === 1 ? '' : 's'} will change. Mehen edits the files below${filesOnly ? '' : ` and refreshes lockfiles${checks ? ", then runs each project's checks" : ''}`}${push ? ', then commits and pushes' : commit ? ', then commits' : ''}.`}
         icon={<Play size={22} />}
         size="wide"
         onClose={close}
@@ -549,7 +552,7 @@ export function UpdateFlow({
                   {commit && willCommit(job) && (
                     <li className="flex items-center gap-2 text-muted">
                       <GitCommitHorizontal size={14} className="shrink-0" />
-                      Commit on {job.branch ?? 'the current branch'}: “{commitSubject(changes.length)}”
+                      Commit on {job.branch ?? 'the current branch'}: “{commitSubject(changes.length)}”{push && ', then push'}
                     </li>
                   )}
                 </ul>
@@ -580,7 +583,7 @@ export function UpdateFlow({
         </div>
         <p className="mt-3 border-l-2 border-line-strong pl-3 text-[12.5px] leading-relaxed text-muted">
           {filesOnly ? 'Workflow files have nothing to install or test here; your CI runs them next time it starts.' : checks ? (stopOnFailure ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : "If a check fails, the remaining checks still run so you see every failure, then Mehen puts that project's files back.") : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
-          {commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'}
+          {push ? 'Each commit is pushed once it is made.' : commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'}
           {!filesOnly && ' Different projects update side by side; projects that need the same tool take turns.'}
         </p>
       </Dialog>
@@ -591,7 +594,13 @@ export function UpdateFlow({
     return (
       <Dialog
         title={outcomes.length ? 'Committing' : 'Updating'}
-        description={outcomes.length ? 'Committing the files Mehen changed.' : filesOnly ? `Each project's workflow files are updated${ran.commit ? ' and committed' : ''}.` : `Each project is updated${ran.checks ? ' and checked' : ''}${ran.commit ? ' and committed' : ''}. Projects that need the same tool take turns.`}
+        description={
+          outcomes.length
+            ? `Committing${push ? ' and pushing' : ''} the files Mehen changed.`
+            : filesOnly
+              ? `Each project's workflow files are updated${ran.push ? ', committed and pushed' : ran.commit ? ' and committed' : ''}.`
+              : `Each project is updated${ran.checks ? ' and checked' : ''}${ran.push ? ', then committed and pushed' : ran.commit ? ' and committed' : ''}. Projects that need the same tool take turns.`
+        }
         icon={<RefreshCw size={22} className="animate-spin" />}
         size="wide"
         busy
@@ -610,7 +619,7 @@ export function UpdateFlow({
       >
         {jobs.map((job) => {
           const states = job.plans.map((p) => live[p.projectId.toLowerCase()]).filter(Boolean)
-          const now = states.find((s) => s.state === 'running' || s.state === 'committing') ?? states.find((s) => s.state === 'waiting') ?? states[0]
+          const now = states.find((s) => s.state === 'running' || s.state === 'committing' || s.state === 'pushing') ?? states.find((s) => s.state === 'waiting') ?? states[0]
           const state = now?.state ?? 'queued'
           const asked = stopping.has('*') || stopping.has(job.key.toLowerCase())
           const stoppable = !outcomes.length && (state === 'queued' || state === 'waiting' || state === 'running')
@@ -640,9 +649,9 @@ export function UpdateFlow({
                 <StateChip tone="wait" spin>
                   Cancelling
                 </StateChip>
-              ) : state === 'running' || state === 'committing' ? (
+              ) : state === 'running' || state === 'committing' || state === 'pushing' ? (
                 <StateChip tone="run" spin>
-                  {state === 'committing' ? 'Committing' : 'Running'}
+                  {state === 'pushing' ? 'Pushing' : state === 'committing' ? 'Committing' : 'Running'}
                 </StateChip>
               ) : (
                 <StateChip tone="wait">Waiting</StateChip>
@@ -671,7 +680,7 @@ export function UpdateFlow({
     return (
       <Dialog
         title={`Commit ${committable.length} project${committable.length === 1 ? '' : 's'}`}
-        description="Only the files Mehen changed are committed, on each project's current branch. Nothing is pushed."
+        description={`Only the files Mehen changed are committed, on each project's current branch. ${push ? 'Each branch is then pushed.' : 'Nothing is pushed.'}`}
         icon={<GitCommitHorizontal size={22} />}
         onClose={() => setStage('done')}
         footer={
@@ -679,7 +688,7 @@ export function UpdateFlow({
             <Button onClick={() => setStage('done')}>Not now</Button>
             <Button variant="primary" onClick={commitNow}>
               <GitCommitHorizontal size={15} />
-              Commit
+              {push ? 'Commit & push' : 'Commit'}
             </Button>
           </>
         }
@@ -707,12 +716,22 @@ export function UpdateFlow({
     )
   }
 
-  const anyCommitted = passed.some((j) => outcomeOf(j)?.committed || commitOf(j)?.committed)
+  const committedJobs = passed.filter((j) => outcomeOf(j)?.committed || commitOf(j)?.committed)
+  const anyCommitted = committedJobs.length > 0
+  const pushedOf = (j: Job) => !!(outcomeOf(j)?.pushed || commitOf(j)?.pushed)
+  const allPushed = anyCommitted && committedJobs.every(pushedOf)
+  const somePushed = committedJobs.some(pushedOf)
   return (
     <Dialog
       title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : stopped.length && !passed.length ? 'Update cancelled' : 'Update finished'}
       description={
-        anyCommitted ? 'Each committed project has a new local commit. Nothing was pushed.' : passed.length ? 'Changed files are ready to commit. Nothing has been committed yet.' : 'Nothing on disk was changed.'
+        allPushed
+          ? 'Each committed project was pushed to its remote.'
+          : somePushed
+            ? 'Some commits were pushed; the rest stayed local.'
+            : anyCommitted
+              ? `Each committed project has a new local commit. ${ran.push ? 'The push did not go through.' : 'Nothing was pushed.'}`
+              : passed.length ? 'Changed files are ready to commit. Nothing has been committed yet.' : 'Nothing on disk was changed.'
       }
       icon={broke.length || error ? <AlertTriangle size={22} /> : <ShieldCheck size={22} />}
       tone={broke.length || error ? 'danger' : undefined}
@@ -757,7 +776,7 @@ export function UpdateFlow({
             <b className="block text-[14px]">
               {broke.length || stopped.length
                 ? `${passed.length} of ${total} project${total === 1 ? '' : 's'} updated${stopped.length ? `, ${stopped.length} cancelled` : ''}`
-                : `${total} project${total === 1 ? '' : 's'} updated${anyCommitted ? ' and committed' : ''}`}
+                : `${total} project${total === 1 ? '' : 's'} updated${allPushed ? ', committed and pushed' : anyCommitted ? ' and committed' : ''}`}
             </b>
             <span className="text-[12.5px] text-muted">
               {broke.length
@@ -779,6 +798,8 @@ export function UpdateFlow({
         const c = commitOf(job)
         const hash = o.committed ?? c?.committed
         const why = o.commitError ?? c?.error ?? (ran.commit ? o.commitSkipped : null)
+        const pushed = !!(o.pushed || c?.pushed)
+        const pushWhy = o.pushError ?? c?.pushError ?? null
         const changes = changesOf(job)
         const failing = o.steps.filter((s) => !s.ok)
         const blocking = o.conflicts.filter((x) => x.blocking)
@@ -829,7 +850,9 @@ export function UpdateFlow({
                 <small className="text-[12px] text-muted">
                   {changes.map((ch) => `${ch.name} ${ch.to}`).join(', ')}
                   {hash && ` · committed ${hash}${job.branch ? ` on ${job.branch}` : ''}`}
+                  {pushed && ' · pushed'}
                   {why && <span className="text-risk-review"> · not committed: {why}</span>}
+                  {pushWhy && <span className="text-risk-review"> · not pushed: {pushWhy}</span>}
                   {warned.length > 0 && (
                     <span className="mt-0.5 flex items-start gap-1.5 text-risk-review" title={warned.map((x) => x.summary).join('\n')}>
                       <AlertTriangle size={13} className="mt-px shrink-0" />
@@ -911,7 +934,7 @@ export function UpdateFlow({
               <span className="flex flex-col items-end gap-1.5">
                 <StateChip tone="ok">
                   {hash ? <GitCommitHorizontal size={14} /> : <Check size={14} />}
-                  {hash ? 'Committed' : 'Updated'}
+                  {pushed ? 'Pushed' : hash ? 'Committed' : 'Updated'}
                 </StateChip>
                 {onReviewInGitWyrm && job.plans.some((p) => p.repo) && (
                   <Button variant="ghost" className="h-7 px-2" onClick={() => onReviewInGitWyrm(job.key)} title={hash ? 'See the new commit in GitWyrm' : 'See the changed files in GitWyrm, then commit them there'}>

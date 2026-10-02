@@ -234,7 +234,7 @@ export interface StepResult {
 }
 
 
-export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'done' | 'failed' | 'rolled-back' | 'cancelled'
+export type JobState = 'queued' | 'waiting' | 'running' | 'committing' | 'pushing' | 'done' | 'failed' | 'rolled-back' | 'cancelled'
 
 /** Progress for one repository's share of a batch update. */
 export interface BatchEvent {
@@ -262,6 +262,10 @@ export interface JobOutcome {
   commitError: string | null
   /** Why no commit was attempted although one was asked for. */
   commitSkipped: string | null
+  /** The commit reached the remote. */
+  pushed?: boolean
+  /** The commit stayed local because the push failed. */
+  pushError?: string | null
   /** Dependency conflicts the package managers reported along the way. */
   conflicts: Conflict[]
   /** Anything worth knowing about how it went, like a clean install. */
@@ -291,6 +295,8 @@ export interface CommitOutcome {
   name: string
   committed: string | null
   error: string | null
+  pushed?: boolean
+  pushError?: string | null
 }
 
 export interface CheckConfig {

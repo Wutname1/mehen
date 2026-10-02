@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react'
 
+/** After a successful update: leave the files, commit them, or commit and push. */
+export type CommitMode = 'off' | 'commit' | 'push'
+
+export const COMMIT_MODES: { value: CommitMode; label: string; detail: string }[] = [
+  { value: 'off', label: "Don't commit", detail: 'Leaves the changed files for you to commit.' },
+  { value: 'commit', label: 'Commit', detail: 'Commits only the files Mehen changed, once that project is done. Never pushes.' },
+  { value: 'push', label: 'Commit & push', detail: 'Commits only the files Mehen changed, then pushes the branch to its remote.' },
+]
+
 /** Choices that only affect this window, kept in the webview's storage. */
 export interface Prefs {
   palette: 'faience' | 'parchment'
@@ -8,8 +17,8 @@ export interface Prefs {
   build: boolean
   /** Run each project's tests after installing. */
   test: boolean
-  /** Commit each repository once its update succeeds. */
-  commit: boolean
+  /** Commit (and maybe push) each repository once its update succeeds. */
+  commit: CommitMode
   /** Check every project when Mehen opens. */
   scanOnOpen: boolean
   /** Stop a project at its first failed check instead of running the rest. */
@@ -20,7 +29,7 @@ export interface Prefs {
   railSort: 'az' | 'za' | 'updates'
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', build: true, test: true, commit: false, scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', build: true, test: true, commit: 'off', scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
 
 /** Bumped when a default changes and older saved choices should pick it up. */
 const VERSION = 2
@@ -37,6 +46,8 @@ function load(): Prefs {
       saved.test ??= saved.checks
       delete saved.checks
     }
+    // Commit used to be on or off.
+    if (typeof saved.commit === 'boolean') saved.commit = saved.commit ? 'commit' : 'off'
     return { ...DEFAULTS, ...saved }
   } catch {
     return DEFAULTS

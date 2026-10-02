@@ -20,6 +20,27 @@ export function Switch({ checked, onChange, label, disabled }: { checked: boolea
   )
 }
 
+/** One choice out of a few, shown side by side. */
+export function Segmented<T extends string>({ value, options, onChange, label }: { value: T; options: { value: T; label: string; detail?: string }[]; onChange: (next: T) => void; label: string }) {
+  return (
+    <div role="radiogroup" aria-label={label} className="inline-flex shrink-0 rounded-[3px] border border-line-strong bg-paper p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          role="radio"
+          aria-checked={value === o.value}
+          title={o.detail}
+          onClick={() => onChange(o.value)}
+          className={cx('h-[26px] rounded-[2px] px-2.5 text-[12.5px] whitespace-nowrap', value === o.value ? 'bg-check font-semibold text-paper' : 'text-muted hover:text-ink')}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 /** A labelled setting: title and help on the left, the control on the right. */
 export function SettingRow({ title, help, children }: { title: ReactNode; help?: ReactNode; children?: ReactNode }) {
   return (

@@ -298,6 +298,27 @@ pub(crate) fn commit_paths(repo: &Path, paths: &[String], messages: &[&str]) -> 
     run(git(repo).args(["rev-parse", "--short", "HEAD"])).map(|h| h.trim().to_string())
 }
 
+const PUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Pushes the current branch. A branch with no upstream yet is pushed to
+/// `origin` and tracks it from then on. Never asks for credentials in a
+/// terminal, so a push that needs them fails instead of hanging.
+pub(crate) async fn push(repo: &Path) -> Result<(), String> {
+    let tracked = git(repo).args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).output().is_ok_and(|o| o.status.success());
+    let mut cmd = tokio::process::Command::from(git(repo));
+    cmd.arg("push");
+    if !tracked {
+        cmd.args(["-u", "origin", "HEAD"]);
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0").stdin(std::process::Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(PUSH_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => Err(tail(&format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))),
+        Ok(Err(e)) => Err(format!("could not run git: {e}")),
+        Err(_) => Err(format!("timed out after {} minutes", PUSH_TIMEOUT.as_secs() / 60)),
+    }
+}
+
 fn unified_diff(path: &str, before: &str, after: &str, base: &Path) -> String {
     let shown = Path::new(path).strip_prefix(base).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     TextDiff::from_lines(before, after).unified_diff().context_radius(2).header(&shown, &shown).to_string()

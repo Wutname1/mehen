@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, distinctVersions, displayVersion, folderName, repoKey, samePath, type QueueUsage, type Repo, runLabel } from '../derive'
 import { GitWyrmMark, cx } from './bits'
 import { Menu, MenuCheck, MenuSeparator, MenuTitle } from './Menu'
+import { COMMIT_MODES, type CommitMode } from '../prefs'
 import { RepoAvatar } from './RepoAvatar'
 
 /** Selected usages grouped by package, for the tray. */
@@ -96,10 +97,11 @@ export function Tray({
   onPreview: () => void
   build: boolean
   test: boolean
-  commit: boolean
-  onOptions: (patch: { build?: boolean; test?: boolean; commit?: boolean }) => void
+  commit: CommitMode
+  onOptions: (patch: { build?: boolean; test?: boolean; commit?: CommitMode }) => void
 }) {
   const [menu, setMenu] = useState<HTMLElement | null>(null)
+  const commits = commit === 'push' ? 'commits and pushes' : 'commits'
   const usages = groups.flatMap((g) => g.usages)
   const repos = new Set(usages.map((u) => repoKey(u.project).toLowerCase()))
   // Workflow edits have nothing to install, build or test.
@@ -174,15 +176,15 @@ export function Tray({
         )}
         {groups.length > 0 && (
           <p className="m-0 mb-0.5 flex items-center gap-1.5 text-[12px] text-muted">
-            {commit ? <GitCommitHorizontal size={14} className="shrink-0" /> : filesOnly ? <FileText size={14} className="shrink-0" /> : <Terminal size={14} className="shrink-0" />}
+            {commit !== 'off' ? <GitCommitHorizontal size={14} className="shrink-0" /> : filesOnly ? <FileText size={14} className="shrink-0" /> : <Terminal size={14} className="shrink-0" />}
             {filesOnly
-              ? commit
-                ? 'Edits the workflow files, then commits each project. Nothing to install or test.'
+              ? commit !== 'off'
+                ? `Edits the workflow files, then ${commits} each project. Nothing to install or test.`
                 : 'Edits the workflow files only. Nothing to install or test.'
               : build || test
-                ? `Then ${build && test ? 'builds and tests' : build ? 'builds (no tests)' : 'tests (no build)'}${commit ? ', then commits each project.' : '. You commit afterwards.'}`
-                : commit
-                  ? 'Installs only, then commits each project. No build or test.'
+                ? `Then ${build && test ? 'builds and tests' : build ? 'builds (no tests)' : 'tests (no build)'}${commit !== 'off' ? `, then ${commits} each project.` : '. You commit afterwards.'}`
+                : commit !== 'off'
+                  ? `Installs only, then ${commits} each project. No build or test.`
                   : 'Installs only. No build or test, nothing committed.'}
           </p>
         )}
@@ -234,9 +236,11 @@ export function Tray({
                 <MenuSeparator />
               </>
             )}
-            <MenuCheck checked={commit} onSelect={() => onOptions({ commit: !commit })} detail="Commits only the files Mehen changed, once that project is done. Never pushes.">
-              Commit each repository
-            </MenuCheck>
+            {COMMIT_MODES.map((m) => (
+              <MenuCheck key={m.value} radio checked={commit === m.value} onSelect={() => onOptions({ commit: m.value })} detail={m.detail}>
+                {m.label}
+              </MenuCheck>
+            ))}
           </Menu>
         )}
       </div>

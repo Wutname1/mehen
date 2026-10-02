@@ -36,6 +36,8 @@ pub struct BatchOptions {
     /// Commit even where the files already had uncommitted changes, which
     /// then go into the same commit.
     pub force_commit: bool,
+    /// Push each repository's branch after committing it.
+    pub push: bool,
     /// Steps running at once across every repository; at least 1.
     pub parallel: usize,
     /// Stop a repository at its first failed check. When off, the remaining
@@ -51,6 +53,7 @@ pub enum JobState {
     Waiting,
     Running,
     Committing,
+    Pushing,
     Done,
     Failed,
     RolledBack,
@@ -90,6 +93,10 @@ pub struct JobOutcome {
     pub commit_error: Option<String>,
     /// Why no commit was attempted although one was asked for.
     pub commit_skipped: Option<String>,
+    /// The commit reached the remote.
+    pub pushed: bool,
+    /// The commit stayed local because the push failed.
+    pub push_error: Option<String>,
     /// Dependency conflicts the package managers reported along the way.
     pub conflicts: Vec<Conflict>,
     /// Anything worth knowing about how it went, like a clean install.
@@ -192,6 +199,8 @@ pub struct CommitOutcome {
     pub name: String,
     pub committed: Option<String>,
     pub error: Option<String>,
+    pub pushed: bool,
+    pub push_error: Option<String>,
 }
 
 /// Where this install may start clean: the job's `clean_retry` paths that
@@ -249,26 +258,30 @@ fn remove_path(path: &Path) {
 }
 
 /// Commits already-applied plans, one commit per repository, as the batch
-/// runner would have with commit on.
-pub fn commit(plans: Vec<UpdatePlan>, force: bool) -> Vec<CommitOutcome> {
-    group(plans)
-        .into_iter()
-        .map(|job| {
-            let result = match (job.commit_blocked(force), &job.repo) {
-                (Some(reason), _) => Err(reason),
-                (None, None) => Err("not inside a git repository".into()),
-                (None, Some(repo)) => {
-                    let (subject, body) = job.commit_message();
-                    update::commit_paths(repo, &job.touched_paths(), &[&subject, &body])
-                }
-            };
-            let (committed, error) = match result {
-                Ok(hash) => (Some(hash), None),
-                Err(e) => (None, Some(e)),
-            };
-            CommitOutcome { job: job.key, name: job.name, committed, error }
-        })
-        .collect()
+/// runner would have with commit on; `push` then pushes each one committed.
+pub async fn commit(plans: Vec<UpdatePlan>, force: bool, push: bool) -> Vec<CommitOutcome> {
+    let mut outcomes = Vec::new();
+    for job in group(plans) {
+        let result = match (job.commit_blocked(force), &job.repo) {
+            (Some(reason), _) => Err(reason),
+            (None, None) => Err("not inside a git repository".into()),
+            (None, Some(repo)) => {
+                let (subject, body) = job.commit_message();
+                update::commit_paths(repo, &job.touched_paths(), &[&subject, &body])
+            }
+        };
+        let (committed, error) = match result {
+            Ok(hash) => (Some(hash), None),
+            Err(e) => (None, Some(e)),
+        };
+        let push_error = match (&job.repo, &committed) {
+            (Some(repo), Some(_)) if push => update::push(repo).await.err(),
+            _ => None,
+        };
+        let pushed = push && committed.is_some() && push_error.is_none();
+        outcomes.push(CommitOutcome { job: job.key, name: job.name, committed, error, pushed, push_error });
+    }
+    outcomes
 }
 
 /// The step's tool, which decides who it must take turns with.
@@ -347,6 +360,8 @@ where
         committed: None,
         commit_error: None,
         commit_skipped: None,
+        pushed: false,
+        push_error: None,
         conflicts: Vec::new(),
         notes: Vec::new(),
         failed_before: None,
@@ -499,6 +514,13 @@ where
                 match update::commit_paths(repo, &paths, &[&subject, &body]) {
                     Ok(hash) => outcome.committed = Some(hash),
                     Err(e) => outcome.commit_error = Some(e),
+                }
+                if options.push && outcome.committed.is_some() {
+                    on_event(job.event(JobState::Pushing, Some("git push".into()), None));
+                    match update::push(repo).await {
+                        Ok(()) => outcome.pushed = true,
+                        Err(e) => outcome.push_error = Some(e),
+                    }
                 }
             }
         }
@@ -673,7 +695,7 @@ mod tests {
         };
 
         let log = Log::default();
-        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans(), opts, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok));
         let runs = log.borrow();
@@ -707,7 +729,7 @@ mod tests {
                 let first = calls.get() == 1;
                 async move { if first { (false, "npm error code ERESOLVE".to_string()) } else { (retry_works, "done".to_string()) } }
             };
-            let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+            let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
             let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
             // A failed install nothing explained is tried once more on the original files.
             assert_eq!(calls.get(), if retry_works { 2 } else { 3 }, "one retry");
@@ -728,7 +750,7 @@ mod tests {
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)])];
         let output = "npm error Could not resolve dependency:
 npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
-        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
         let outcomes = run(plans, opts, &Cancels::default(), |_, _| async move { (false, output.to_string()) }, |_| {}).await;
         let conflicts = &outcomes[0].conflicts;
         assert!(outcomes[0].rolled_back);
@@ -758,7 +780,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(kinds(true, false), [StepKind::Install, StepKind::Install, StepKind::Verify], "the build without tests");
 
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, ""), |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, ""), |_| {}).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(log.borrow().len(), 2);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "after");
@@ -777,7 +799,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         ];
         let events = RefCell::new(Vec::new());
         let log = Log::default();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), recorder(&log, "npm"), |e| events.borrow_mut().push(e)).await;
         let bad_outcome = outcomes.iter().find(|o| o.name == "bad").unwrap();
         assert!(!bad_outcome.ok && bad_outcome.rolled_back, "{:?}", bad_outcome.error);
         assert_eq!(std::fs::read_to_string(bad.join("Cargo.toml")).unwrap(), "before");
@@ -800,7 +822,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         git(&["commit", "-q", "-m", "init"]);
 
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![]), plan(&dir, "app.csproj", Some(&dir), vec![])];
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: true, force_commit: false, push: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await;
         assert!(outcomes[0].committed.is_some(), "{:?}", outcomes[0].commit_error);
         let log = String::from_utf8(git(&["log", "-1", "--format=%s%n%b"]).stdout).unwrap();
         assert!(log.starts_with("Updated 2 Dependencies"), "{log}");
@@ -810,11 +832,38 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
     }
 
     #[tokio::test]
+    async fn pushes_after_committing_and_sets_the_upstream() {
+        let dir = temp("push");
+        let remote = temp("push-remote");
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+        std::process::Command::new("git").arg("-C").arg(&remote).args(["init", "-q", "--bare"]).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["remote", "add", "origin", &remote.display().to_string()]);
+        std::fs::write(dir.join("package.json"), "before").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let opts = BatchOptions { build: false, test: false, commit: true, force_commit: false, push: true, parallel: 1, stop_on_failure: true };
+        let outcome = run(vec![plan(&dir, "package.json", Some(&dir), vec![])], opts, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await.remove(0);
+        assert!(outcome.pushed, "{:?} {:?}", outcome.commit_error, outcome.push_error);
+        let local = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+        let upstream = String::from_utf8(git(&["rev-parse", "@{u}"]).stdout).unwrap();
+        assert_eq!(local, upstream);
+
+        git(&["remote", "remove", "origin"]);
+        git(&["branch", "--unset-upstream"]);
+        let outcome = run(vec![plan(&dir, "app.csproj", Some(&dir), vec![])], opts, &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await.remove(0);
+        assert!(outcome.committed.is_some() && !outcome.pushed && outcome.push_error.is_some(), "{:?}", outcome.push_error);
+    }
+
+    #[tokio::test]
     async fn keeps_running_checks_when_asked_then_restores() {
         let dir = temp("keep-going");
         let plans = vec![plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("vitest", StepKind::Verify, &dir), step("npm", StepKind::Test, &dir)])];
         let log = Log::default();
-        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: false };
+        let opts = BatchOptions { build: true, test: true, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: false };
         let outcomes = run(plans, opts, &Cancels::default(), recorder(&log, "vitest"), |_| {}).await;
         let lanes: Vec<String> = log.borrow().iter().map(|r| r.0.clone()).collect();
         // Install, the failed build, the tests; then the install again on the
@@ -847,7 +896,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
             async move { result }
         };
         let events = RefCell::new(Vec::new());
-        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
         let outcome = run(vec![p], opts, &Cancels::default(), fake, |e| events.borrow_mut().push(e)).await.remove(0);
         assert!(outcome.rolled_back && !outcome.ok);
         assert_eq!(*installed.borrow(), ["after", "before"], "the old packages were installed again after the files were put back");
@@ -868,7 +917,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
             calls.set(calls.get() + 1);
             async move { (false, output.to_string()) }
         };
-        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: true };
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
         let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
         assert_eq!(calls.get(), 2, "the restore, then the restore on the original files; no build");
         assert_eq!(outcome.failed_before, Some(true));
@@ -884,7 +933,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
             calls.set(calls.get() + 1);
             async move { (false, format!("`{}` {}", s.program, update::NOT_INSTALLED)) }
         };
-        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, parallel: 1, stop_on_failure: false };
+        let opts = BatchOptions { build: true, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: false };
         let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
         assert_eq!(calls.get(), 1, "nothing ran after the tool was found missing");
         assert_eq!(outcome.missing_tool.as_deref(), Some("npm"));
@@ -917,7 +966,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let npm = Step { kind: StepKind::Install, label: "npm version".into(), program: "npm".into(), args: vec!["--version".into()], cwd: d.display().to_string() };
         let plans = vec![plan(&a, "package.json", None, vec![sleep(&a)]), plan(&b, "package.json", None, vec![sleep(&b)]), plan(&c, "x.csproj", None, vec![git]), plan(&d, "y.csproj", None, vec![npm])];
         let started = Instant::now();
-        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |s, c| async move { update::run_step(&s, &c).await }, |_| {}).await;
+        let outcomes = run(plans, BatchOptions { build: true, test: true, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true }, &Cancels::default(), |s, c| async move { update::run_step(&s, &c).await }, |_| {}).await;
         assert!(outcomes.iter().all(|o| o.ok), "{:?}", outcomes.iter().map(|o| &o.error).collect::<Vec<_>>());
         assert!(started.elapsed() >= Duration::from_millis(1500), "the two node steps overlapped: {:?}", started.elapsed());
     }
@@ -929,7 +978,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let plans = vec![plan(&a, "package.json", Some(&a), vec![slow(&a)]), plan(&b, "package.json", Some(&b), vec![slow(&b)])];
         let before = std::fs::read_to_string(a.join("package.json")).unwrap();
         let cancels = Cancels::default();
-        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true };
         let started = Instant::now();
         let stop = async {
             tokio::time::sleep(Duration::from_millis(600)).await;
@@ -951,7 +1000,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let jobs = group(plans.clone());
         let cancels = Cancels::default();
         cancels.cancel(Some(&jobs[1].key));
-        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, parallel: 2, stop_on_failure: true };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 2, stop_on_failure: true };
         let outcomes = run(plans, opts, &cancels, recorder(&log, ""), |_| {}).await;
         assert!(outcomes[0].ok && !outcomes[0].cancelled);
         assert!(outcomes[1].cancelled && !outcomes[1].ok);
@@ -996,7 +1045,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
             p.uncommitted = vec!["package.json".into()];
             p
         };
-        let opts = |force_commit| BatchOptions { build: false, test: false, commit: true, force_commit, parallel: 1, stop_on_failure: true };
+        let opts = |force_commit| BatchOptions { build: false, test: false, commit: true, force_commit, push: false, parallel: 1, stop_on_failure: true };
         let held = run(vec![dirty()], opts(false), &Cancels::default(), |_, _| async { (true, String::new()) }, |_| {}).await.remove(0);
         assert!(held.ok && held.committed.is_none() && held.commit_skipped.as_deref().is_some_and(|r| r.contains("package.json")), "{held:?}");
         std::fs::write(dir.join("package.json"), "before").unwrap();
