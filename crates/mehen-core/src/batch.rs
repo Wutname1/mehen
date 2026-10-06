@@ -111,6 +111,10 @@ pub struct JobOutcome {
     /// Checks that failed with no failures the update added: run again with
     /// these as `accepted_failures`, the update goes through.
     pub known_failures: Vec<KnownFailure>,
+    /// Projects whose own step fails without the update and has nothing
+    /// to accept (a package that cannot be found, say): the rest of the job
+    /// can go ahead without them.
+    pub broken_projects: Vec<String>,
 }
 
 /// One repository's share of the batch.
@@ -382,6 +386,7 @@ where
         failed_before: None,
         missing_tool: None,
         known_failures: Vec::new(),
+        broken_projects: Vec::new(),
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -655,6 +660,11 @@ async fn settle<R, F, E>(
         } else if comparable {
             format!("`{}` already failed before these updates, and they add new failures: {}.", step.label, failures::list(&added))
         } else {
+            for plan in job.plans.iter().filter(|p| p.steps.iter().any(|s| update::step_key(s) == key)) {
+                if !outcome.broken_projects.contains(&plan.project_id) {
+                    outcome.broken_projects.push(plan.project_id.clone());
+                }
+            }
             format!("`{}` fails without these updates too, so the problem was already in the project.", step.label)
         });
     }
@@ -1004,6 +1014,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
         assert_eq!(calls.get(), 2, "the restore, then the restore on the original files; no build");
         assert_eq!(outcome.failed_before, Some(true));
+        assert_eq!(outcome.broken_projects.len(), 1, "the project whose restore fails anyway");
         assert!(outcome.notes.iter().any(|n| n.contains("fails without these updates too")), "{:?}", outcome.notes);
     }
 

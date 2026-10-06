@@ -17,6 +17,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+mod ai;
 mod background;
 mod gitwyrm;
 #[cfg(target_os = "macos")]
@@ -52,6 +53,8 @@ struct AppState {
     checking: AtomicBool,
     /// Stop switches for the update running now.
     cancels: std::sync::Mutex<Arc<Cancels>>,
+    /// Stop switch for the fix running now.
+    fix_cancel: std::sync::Mutex<mehen_core::cancel::Cancel>,
     /// The last result this app ran or loaded, for when the saved one cannot
     /// be read back.
     inventory: std::sync::Mutex<Option<Inventory>>,
@@ -703,7 +706,7 @@ pub fn run() {
             mehen_core::trace::init(&dir, "app");
             let (store, repaired) = Store::open_or_repair(&dir.join("mehen.db")).map_err(|e| e.to_string())?;
             let inventory = std::sync::Mutex::new(store.last_inventory());
-            app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default(), inventory });
+            app.manage(AppState { store, checking: AtomicBool::new(false), cancels: Default::default(), fix_cancel: Default::default(), inventory });
             telemetry::set_enabled(app.state::<AppState>().error_reports());
             if let Some(note) = repaired {
                 eprintln!("{note}");
@@ -750,6 +753,9 @@ pub fn run() {
             plan_update,
             apply_batch,
             cancel_update,
+            ai::ai_tools,
+            ai::fix_update,
+            ai::cancel_fix,
             check_commands,
             set_check_commands,
             commit_update,

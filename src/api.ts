@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { compareVersions, isWithin, samePath } from './derive'
-import type { OpenRepoRequest, AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move } from './types'
+import type { OpenRepoRequest, AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move, AiTool, AiToolId, FixEvent, FixOutcome } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -262,6 +262,44 @@ const mockBatchListeners = new Set<(e: BatchEvent) => void>()
 /** Jobs asked to stop in the browser preview; `*` is all of them. */
 const mockCancelled = new Set<string>()
 
+/** Claude Code and Codex as installed (and signed in to) on this computer. */
+export async function aiTools(): Promise<AiTool[]> {
+  if (!inTauri) {
+    return [
+      { tool: 'claude', name: 'Claude Code', version: '2.1.0', ready: true, problem: null, installUrl: 'https://docs.anthropic.com/en/docs/claude-code' },
+      { tool: 'codex', name: 'Codex', version: null, ready: false, problem: 'Not installed', installUrl: 'https://developers.openai.com/codex/cli' },
+    ]
+  }
+  return invoke<AiTool[]>('ai_tools')
+}
+
+/**
+ * Applies one repository's update, then has `tool` change the project's code
+ * until its checks pass (a few tries at most). Everything is put back when
+ * they never do. Progress comes as `onFixEvent` events.
+ */
+export async function fixUpdate(plans: UpdatePlan[], tool: AiToolId, run: { build: boolean; test: boolean }, commit: boolean, push: boolean): Promise<{ outcome: FixOutcome; inventory: Inventory | null }> {
+  if (!inTauri) return { outcome: await mock.fixUpdate(plans), inventory: null }
+  return invoke<{ outcome: FixOutcome; inventory: Inventory | null }>('fix_update', { plans, tool, build: run.build, test: run.test, commit, push })
+}
+
+export async function onFixEvent(handler: (e: FixEvent) => void): Promise<UnlistenFn> {
+  if (!inTauri) {
+    mockFixListeners.add(handler)
+    return () => {
+      mockFixListeners.delete(handler)
+    }
+  }
+  return listen<FixEvent>('mehen://fix', (e) => handler(e.payload))
+}
+
+export async function cancelFix(): Promise<void> {
+  if (!inTauri) return
+  return invoke<void>('cancel_fix')
+}
+
+const mockFixListeners = new Set<(e: FixEvent) => void>()
+
 /** Stops one repository's running update, or every one when `job` is null. Its files are put back. */
 export async function cancelUpdate(job: string | null): Promise<void> {
   if (!inTauri) {
@@ -510,6 +548,28 @@ const mock = (() => {
         branch: project.repo ? 'main' : null,
         pinned: changes.filter(pinnedDep).map((c) => c.name),
       }
+    },
+    // Walks through a fix that works on the second try.
+    fixUpdate: async (plans: UpdatePlan[]): Promise<FixOutcome> => {
+      const emit = (e: FixEvent) => mockFixListeners.forEach((l) => l(e))
+      const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
+      const step = async (label: string, ok = true) => {
+        emit({ kind: 'step', label, state: 'running' })
+        await wait(900)
+        emit({ kind: 'step', label, state: ok ? 'ok' : 'failed' })
+      }
+      await step('npm install')
+      await step('npm run build', false)
+      emit({ kind: 'asking', round: 1, of: 3 })
+      for (const text of ['Reading the build error. ', 'Express 5 removed `app.del`; ', 'switching to `app.delete`.']) {
+        await wait(500)
+        emit({ kind: 'text', text })
+      }
+      emit({ kind: 'tool', title: 'Edit src/server.ts', status: 'done' })
+      await step('npm run build')
+      await step('npm run test')
+      const name = plans[0]?.changes[0]?.name ?? 'the package'
+      return { ok: true, rounds: 1, changed: ['src/server.ts'], summary: `Updated src/server.ts for the new ${name}: \`app.del\` is now \`app.delete\`.`, error: null, steps: [], rolledBack: false, committed: null, commitError: null, commitSkipped: null, pushed: false, pushError: null }
     },
     // Mirrors the Rust runner: one job per repository, one step per tool at a time.
     applyBatch: async (plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, push = false): Promise<BatchResult> => {

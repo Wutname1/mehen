@@ -280,7 +280,7 @@ pub(crate) fn touched_paths(plan: &UpdatePlan) -> Vec<String> {
     paths
 }
 
-fn git(repo: &Path) -> std::process::Command {
+pub(crate) fn git(repo: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(repo);
     #[cfg(windows)]

@@ -1,8 +1,8 @@
-import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Lock, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
+import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Lock, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Sparkles, Terminal, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { applyPins, bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
-import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
+import type { AiTool, BatchEvent, Change, CommitOutcome, Conflict, FixEvent, FixOutcome, Inventory, JobOutcome, JobState, KnownFailure, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { FeedbackDialog } from './FeedbackDialog'
@@ -18,7 +18,7 @@ export interface UpdateTarget {
   changes: Change[]
 }
 
-type Stage = 'planning' | 'preview' | 'confirm' | 'running' | 'done' | 'commit'
+type Stage = 'planning' | 'preview' | 'confirm' | 'running' | 'done' | 'commit' | 'fix'
 
 /** How many tries Mehen makes at most, across every repository, while it works out what breaks. */
 const MAX_TRIES = 16
@@ -278,6 +278,14 @@ export function UpdateFlow({
   const [tried, setTried] = useState(targets)
   /** Packages held back after a failure, by job key (lowercased). */
   const [fallbacks, setFallbacks] = useState<Record<string, Fallback[]>>({})
+  /** The updates behind `fallbacks` that broke a check on their own, by job key, so a tool can be asked to fix them. */
+  const [brokeAlone, setBrokeAlone] = useState<Record<string, UpdateUnit[]>>({})
+  /** AI coding tools found on this computer. */
+  const [tools, setTools] = useState<AiTool[]>([])
+  /** The fix being run or last run, and what it has said so far. */
+  const [fixing, setFixing] = useState<{ key: string; unit: UpdateUnit; tool: AiTool; events: FixEvent[]; outcome: FixOutcome | null } | null>(null)
+  /** Units fixed this session, as `job key|unit key`. */
+  const [fixed, setFixed] = useState<Set<string>>(new Set())
   /** The updates that could be planned, which are the ones a run tries. */
   const [ready, setReady] = useState<UpdateTarget[]>([])
   /** The step to come back to when the plans are worked out again (pins changed on it). */
@@ -316,7 +324,37 @@ export function UpdateFlow({
 
   const jobs = useMemo(() => jobsOf(plans, nameOf), [plans, nameOf])
   const busy = stage === 'planning' || stage === 'running'
-  const close = () => !busy && onClose(refreshed)
+  const close = () => !busy && stage !== 'fix' && onClose(refreshed)
+
+  useEffect(() => {
+    api.aiTools().then(setTools, () => setTools([]))
+    const unlisten = api.onFixEvent((e) => setFixing((f) => (f && !f.outcome ? { ...f, events: [...f.events, e] } : f)))
+    return () => {
+      unlisten.then((fn) => fn())
+    }
+  }, [])
+
+  /** The tool to offer: Claude Code when both are ready. */
+  const tool = tools.find((t) => t.ready) ?? null
+
+  const startFix = async (key: string, unit: UpdateUnit, using: AiTool) => {
+    setFixing({ key, unit, tool: using, events: [], outcome: null })
+    setStage('fix')
+    const failure = (error: string): FixOutcome => ({ ok: false, rounds: 0, changed: [], summary: '', error, steps: [], rolledBack: false, committed: null, commitError: null, commitSkipped: null, pushed: false, pushError: null })
+    let outcome: FixOutcome
+    try {
+      const planned = await Promise.all(targetsOf([unit]).map(planTarget))
+      const errors = planned.flatMap((p) => p.errors)
+      const fixPlans = planned.flatMap((p) => (p.plan ? [{ ...p.plan, acceptedFailures: [] }] : []))
+      const result = errors.length || !fixPlans.length ? null : await api.fixUpdate(fixPlans, using.tool, { build, test }, commit, push)
+      outcome = result?.outcome ?? failure(errors.join('; ') || 'Nothing to change')
+      if (result?.inventory) setRefreshed(result.inventory)
+    } catch (e) {
+      outcome = failure(String(e))
+    }
+    setFixing((f) => (f ? { ...f, outcome } : f))
+    if (outcome.ok) setFixed((prev) => new Set([...prev, `${key}|${unit.key}`]))
+  }
 
   const cancel = (job: Job | null) => {
     const key = job ? job.key.toLowerCase() : '*'
@@ -330,6 +368,7 @@ export function UpdateFlow({
     setStopping(new Set())
     stopAsked.current = new Set()
     setFallbacks({})
+    setBrokeAlone({})
     setStage('running')
     setError(null)
     try {
@@ -355,6 +394,11 @@ export function UpdateFlow({
       const tally = new Map<string, Tally>()
       const tallyOf = (key: string) => tally.get(key) ?? (tally.set(key, { ok: [], plans: [], failed: null, notes: [] }), tally.get(key)!)
       const left: Record<string, Fallback[]> = {}
+      const alone: Record<string, UpdateUnit[]> = {}
+      // Per repository: failures its checks had before any update, accepted from then on.
+      const accepted = new Map<string, KnownFailure[]>()
+      const without = (units: UpdateUnit[], ids: Set<string>) =>
+        units.map((u) => ({ ...u, parts: u.parts.filter((p) => !ids.has(p.project.id.toLowerCase())) })).filter((u) => u.parts.length > 0)
       let inventory: Inventory | null = null
 
       for (let tries = 0; queue.size > 0 && tries < MAX_TRIES && !stopAsked.current.has('*'); tries++) {
@@ -371,7 +415,7 @@ export function UpdateFlow({
           const fine = planned.flatMap((p) => (p.target && p.plan ? [{ target: p.target, plan: p.plan }] : []))
           if (!fine.length) continue
           const dirty = dirtyBefore.get(key) ?? new Set()
-          round.push({ key, units: unitsOf(fine.map((f) => f.target)), plans: fine.map((f) => ({ ...f.plan, uncommitted: (f.plan.uncommitted ?? []).filter((x) => dirty.has(x)) })) })
+          round.push({ key, units: unitsOf(fine.map((f) => f.target)), plans: fine.map((f) => ({ ...f.plan, uncommitted: (f.plan.uncommitted ?? []).filter((x) => dirty.has(x)), acceptedFailures: accepted.get(key) ?? [] })) })
         }
         if (!round.length) break
         const result = await api.applyBatch(
@@ -394,6 +438,25 @@ export function UpdateFlow({
             continue
           }
           t.failed = { outcome: o, plans: tried.plans, targets: targetsOf(tried.units) }
+          // A check that fails the same way without the update: accept those
+          // failures and run again, so only new ones count against an update.
+          if (o.failedBefore === true && o.knownFailures?.length && !accepted.has(key) && o.rolledBack) {
+            accepted.set(key, o.knownFailures)
+            queue.set(key, [tried.units, ...(queue.get(key) ?? [])])
+            continue
+          }
+          // Projects that fail without the update and have nothing to accept
+          // are left as they are; the rest of the repository goes ahead.
+          const broken = new Set((o.brokenProjects ?? []).map((id) => id.toLowerCase()))
+          if (o.failedBefore === true && broken.size && o.rolledBack) {
+            const rest = [tried.units, ...(queue.get(key) ?? [])].map((units) => without(units, broken)).filter((units) => units.length > 0)
+            if (rest.length) {
+              const names = [...new Set(tried.units.flatMap((u) => u.parts).filter((p) => broken.has(p.project.id.toLowerCase())).map((p) => relativePath([p.project.repo ?? p.project.dir], p.project.manifest)))]
+              t.notes.push(`Left ${names.join(', ')} as ${names.length === 1 ? 'it was' : 'they were'}: ${o.steps.filter((s) => !s.ok).map((s) => `\`${s.label}\``).join(', ') || 'its check'} fails there even without the updates.`)
+              queue.set(key, rest)
+              continue
+            }
+          }
           // Stopped, missing a tool, already broken before the update, or its
           // files could not be put back: trying more parts would not help.
           if (o.cancelled || o.missingTool || o.failedBefore === true || !o.rolledBack) {
@@ -420,10 +483,12 @@ export function UpdateFlow({
             stages.unshift(...halves(tried.units))
           } else {
             left[key] = [...(left[key] ?? []), ...leftOut(tried.units[0])]
+            alone[key] = [...(alone[key] ?? []), tried.units[0]]
           }
           if (stages.length) queue.set(key, stages)
         }
         setFallbacks({ ...left })
+        setBrokeAlone({ ...alone })
       }
       for (const [key, stages] of queue) {
         const names = [...new Set(stages.flat().flatMap((u) => u.parts.map((p) => p.change.name)))]
@@ -529,6 +594,80 @@ export function UpdateFlow({
   )
 
   if (note) return <FeedbackDialog preset={note} onClose={() => setNote(null)} />
+
+  if (stage === 'fix' && fixing) {
+    const { unit, tool: using, events, outcome } = fixing
+    const names = [...new Set(unit.parts.map((p) => `${p.change.name} ${p.change.to}`))].join(', ')
+    const steps = new Map<string, string>()
+    for (const e of events) if (e.kind === 'step') steps.set(e.label, e.state)
+    const asking = events.filter((e) => e.kind === 'asking').at(-1)
+    const said = events.flatMap((e) => (e.kind === 'text' ? [e.text] : [])).join('')
+    const actions = events.filter((e) => e.kind === 'tool' || e.kind === 'denied')
+    return (
+      <Dialog
+        title={outcome ? (outcome.ok ? 'Fixed' : 'Not fixed') : `Fixing with ${using.name}`}
+        description={outcome ? (outcome.ok ? (outcome.rounds ? `${using.name} changed the code so ${names} works. Every check passed.` : `${names} works as it is now; nothing needed fixing.`) : 'Everything is back as it was before the fix started.') : `Updating ${names}, then ${using.name} changes this project's code until its checks pass. It can edit files here but cannot run commands; Mehen runs the checks.`}
+        icon={outcome ? outcome.ok ? <ShieldCheck size={22} /> : <AlertTriangle size={22} /> : <Sparkles size={22} />}
+        tone={outcome && !outcome.ok ? 'danger' : undefined}
+        size="wide"
+        busy={!outcome}
+        onClose={() => outcome && setStage('done')}
+        footer={
+          outcome ? (
+            <Button variant="primary" onClick={() => setStage('done')}>
+              Back to results
+            </Button>
+          ) : (
+            <Button onClick={() => void api.cancelFix()} title="Stop and put every file back">
+              <Ban size={15} />
+              Cancel
+            </Button>
+          )
+        }
+      >
+        <ul className="m-0 mb-3 grid list-none gap-1 p-0 text-[12.5px]">
+          {[...steps].map(([label, state]) => (
+            <li key={label} className="flex items-center gap-2">
+              {state === 'running' ? <Loader2 size={14} className="animate-spin text-state" /> : state === 'ok' ? <Check size={14} className="text-ok" /> : <X size={14} className="text-risk-security" />}
+              <code className="font-mono text-[12px]">{label}</code>
+            </li>
+          ))}
+          {asking && asking.kind === 'asking' && (
+            <li className="flex items-center gap-2">
+              <Sparkles size={14} className="text-state" />
+              Asked {using.name}{asking.of > 1 ? ` (try ${asking.round} of ${asking.of})` : ''}
+            </li>
+          )}
+        </ul>
+        {(said || actions.length > 0) && (
+          <div className="mb-3 max-h-72 overflow-auto rounded-[3px] border border-line bg-sunken px-3 py-2.5 text-[12.5px] leading-relaxed">
+            {said && <p className="m-0 whitespace-pre-wrap">{said}</p>}
+            {actions.map((a, i) => (
+              <p key={i} className={cx('m-0 mt-1 font-mono text-[12px]', a.kind === 'denied' ? 'text-risk-review' : 'text-muted')}>
+                {a.kind === 'tool' ? `${a.title} · ${a.status}` : a.kind === 'denied' ? `Not allowed: ${a.title} (${a.reason})` : ''}
+              </p>
+            ))}
+          </div>
+        )}
+        {outcome && (
+          <div className="grid gap-1.5 text-[12.5px]">
+            {outcome.ok && outcome.changed.length > 0 && (
+              <p className="m-0">
+                Changed: <span className="font-mono text-[12px]">{outcome.changed.join(', ')}</span>
+              </p>
+            )}
+            {outcome.ok && outcome.summary && <p className="m-0 text-muted">{outcome.summary}</p>}
+            {outcome.committed && <p className="m-0 text-muted">Committed {outcome.committed}{outcome.pushed ? ' and pushed' : ''}.</p>}
+            {(outcome.commitSkipped || outcome.commitError || outcome.pushError) && <p className="m-0 text-risk-review">Not {outcome.commitSkipped || outcome.commitError ? 'committed' : 'pushed'}: {outcome.commitSkipped ?? outcome.commitError ?? outcome.pushError}</p>}
+            {!outcome.ok && <p className="m-0 text-risk-security">{outcome.error}</p>}
+            {!outcome.ok && outcome.steps.some((s) => !s.ok) && (
+              <pre className="mt-1 max-h-60 overflow-auto rounded-[3px] bg-sunken px-2.5 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap">{outcome.steps.filter((s) => !s.ok).map((s) => s.output).join('\n\n')}</pre>
+            )}
+          </div>
+        )}
+      </Dialog>
+    )
+  }
 
   if (stage === 'planning') {
     return (
@@ -864,7 +1003,9 @@ export function UpdateFlow({
   const pushedOf = (j: Job) => !!(outcomeOf(j)?.pushed || commitOf(j)?.pushed)
   const allPushed = anyCommitted && committedJobs.every(pushedOf)
   const somePushed = committedJobs.some(pushedOf)
-  const heldBack = Object.values(fallbacks).flat().filter((f) => !f.to).length
+  /** A left-out package a tool has since fixed, so it went in after all. */
+  const isFixed = (key: string, name: string) => !!brokeAlone[key]?.some((u) => fixed.has(`${key}|${u.key}`) && u.parts.some((p) => p.change.name === name))
+  const heldBack = Object.entries(fallbacks).flatMap(([key, list]) => list.filter((f) => !f.to && !isFixed(key, f.name))).length
   return (
     <Dialog
       title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : stopped.length && !passed.length ? 'Update cancelled' : 'Update finished'}
@@ -968,13 +1109,33 @@ export function UpdateFlow({
                 <ul className="m-0 mb-0.5 grid list-none gap-1.5 p-0">
                   {held.map((f) => {
                     const done = kept.has(`${job.key.toLowerCase()}|${f.keep.name}`)
+                    const mended = isFixed(job.key.toLowerCase(), f.name)
                     return (
                       <li key={f.name} className="flex items-center gap-2 text-[12.5px]">
                         <RotateCcw size={14} className="shrink-0 text-risk-review" />
                         <span className="min-w-0 flex-1">
-                          {f.with ? `${f.name} ${f.tried} only goes with the new ${f.with}` : `${f.name} ${f.tried} broke it`}, so Mehen {f.to ? `used ${f.to} instead` : `left it on ${f.stays}`}.
+                          {mended
+                            ? `${f.name} ${f.tried} broke it at first; the code was fixed and it went in.`
+                            : `${f.with ? `${f.name} ${f.tried} only goes with the new ${f.with}` : `${f.name} ${f.tried} broke it`}, so Mehen ${f.to ? `used ${f.to} instead` : `left it on ${f.stays}`}.`}
                         </span>
-                        {done ? (
+                        {(() => {
+                          const unit = !f.to && !f.with ? brokeAlone[job.key.toLowerCase()]?.find((u) => u.parts.some((p) => p.change.name === f.name)) : undefined
+                          if (!unit || !ran.checks) return null
+                          if (fixed.has(`${job.key.toLowerCase()}|${unit.key}`))
+                            return (
+                              <span className="inline-flex items-center gap-1 text-[12px] whitespace-nowrap text-ok">
+                                <Check size={13} />
+                                Fixed
+                              </span>
+                            )
+                          return tool ? (
+                            <Button onClick={() => void startFix(job.key.toLowerCase(), unit, tool)} title={`Update ${f.name} to ${f.tried} and have ${tool.name} change this project's code until its checks pass. If they never do, everything is put back.`}>
+                              <Sparkles size={14} />
+                              Fix with {tool.name}
+                            </Button>
+                          ) : null
+                        })()}
+                        {mended ? null : done ? (
                           <span className="inline-flex items-center gap-1 text-[12px] whitespace-nowrap text-state">
                             <Pin size={13} />
                             Kept on {f.keep.line}.x

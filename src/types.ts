@@ -229,6 +229,8 @@ export interface UpdatePlan {
   branch: string | null
   /** Packages whose entry was an exact pin before this update. */
   pinned?: string[]
+  /** Failures a check already had before any update; while it fails with only these, it counts as passing. */
+  acceptedFailures?: KnownFailure[]
 }
 
 export interface StepResult {
@@ -251,6 +253,53 @@ export interface BatchEvent {
   label: string | null
   /** The tool the step uses: npm, cargo, dotnet... */
   lane: string | null
+}
+
+/** An AI coding tool Mehen can hand a broken build to, as found on this computer. */
+export type AiToolId = 'claude' | 'codex'
+
+export interface AiTool {
+  tool: AiToolId
+  /** "Claude Code", "Codex". */
+  name: string
+  version: string | null
+  ready: boolean
+  /** Why it cannot be used yet: not installed, too old, not answering. */
+  problem: string | null
+  installUrl: string
+}
+
+/** What happens while a tool fixes an update, as it happens. */
+export type FixEvent =
+  | { kind: 'step'; label: string; state: 'running' | 'ok' | 'failed' }
+  | { kind: 'asking'; round: number; of: number }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; title: string; status: string }
+  | { kind: 'denied'; title: string; reason: string }
+
+export interface FixOutcome {
+  ok: boolean
+  /** Times the tool was asked; 0 when the update needed no fix. */
+  rounds: number
+  /** Files outside the update's own that changed, relative to the repository. */
+  changed: string[]
+  /** What the tool said it did. */
+  summary: string
+  error: string | null
+  steps: StepResult[]
+  rolledBack: boolean
+  committed: string | null
+  commitError: string | null
+  commitSkipped: string | null
+  pushed: boolean
+  pushError: string | null
+}
+
+/** What a check reported when it failed the same way without the update. */
+export interface KnownFailure {
+  step: string
+  label: string
+  failures: string[]
 }
 
 export interface JobOutcome {
@@ -278,6 +327,10 @@ export interface JobOutcome {
   notes?: string[]
   /** After a failure, whether what failed also fails without the update (the project was already broken). */
   failedBefore?: boolean | null
+  /** Checks that failed with no failures the update added; rerun with these accepted, the update goes through. */
+  knownFailures?: KnownFailure[]
+  /** Projects whose own step fails without the update, with nothing to accept. */
+  brokenProjects?: string[]
   /** The tool a step needed that is not installed: npm, dotnet... */
   missingTool?: string | null
 }

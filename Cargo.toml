@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mehen-core", "src-tauri"]
+members = ["crates/agent-cli", "crates/mehen-core", "src-tauri"]
 resolver = "2"
 
 # Dev builds keep our own code quick to rebuild but optimize dependencies
