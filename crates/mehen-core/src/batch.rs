@@ -4,7 +4,7 @@
 //! turns (two `npm install`s at once tread on each other), and a global limit
 //! keeps the machine usable.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,7 +16,8 @@ use tokio::sync::{Mutex, MutexGuard, Semaphore, SemaphorePermit};
 use crate::cancel::{Cancel, Cancels};
 use crate::diagnose::{self, Conflict};
 use crate::model::Ecosystem;
-use crate::update::{self, PlannedChange, Step, StepKind, StepResult, UpdatePlan};
+use crate::failures;
+use crate::update::{self, KnownFailure, PlannedChange, Step, StepKind, StepResult, UpdatePlan};
 
 /// How many steps may run at once when the user leaves it on automatic:
 /// a quarter of the CPU threads, between 1 and 4.
@@ -107,6 +108,9 @@ pub struct JobOutcome {
     pub failed_before: Option<bool>,
     /// The tool a step needed that is not installed (`npm`, `dotnet`, ...).
     pub missing_tool: Option<String>,
+    /// Checks that failed with no failures the update added: run again with
+    /// these as `accepted_failures`, the update goes through.
+    pub known_failures: Vec<KnownFailure>,
 }
 
 /// One repository's share of the batch.
@@ -161,7 +165,18 @@ impl Job {
             .into_iter()
             .flat_map(|e| {
                 let changes: Vec<(&str, &PlannedChange)> = self.plans.iter().filter(|p| p.ecosystem == e).flat_map(|p| p.changes.iter().map(move |c| (p.project_id.as_str(), c))).collect();
-                diagnose::suspects(output, e, &changes)
+                let found = diagnose::suspects(output, e, &changes);
+                if !found.is_empty() {
+                    return found;
+                }
+                // Nothing in the output names a package: see what the failing files import.
+                let mut dirs: Vec<PathBuf> = vec![PathBuf::from(&step.cwd)];
+                dirs.extend(self.plans.iter().filter_map(|p| Path::new(&p.project_id).parent().map(Path::to_path_buf)));
+                dirs.dedup();
+                let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+                let mut seen = HashSet::new();
+                let unique: Vec<&PlannedChange> = changes.iter().map(|(_, c)| *c).filter(|c| seen.insert(c.name.clone())).collect();
+                diagnose::imported_by_errors(output, &dirs, e, &unique)
             })
             .collect()
     }
@@ -366,6 +381,7 @@ where
         notes: Vec::new(),
         failed_before: None,
         missing_tool: None,
+        known_failures: Vec::new(),
     };
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
@@ -426,6 +442,8 @@ where
     // to see whether they failed before the update too.
     let mut installed: Vec<Step> = Vec::new();
     let mut failed: Vec<Step> = Vec::new();
+    // What each failed check reported, to compare with a run without the update.
+    let mut reported: HashMap<String, BTreeSet<String>> = HashMap::new();
     for step in steps {
         let lane = lane(&step);
         let Some(turn) = take_turn(job, &lane, &cancel, lanes, limit, on_event).await else {
@@ -447,6 +465,17 @@ where
                 discard(moved);
             } else {
                 put_back(moved);
+            }
+        }
+        if !ok && step.kind.is_check() && !cancel.is_cancelled() {
+            let now = failures::signatures(&output);
+            let key = update::step_key(&step);
+            let accepted: BTreeSet<&str> = job.plans.iter().flat_map(|p| &p.accepted_failures).filter(|k| k.step == key).flat_map(|k| k.failures.iter().map(String::as_str)).collect();
+            if !now.is_empty() && now.iter().all(|f| accepted.contains(f.as_str())) {
+                ok = true;
+                outcome.notes.push(format!("`{}` still fails only where it failed before these updates ({}).", step.label, failures::list(&now)));
+            } else {
+                reported.insert(key, now);
             }
         }
         let mut found = Vec::new();
@@ -488,14 +517,14 @@ where
             roll_back(&mut outcome, format!("`{}` failed", step.label));
             // Hand back this tool and slot: putting things back needs them.
             drop(turn);
-            settle(job, &installed, &failed, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
+            settle(job, &installed, &failed, &reported, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
             return outcome;
         }
     }
     if !failed_checks.is_empty() {
         let list = failed_checks.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ");
         roll_back(&mut outcome, format!("{list} failed"));
-        settle(job, &installed, &failed, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
+        settle(job, &installed, &failed, &reported, &mut outcome, &cancel, lanes, limit, run_step, on_event).await;
         return outcome;
     }
 
@@ -567,6 +596,7 @@ async fn settle<R, F, E>(
     job: &Job,
     installed: &[Step],
     failed: &[Step],
+    reported: &HashMap<String, BTreeSet<String>>,
     outcome: &mut JobOutcome,
     cancel: &Cancel,
     lanes: &HashMap<String, Mutex<()>>,
@@ -607,13 +637,23 @@ async fn settle<R, F, E>(
             break;
         };
         on_event(job.event(JobState::Running, Some(format!("Trying without the updates: {}", step.label)), Some(lane)));
-        let (ok, _) = run_step(step.clone(), cancel.clone()).await;
+        let (ok, before) = run_step(step.clone(), cancel.clone()).await;
         if cancel.is_cancelled() {
             break;
         }
-        outcome.failed_before = Some(outcome.failed_before.unwrap_or(false) || !ok);
+        // Both runs failed: what the update added is what the second lacks.
+        let key = update::step_key(step);
+        let (before, after) = (failures::signatures(&before), reported.get(&key).cloned().unwrap_or_default());
+        let added: BTreeSet<String> = after.difference(&before).cloned().collect();
+        let comparable = !ok && step.kind.is_check() && !before.is_empty() && !after.is_empty();
+        outcome.failed_before = Some(outcome.failed_before.unwrap_or(false) || (!ok && !(comparable && !added.is_empty())));
         outcome.notes.push(if ok {
             format!("`{}` works without these updates, so one of them broke it.", step.label)
+        } else if comparable && added.is_empty() {
+            outcome.known_failures.push(KnownFailure { step: key, label: step.label.clone(), failures: before.iter().cloned().collect() });
+            format!("`{}` fails without these updates too ({}). The updates added no new failures.", step.label, failures::list(&before))
+        } else if comparable {
+            format!("`{}` already failed before these updates, and they add new failures: {}.", step.label, failures::list(&added))
         } else {
             format!("`{}` fails without these updates too, so the problem was already in the project.", step.label)
         });
@@ -659,6 +699,7 @@ mod tests {
             branch: None,
             clean_retry: Vec::new(),
             pinned: Vec::new(),
+            accepted_failures: Vec::new(),
         }
     }
 
@@ -906,6 +947,47 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(outcome.conflicts.len(), 1);
         assert_eq!(outcome.conflicts[0].keep.as_ref().map(|k| (k.name.as_str(), k.line.as_str())), Some(("typescript", "6")));
         assert_eq!(events.borrow().last().map(|e| e.state), Some(JobState::RolledBack), "the job ends rolled back");
+    }
+
+    #[tokio::test]
+    async fn a_test_that_already_failed_is_accepted_once_known() {
+        let dir = temp("known-failure");
+        let manifest = dir.join("package.json");
+        let p = plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir), step("npm", StepKind::Test, &dir)]);
+        // One test fails whatever is installed; the update adds nothing.
+        let fake = |s: Step, _: Cancel| {
+            let result = if s.kind == StepKind::Install { (true, String::new()) } else { (false, "✔ parses (1ms)\n✖ finds the bundled CLI (1.2ms)\nℹ fail 1".to_string()) };
+            async move { result }
+        };
+        let opts = BatchOptions { build: false, test: true, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
+        let first = run(vec![p.clone()], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
+        assert!(!first.ok && first.rolled_back);
+        assert_eq!(first.failed_before, Some(true));
+        assert_eq!(first.known_failures.len(), 1);
+        assert_eq!(first.known_failures[0].failures, ["test: finds the bundled CLI"]);
+        assert!(first.notes.iter().any(|n| n.contains("added no new failures")), "{:?}", first.notes);
+
+        let again = UpdatePlan { accepted_failures: first.known_failures.clone(), ..p.clone() };
+        let second = run(vec![again.clone()], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
+        assert!(second.ok, "{:?}", second.error);
+        assert_eq!(std::fs::read_to_string(&manifest).unwrap(), "after", "the update stays");
+        assert!(second.notes.iter().any(|n| n.contains("only where it failed before")), "{:?}", second.notes);
+
+        // A new failing test on top of the known one is the update's doing.
+        std::fs::write(&manifest, "before").unwrap();
+        let worse = |s: Step, _: Cancel| {
+            let on_disk = std::fs::read_to_string(&manifest).unwrap();
+            let result = match (s.kind, on_disk.as_str()) {
+                (StepKind::Install, _) => (true, String::new()),
+                (_, "after") => (false, "✖ finds the bundled CLI (1ms)\n✖ serves ranges (2ms)".to_string()),
+                _ => (false, "✖ finds the bundled CLI (1ms)".to_string()),
+            };
+            async move { result }
+        };
+        let third = run(vec![again], opts, &Cancels::default(), worse, |_| {}).await.remove(0);
+        assert!(!third.ok);
+        assert_eq!(third.failed_before, Some(false), "the update broke something new");
+        assert!(third.notes.iter().any(|n| n.contains("add new failures: serves ranges")), "{:?}", third.notes);
     }
 
     #[tokio::test]

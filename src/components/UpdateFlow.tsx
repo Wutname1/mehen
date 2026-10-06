@@ -90,6 +90,33 @@ function installLink(tool: string): { name: string; url: string } {
 }
 
 const jobKey = (p: UpdatePlan) => p.repo ?? p.projectId.replace(/[\\/][^\\/]*$/, '')
+/** The same key for a project before it has a plan, so a repository is always one job. */
+const projectKey = (p: Project) => (p.repo ?? p.id.replace(/[\\/][^\\/]*$/, '')).toLowerCase()
+
+/**
+ * Plans a project's update. When that fails, each change is tried alone and
+ * the ones that cannot be planned are dropped, so one entry Mehen cannot
+ * rewrite does not hold back the rest of the project's updates.
+ */
+async function planTarget(t: UpdateTarget): Promise<{ target: UpdateTarget | null; plan: UpdatePlan | null; errors: string[] }> {
+  const usable = (plan: UpdatePlan) => plan.edits.length > 0 || plan.steps.length > 0
+  try {
+    const plan = await api.planUpdate(t.project.id, t.changes)
+    return usable(plan) ? { target: t, plan, errors: [] } : { target: null, plan: null, errors: ['Nothing to change'] }
+  } catch (e) {
+    if (t.changes.length < 2) return { target: null, plan: null, errors: [String(e)] }
+  }
+  const alone = await Promise.all(t.changes.map((c) => api.planUpdate(t.project.id, [c]).then(() => null, (e) => String(e))))
+  const errors = alone.filter((e): e is string => !!e)
+  const changes = t.changes.filter((_, i) => !alone[i])
+  if (!changes.length) return { target: null, plan: null, errors }
+  try {
+    const plan = await api.planUpdate(t.project.id, changes)
+    return { target: { ...t, changes }, plan, errors }
+  } catch (e) {
+    return { target: null, plan: null, errors: [...errors, String(e)] }
+  }
+}
 
 function jobsOf(plans: UpdatePlan[], nameOf: (key: string) => string): Job[] {
   const map = new Map<string, Job>()
@@ -251,22 +278,19 @@ export function UpdateFlow({
   const [tried, setTried] = useState(targets)
   /** Packages held back after a failure, by job key (lowercased). */
   const [fallbacks, setFallbacks] = useState<Record<string, Fallback[]>>({})
+  /** The updates that could be planned, which are the ones a run tries. */
+  const [ready, setReady] = useState<UpdateTarget[]>([])
   /** The step to come back to when the plans are worked out again (pins changed on it). */
   const resume = useRef<Stage | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    Promise.all(
-      applyPins(current, pinMode).map((t) =>
-        api.planUpdate(t.project.id, t.changes).then(
-          (plan) => (plan.edits.length || plan.steps.length ? { plan } : { error: 'Nothing to change', project: t.project }),
-          (e) => ({ error: String(e), project: t.project }),
-        ),
-      ),
-    ).then((results) => {
+    const targets = applyPins(current, pinMode)
+    Promise.all(targets.map(planTarget)).then((results) => {
       if (cancelled) return
-      setPlans(results.flatMap((r) => ('plan' in r && r.plan ? [r.plan] : [])))
-      setFailed(results.flatMap((r) => ('error' in r && r.error ? [{ project: r.project, error: r.error }] : [])))
+      setPlans(results.flatMap((r) => (r.plan ? [r.plan] : [])))
+      setReady(results.flatMap((r) => (r.target ? [r.target] : [])))
+      setFailed(results.flatMap((r, i) => r.errors.map((error) => ({ project: targets[i].project, error }))))
       setTried(current)
       setFallbacks({})
       setStage(resume.current ?? start)
@@ -309,9 +333,10 @@ export function UpdateFlow({
     setStage('running')
     setError(null)
     try {
+      const projects = new Map(ready.map((t) => [t.project.id.toLowerCase(), t.project]))
       const keyOf = (projectId: string) => {
-        const plan = plans.find((p) => p.projectId.toLowerCase() === projectId.toLowerCase())
-        return (plan ? jobKey(plan) : projectId).toLowerCase()
+        const project = projects.get(projectId.toLowerCase())
+        return project ? projectKey(project) : projectId.toLowerCase()
       }
       // Files someone else had already changed. After a part goes in uncommitted,
       // its own edits show as changed too, and must not block the next part's commit.
@@ -321,7 +346,7 @@ export function UpdateFlow({
       // run, breaking moves go one at a time after the rest; a part that fails
       // without saying why is split in half until the update that breaks is found.
       const byJob = new Map<string, UpdateTarget[]>()
-      for (const t of applyPins(current, pinMode)) byJob.set(keyOf(t.project.id), [...(byJob.get(keyOf(t.project.id)) ?? []), t])
+      for (const t of ready) byJob.set(keyOf(t.project.id), [...(byJob.get(keyOf(t.project.id)) ?? []), t])
       const queue = new Map<string, UpdateUnit[][]>()
       for (const [key, targets] of byJob) {
         const units = unitsOf(targets)
@@ -341,14 +366,12 @@ export function UpdateFlow({
             queue.delete(key)
             continue
           }
-          const planned = await Promise.all(targetsOf(units).map((t) => api.planUpdate(t.project.id, t.changes).then((p) => p, (e) => `${t.project.name}: ${e}`)))
-          const unplanned = planned.filter((p): p is string => typeof p === 'string')
-          if (unplanned.length) {
-            tallyOf(key).notes.push(...unplanned.map((e) => `Not tried: ${e}`))
-            continue
-          }
+          const planned = await Promise.all(targetsOf(units).map(planTarget))
+          tallyOf(key).notes.push(...planned.flatMap((p) => p.errors.map((e) => `Not tried: ${e}`)))
+          const fine = planned.flatMap((p) => (p.target && p.plan ? [{ target: p.target, plan: p.plan }] : []))
+          if (!fine.length) continue
           const dirty = dirtyBefore.get(key) ?? new Set()
-          round.push({ key, units, plans: (planned as UpdatePlan[]).map((p) => ({ ...p, uncommitted: (p.uncommitted ?? []).filter((f) => dirty.has(f)) })) })
+          round.push({ key, units: unitsOf(fine.map((f) => f.target)), plans: fine.map((f) => ({ ...f.plan, uncommitted: (f.plan.uncommitted ?? []).filter((x) => dirty.has(x)) })) })
         }
         if (!round.length) break
         const result = await api.applyBatch(
@@ -385,9 +408,14 @@ export function UpdateFlow({
           const culprits = o.conflicts.filter((x) => x.blocking && x.keep).map((x) => x.keep!)
           const next = culprits.length ? withoutCulprits(targetsOf(tried.units), culprits) : null
           const stages = queue.get(key) ?? []
+          // The failure names packages that stay on their line (a file that no
+          // longer builds imports them): the rest go first, then each named one alone.
+          const named = tried.units.filter((u) => u.parts.some((p) => culprits.some((k) => k.name.toLowerCase() === p.change.name.toLowerCase())))
           if (next) {
             left[key] = [...(left[key] ?? []), ...next.fallbacks]
             stages.unshift(unitsOf(next.targets))
+          } else if (named.length && named.length < tried.units.length) {
+            stages.unshift(tried.units.filter((u) => !named.includes(u)), ...named.map((u) => [u]))
           } else if (tried.units.length > 1) {
             stages.unshift(...halves(tried.units))
           } else {

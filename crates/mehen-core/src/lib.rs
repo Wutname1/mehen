@@ -8,6 +8,7 @@ pub mod check;
 pub mod compat;
 pub mod dart;
 pub mod diagnose;
+pub mod failures;
 pub mod icons;
 pub mod golang;
 pub mod ignore;

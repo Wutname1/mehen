@@ -83,6 +83,23 @@ pub struct Step {
     pub cwd: String,
 }
 
+/// What a check reported when it failed the same way without the update:
+/// the project's own failures, which do not count against an update.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownFailure {
+    /// The check, as [`step_key`] names it.
+    pub step: String,
+    pub label: String,
+    /// As [`crate::failures::signatures`] words them.
+    pub failures: Vec<String>,
+}
+
+/// One name for a step however many plans share it.
+pub fn step_key(step: &Step) -> String {
+    format!("{}|{}|{}", step.program, step.args.join(" "), step.cwd).to_lowercase()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePlan {
@@ -116,6 +133,10 @@ pub struct UpdatePlan {
     /// Packages whose entry was an exact pin before this update.
     #[serde(default)]
     pub pinned: Vec<String>,
+    /// Failures a check already had before any update; while it fails with
+    /// only these, it counts as passing.
+    #[serde(default)]
+    pub accepted_failures: Vec<KnownFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +199,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         branch: None,
         clean_retry: Vec::new(),
         pinned: Vec::new(),
+        accepted_failures: Vec::new(),
     };
     // One edit covers every entry with the same name and spelling (e.g. the
     // package listed in both dependencies and devDependencies).
@@ -365,7 +387,12 @@ fn held_in_group(dep: &Dependency, to: &str) -> bool {
 }
 
 /// Keeps the operator and prefix the author used: `^18.2.0` -> `^19.1.0`.
+/// A tag like `latest` or `*` follows whatever is published, so the lockfile
+/// alone decides what is installed; it becomes `^19.1.0`, which says so.
 fn keep_prefix(old: &str, to: &str) -> Option<String> {
+    if matches!(old.trim(), "latest" | "*" | "x" | "") {
+        return Some(format!("^{to}"));
+    }
     if old.contains(' ') || old.contains("||") || from_spec(old).is_none() {
         return None;
     }
@@ -1288,6 +1315,15 @@ mod tests {
         assert!(plan.edits[0].after.contains("\"typescript\": \"~6.0.3\""), "npm must not take a newer 6.x: {}", plan.edits[0].after);
         assert!(plan.edits[0].after.contains("\"@angular/compiler-cli\": \"~22.2.0\""));
         assert_eq!(plan.clean_retry.len(), 2, "a group move may need a clean install");
+    }
+
+    #[test]
+    fn npm_writes_a_range_for_a_floating_tag() {
+        let dir = temp("npm-latest");
+        std::fs::write(dir.join("package.json"), "{\n  \"devDependencies\": {\n    \"@vitejs/plugin-react\": \"latest\"\n  }\n}\n").unwrap();
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("@vitejs/plugin-react", Ecosystem::Npm, "latest", "6.1.1")]);
+        let plan = plan(&p, &[Change { from: None, name: "@vitejs/plugin-react".into(), to: "6.1.2".into(), loosen: false }], |_| None).unwrap();
+        assert!(plan.edits[0].after.contains("\"@vitejs/plugin-react\": \"^6.1.2\""), "{}", plan.edits[0].after);
     }
 
     #[test]

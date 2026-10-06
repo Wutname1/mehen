@@ -175,6 +175,87 @@ pub fn suspects(output: &str, ecosystem: Ecosystem, changes: &[(&str, &PlannedCh
     conflicts
 }
 
+/// Files a compiler error points at, as written in the output: tsc's
+/// `src/a.ts(51,5): error TS2353`, the `file:line:col - error` form, and
+/// rustc's `--> src\lib.rs:1338:28`.
+fn error_files(output: &str) -> Vec<String> {
+    static TSC: LazyLock<Regex> = LazyLock::new(|| rx(r"(?m)^\s*([^\s(:][^\s(]*?\.[cm]?[jt]sx?)\(\d+,\d+\): error TS\d+"));
+    static TSC_PRETTY: LazyLock<Regex> = LazyLock::new(|| rx(r"(?m)^\s*([^\s:][^\s:]*?\.[cm]?[jt]sx?):\d+:\d+ - error TS\d+"));
+    static RUSTC: LazyLock<Regex> = LazyLock::new(|| rx(r"(?m)^\s*--> ([^\s:]+\.rs):\d+:\d+"));
+    let mut files: Vec<String> = Vec::new();
+    for re in [&*TSC, &*TSC_PRETTY, &*RUSTC] {
+        for c in re.captures_iter(output) {
+            let f = c[1].to_string();
+            // Errors inside a dependency's own sources name the dependency, not the project's use of it.
+            if !f.contains("node_modules") && !f.contains(".cargo") && !files.contains(&f) {
+                files.push(f);
+            }
+        }
+    }
+    files
+}
+
+/// Packages a source file uses: `import ... from 'x'`, `require('x')`,
+/// `import('x')` for JavaScript, and `use x::`, `x::path` or
+/// `extern crate x` for Rust (crate names as code spells them, `_` for `-`).
+fn imports(path: &std::path::Path, text: &str) -> Vec<String> {
+    static JS: LazyLock<Regex> = LazyLock::new(|| rx(r#"(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"./][^'"]*)['"]"#));
+    static RUST: LazyLock<Regex> = LazyLock::new(|| rx(r"\b(?:extern crate\s+)?([a-z_][a-z0-9_]*)::"));
+    let rust = path.extension().is_some_and(|e| e == "rs");
+    let mut out: Vec<String> = Vec::new();
+    if rust {
+        static EXTERN: LazyLock<Regex> = LazyLock::new(|| rx(r"\bextern crate\s+([a-z_][a-z0-9_]*)"));
+        for c in RUST.captures_iter(text).chain(EXTERN.captures_iter(text)) {
+            out.push(c[1].to_string());
+        }
+    } else {
+        for c in JS.captures_iter(text) {
+            let spec = &c[1];
+            // `@scope/name/sub` -> `@scope/name`, `name/sub` -> `name`.
+            let keep = if spec.starts_with('@') { 2 } else { 1 };
+            out.push(spec.split('/').take(keep).collect::<Vec<_>>().join("/"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Updated packages that the files a compiler error points at use, when
+/// the output names no package itself: `src/lib/sentry.ts` failing to
+/// type-check after `@sentry/react` moved, which it imports. `dirs` are
+/// the folders paths in the output may be relative to. Empty when none or
+/// every updated package is used there, which would say nothing.
+pub fn imported_by_errors(output: &str, dirs: &[&std::path::Path], ecosystem: Ecosystem, changes: &[&PlannedChange]) -> Vec<Conflict> {
+    if !matches!(ecosystem, Ecosystem::Npm | Ecosystem::Cargo) || changes.len() < 2 {
+        return Vec::new();
+    }
+    let code_name = |name: &str| if ecosystem == Ecosystem::Cargo { name.replace('-', "_") } else { name.to_string() };
+    let mut used: Vec<(&PlannedChange, String)> = Vec::new();
+    for file in error_files(output) {
+        let Some((path, text)) = dirs.iter().map(|d| d.join(&file)).find_map(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t))) else { continue };
+        let found = imports(&path, &text);
+        for c in changes {
+            if found.iter().any(|i| *i == code_name(&c.name)) && !used.iter().any(|(u, _)| u.name == c.name) {
+                used.push((c, file.clone()));
+            }
+        }
+    }
+    if used.is_empty() || used.len() == changes.len() {
+        return Vec::new();
+    }
+    used.into_iter()
+        .map(|(c, file)| {
+            let from = if c.from.is_empty() { c.written_before.clone() } else { c.from.clone() };
+            Conflict {
+                summary: format!("{file} fails to build and uses {}, which this update moved to {}", c.name, c.to),
+                keep: release_line(&from).map(|line| Keep { ecosystem, name: c.name.clone(), line, from, to: c.to.clone() }),
+                blocking: true,
+            }
+        })
+        .collect()
+}
+
 fn rx(pattern: &str) -> Regex {
     Regex::new(pattern).expect("diagnose patterns are valid")
 }
@@ -409,6 +490,27 @@ npm ERR! Conflicting peer dependency: @typescript-eslint/parser@7.18.0"#;
         let c = diagnose(output, false, Ecosystem::Cargo, &[change("windows-sys", "0.52.0", "0.59.0")]);
         assert_eq!(c[0].summary, "No version of windows-sys fits both this project and mio 1.0.2");
         assert_eq!(c[0].keep.as_ref().unwrap().line, "0.52");
+    }
+
+    #[test]
+    fn a_compiler_error_points_at_the_package_its_file_imports() {
+        let dir = std::env::temp_dir().join("mehen-diagnose-imports");
+        std::fs::create_dir_all(dir.join("src/lib")).unwrap();
+        std::fs::write(dir.join("src/lib/sentry.ts"), "import * as Sentry from '@sentry/react'\nimport { x } from './y'\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "use std::borrow::Cow;\nuse tray_icon::Icon;\nfn f() { serde_json::to_string(&1); }\n").unwrap();
+        let ts = "> tsc -b && vite build\n\nsrc/lib/sentry.ts(51,5): error TS2353: Object literal may only specify known properties, and 'sendDefaultPii' does not exist in type 'BrowserOptions'.";
+        let (sentry, vite, lucide) = (change("@sentry/react", "10.75.2", "11.4.0"), change("vite", "8.2.2", "8.3.2"), change("lucide-react", "1.47.0", "1.52.0"));
+        let c = imported_by_errors(ts, &[dir.as_path()], Ecosystem::Npm, &[&vite, &sentry, &lucide]);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].keep.as_ref().unwrap().name, "@sentry/react");
+        assert_eq!(c[0].summary, "src/lib/sentry.ts fails to build and uses @sentry/react, which this update moved to 11.4.0");
+
+        let rs = "error[E0308]: mismatched types\n    --> src\\lib.rs:1338:28\n     |\n1338 |  bytes: enabled_bytes,";
+        let (tray, tokio) = (change("tray-icon", "0.21.0", "0.22.0"), change("tokio", "1.53.1", "1.53.2"));
+        let c = imported_by_errors(rs, &[dir.as_path()], Ecosystem::Cargo, &[&tokio, &tray]);
+        assert_eq!(c.iter().map(|x| x.keep.as_ref().unwrap().name.as_str()).collect::<Vec<_>>(), ["tray-icon"]);
+        assert!(imported_by_errors(ts, &[dir.as_path()], Ecosystem::Npm, &[&sentry]).is_empty(), "one package alone needs no pointing at");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

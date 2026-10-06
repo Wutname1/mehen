@@ -480,6 +480,9 @@ const mock = (() => {
       const inv = await load()
       const project = inv?.projects.find((p) => p.id === projectId)
       if (!project) throw new Error('Project not found')
+      // One entry the planner cannot rewrite, so planning around it can be tried here.
+      const stuck = changes.find((c) => c.name === 'hls.js')
+      if (stuck) throw new Error(`${stuck.name}: cannot rewrite the range \`${stuck.from}\` automatically`)
       const pinnedDep = (c: Change) => project.dependencies.some((d) => d.name === c.name && d.requested === c.from && d.pinned)
       const planned = changes.map((c) => ({ name: c.name, from: c.from, to: c.to, writtenBefore: c.from, writtenAfter: pinnedDep(c) ? (c.loosen ? `^${c.to}` : c.to) : c.to }))
       const diff = [`--- ${project.manifest}`, `+++ ${project.manifest}`, '@@ -1,3 +1,3 @@', ...planned.flatMap((c) => [`-  "${c.name}": "${c.writtenBefore}",`, `+  "${c.name}": "${c.writtenAfter}",`])].join('\n')
