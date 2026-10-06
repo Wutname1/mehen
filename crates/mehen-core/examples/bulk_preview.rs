@@ -18,7 +18,7 @@ async fn main() {
             .dependencies
             .iter()
             .filter(|d| &d.name == name && matches!(d.status, Status::Major | Status::Minor | Status::Patch))
-            .map(|d| Change { name: d.name.clone(), from: Some(d.requested.clone()), to: to.clone() })
+            .map(|d| Change { name: d.name.clone(), from: Some(d.requested.clone()), to: to.clone(), loosen: false })
             .collect();
         if changes.is_empty() {
             continue;

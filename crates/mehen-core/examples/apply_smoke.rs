@@ -33,7 +33,7 @@ async fn main() {
 
         let inventory = scan(&[dir.clone()], &IgnoreSet::default());
         let project = &inventory.projects[0];
-        let plan = plan(project, &[Change { from: None, name: "left-pad".into(), to: "1.3.0".into() }], |_| None).unwrap();
+        let plan = plan(project, &[Change { from: None, name: "left-pad".into(), to: "1.3.0".into(), loosen: false }], |_| None).unwrap();
         let outcome = apply(&plan, true, None, |e| println!("   [{}] {}", e.state, e.label)).await;
         println!("   ok={} rolled_back={} error={:?}", outcome.ok, outcome.rolled_back, outcome.error);
         let manifest = std::fs::read_to_string(dir.join("package.json")).unwrap();

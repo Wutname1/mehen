@@ -938,6 +938,7 @@ export default function App() {
           build={prefs.build}
               test={prefs.test}
           commitMode={prefs.commit}
+          pinMode={prefs.pins}
           stopOnFailure={prefs.stopOnFailure}
           onOptions={setPrefs}
           nameOf={nameOf}

@@ -29,6 +29,9 @@ pub struct Change {
     #[serde(default)]
     pub from: Option<String>,
     pub to: String,
+    /// Write an exact pin as a range from `to` (see [`crate::pin::loosened`]).
+    #[serde(default)]
+    pub loosen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +113,9 @@ pub struct UpdatePlan {
     /// before a framework moves as a group can refuse a set that fits.
     #[serde(default)]
     pub clean_retry: Vec<String>,
+    /// Packages whose entry was an exact pin before this update.
+    #[serde(default)]
+    pub pinned: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +177,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         uncommitted: Vec::new(),
         branch: None,
         clean_retry: Vec::new(),
+        pinned: Vec::new(),
     };
     // One edit covers every entry with the same name and spelling (e.g. the
     // package listed in both dependencies and devDependencies).
@@ -203,6 +210,7 @@ pub fn plan(project: &Project, changes: &[Change], package_info: impl Fn(&str) -
         Ecosystem::RubyGems => plan_bundler(&mut plan, &manifest, &dir, &deps)?,
         Ecosystem::GithubActions => plan_actions(&mut plan, &dir, &deps, &package_info)?,
     }
+    plan.pinned = plan.changes.iter().filter(|c| crate::pin::is_exact(project.ecosystem, &c.written_before)).map(|c| c.name.clone()).collect();
     for edit in &mut plan.edits {
         edit.diff = unified_diff(&edit.path, &edit.before, &edit.after, repo.as_deref().unwrap_or(&dir));
     }
@@ -365,6 +373,11 @@ fn keep_prefix(old: &str, to: &str) -> Option<String> {
     Some(format!("{prefix}{to}"))
 }
 
+/// `rewrite(old, to)`, or with `loosen` an exact pin written as a range instead.
+fn respec(ecosystem: Ecosystem, loosen: bool, old: &str, to: &str, rewrite: impl FnOnce(&str, &str) -> Option<String>) -> Option<String> {
+    loosen.then(|| crate::pin::loosened(ecosystem, old, to)).flatten().or_else(|| rewrite(old, to))
+}
+
 /// Replaces each capture's middle with `new`, keeping the text around it.
 fn replace_middle(re: &Regex, text: &str, new: &str) -> Option<String> {
     re.is_match(text).then(|| re.replace_all(text, |c: &Captures| format!("{}{new}{}", &c[1], &c[2])).into_owned())
@@ -376,7 +389,7 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
     let before = read(manifest)?;
     let mut text = before.clone();
     for (dep, change) in deps {
-        let mut new_spec = keep_prefix(&dep.requested, &change.to).ok_or_else(|| anyhow!("{}: cannot rewrite the range `{}` automatically", dep.name, dep.requested))?;
+        let mut new_spec = respec(Ecosystem::Npm, change.loosen, &dep.requested, &change.to, keep_prefix).ok_or_else(|| anyhow!("{}: cannot rewrite the range `{}` automatically", dep.name, dep.requested))?;
         // Moving with a group but kept below its newest (TypeScript at 6.0.x
         // for Angular 22): `^` would let npm take a newer minor the group
         // does not accept, so it stays on the patch line.
@@ -459,7 +472,7 @@ fn set_str_keep_decor(value: &mut toml_edit::Value, new: &str) {
 }
 
 /// Rewrites every entry for `name` in one dependency table; returns (before, after) specs.
-fn cargo_visit(table: &mut toml_edit::Item, name: &str, to: &str, found: &mut Vec<(String, String)>) {
+fn cargo_visit(table: &mut toml_edit::Item, name: &str, to: &str, loosen: bool, found: &mut Vec<(String, String)>) {
     let Some(table) = table.as_table_like_mut() else { return };
     for (key, item) in table.iter_mut() {
         let real = item.get("package").and_then(|p| p.as_str()).unwrap_or(key.get()).to_string();
@@ -477,7 +490,7 @@ fn cargo_visit(table: &mut toml_edit::Item, name: &str, to: &str, found: &mut Ve
         };
         if let Some(value) = version_value {
             if let Some(old) = value.as_str().map(str::to_string) {
-                if let Some(new) = cargo_spec(&old, to) {
+                if let Some(new) = respec(Ecosystem::Cargo, loosen, &old, to, cargo_spec) {
                     set_str_keep_decor(value, &new);
                     found.push((old, new));
                 }
@@ -494,17 +507,17 @@ fn plan_cargo(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&
         let mut found = Vec::new();
         for section in SECTIONS {
             if let Some(item) = doc.get_mut(section) {
-                cargo_visit(item, &dep.name, &change.to, &mut found);
+                cargo_visit(item, &dep.name, &change.to, change.loosen, &mut found);
             }
         }
         if let Some(item) = doc.get_mut("workspace").and_then(|w| w.get_mut("dependencies")) {
-            cargo_visit(item, &dep.name, &change.to, &mut found);
+            cargo_visit(item, &dep.name, &change.to, change.loosen, &mut found);
         }
         if let Some(targets) = doc.get_mut("target").and_then(|t| t.as_table_like_mut()) {
             for (_, target) in targets.iter_mut() {
                 for section in SECTIONS {
                     if let Some(item) = target.get_mut(section) {
-                        cargo_visit(item, &dep.name, &change.to, &mut found);
+                        cargo_visit(item, &dep.name, &change.to, change.loosen, &mut found);
                     }
                 }
             }
@@ -549,7 +562,7 @@ fn plan_composer(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&D
     let before = read(manifest)?;
     let mut text = before.clone();
     for (dep, change) in deps {
-        let new = crate::php::rewrite(&dep.requested, &change.to);
+        let new = respec(Ecosystem::Packagist, change.loosen, &dep.requested, &change.to, |o, t| Some(crate::php::rewrite(o, t))).unwrap_or_default();
         if new != dep.requested {
             let re = Regex::new(&format!(r#"("{}"\s*:\s*"){}(")"#, regex::escape(&dep.name), regex::escape(&dep.requested)))?;
             text = replace_middle(&re, &text, &new).ok_or_else(|| anyhow!("{}: `{}` not found in composer.json", dep.name, dep.requested))?;
@@ -594,7 +607,7 @@ fn plan_bundler(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&De
     let before = read(manifest)?;
     let mut text = before.clone();
     for (dep, change) in deps {
-        let new = crate::ruby::rewrite(&dep.requested, &change.to);
+        let new = respec(Ecosystem::RubyGems, change.loosen, &dep.requested, &change.to, |o, t| Some(crate::ruby::rewrite(o, t))).unwrap_or_default();
         if new != dep.requested && !dep.requested.is_empty() {
             text = gemfile_set(&text, &dep.name, &new).ok_or_else(|| anyhow!("{}: no version found on its gem line", dep.name))?;
         }
@@ -626,7 +639,8 @@ fn plan_pub(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Depend
     let before = read(manifest)?;
     let mut text = before.clone();
     for (dep, change) in deps {
-        let (old, new) = match crate::dart::set_constraint(&text, &dep.name, &change.to) {
+        let rewrite = |o: &str, t: &str| respec(Ecosystem::Pub, change.loosen, o, t, |o, t| Some(crate::dart::rewrite(o, t))).unwrap_or_default();
+        let (old, new) = match crate::dart::set_constraint_with(&text, &dep.name, &change.to, rewrite) {
             Some((next, old, new)) => {
                 text = next;
                 (old, new)
@@ -657,7 +671,12 @@ fn plan_pub(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Depend
 
 /// Rewrites the spec of each matching requirement string in a TOML array
 /// (`[project] dependencies`, optional and dependency groups).
-fn python_array(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+/// A Python spec moved to allow `to`, or with `loosen` an exact pin written as a range.
+fn python_spec(old: &str, to: &str, loosen: bool) -> String {
+    respec(Ecosystem::Pypi, loosen, old, to, |o, t| Some(crate::python::rewrite_spec(o, t))).unwrap_or_default()
+}
+
+fn python_array(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, loosen: bool, found: &mut Vec<(String, String)>) {
     let Some(array) = item.and_then(|i| i.as_array_mut()) else { return };
     for value in array.iter_mut() {
         let Some(text) = value.as_str().map(str::to_string) else { continue };
@@ -665,7 +684,7 @@ fn python_array(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: 
         if crate::python::normalize(&req.name) != crate::python::normalize(name) || req.spec != from || req.spec.is_empty() {
             continue;
         }
-        let spec = crate::python::rewrite_spec(&req.spec, to);
+        let spec = python_spec(&req.spec, to, loosen);
         let at = text.find(&req.name).map(|i| i + req.name.len()).unwrap_or(0);
         let Some(pos) = text[at..].find(&req.spec).map(|i| i + at) else { continue };
         let rewritten = format!("{}{spec}{}", &text[..pos], &text[pos + req.spec.len()..]);
@@ -677,15 +696,15 @@ fn python_array(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: 
 }
 
 /// Same for every array in a table of groups (`optional-dependencies`, `dependency-groups`).
-fn python_groups(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+fn python_groups(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, loosen: bool, found: &mut Vec<(String, String)>) {
     let Some(groups) = item.and_then(|i| i.as_table_like_mut()) else { return };
     for (_, group) in groups.iter_mut() {
-        python_array(Some(group), name, from, to, found);
+        python_array(Some(group), name, from, to, loosen, found);
     }
 }
 
 /// Rewrites `name = "spec"` or `name = { version = "spec" }` in a Poetry or Pipfile table.
-fn python_table(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) {
+fn python_table(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: &str, loosen: bool, found: &mut Vec<(String, String)>) {
     let Some(table) = item.and_then(|i| i.as_table_like_mut()) else { return };
     for (key, entry) in table.iter_mut() {
         if crate::python::normalize(key.get()) != crate::python::normalize(name) {
@@ -694,7 +713,7 @@ fn python_table(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: 
         let slot = if entry.as_str().is_some() { Some(entry) } else { entry.as_table_like_mut().and_then(|t| t.get_mut("version")) };
         let Some(slot) = slot else { continue };
         let Some(old) = slot.as_str().map(str::to_string).filter(|s| s == from && !s.trim().is_empty() && s.trim() != "*") else { continue };
-        let spec = crate::python::rewrite_spec(&old, to);
+        let spec = python_spec(&old, to, loosen);
         if let Some(value) = slot.as_value_mut() {
             let decor = value.decor().clone();
             *value = spec.clone().into();
@@ -704,7 +723,7 @@ fn python_table(item: Option<&mut toml_edit::Item>, name: &str, from: &str, to: 
     }
 }
 
-fn python_requirements_txt(text: &str, name: &str, from: &str, to: &str, found: &mut Vec<(String, String)>) -> String {
+fn python_requirements_txt(text: &str, name: &str, from: &str, to: &str, loosen: bool, found: &mut Vec<(String, String)>) -> String {
     let mut out = String::with_capacity(text.len());
     for raw in text.split_inclusive('\n') {
         let matched = crate::python::parse_requirement(raw)
@@ -716,7 +735,7 @@ fn python_requirements_txt(text: &str, name: &str, from: &str, to: &str, found: 
             });
         match matched {
             Some((old, pos)) => {
-                let spec = crate::python::rewrite_spec(&old, to);
+                let spec = python_spec(&old, to, loosen);
                 out.push_str(&raw[..pos]);
                 out.push_str(&spec);
                 out.push_str(&raw[pos + old.len()..]);
@@ -748,24 +767,24 @@ fn plan_python(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dep
             let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {file}"))?;
             if file == "Pipfile" {
                 for section in ["packages", "dev-packages"] {
-                    python_table(doc.get_mut(section), &dep.name, &dep.requested, &change.to, &mut found);
+                    python_table(doc.get_mut(section), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                 }
             } else {
                 if let Some(project) = doc.get_mut("project") {
-                    python_array(project.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
-                    python_groups(project.get_mut("optional-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                    python_array(project.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
+                    python_groups(project.get_mut("optional-dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                 }
-                python_groups(doc.get_mut("dependency-groups"), &dep.name, &dep.requested, &change.to, &mut found);
+                python_groups(doc.get_mut("dependency-groups"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                 if let Some(tool) = doc.get_mut("tool") {
                     if let Some(pdm) = tool.get_mut("pdm") {
-                        python_groups(pdm.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                        python_groups(pdm.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                     }
                     if let Some(poetry) = tool.get_mut("poetry") {
-                        python_table(poetry.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
-                        python_table(poetry.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                        python_table(poetry.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
+                        python_table(poetry.get_mut("dev-dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                         if let Some(groups) = poetry.get_mut("group").and_then(|g| g.as_table_like_mut()) {
                             for (_, group) in groups.iter_mut() {
-                                python_table(group.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, &mut found);
+                                python_table(group.get_mut("dependencies"), &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
                             }
                         }
                     }
@@ -773,7 +792,7 @@ fn plan_python(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, deps: &[(&Dep
             }
             text = doc.to_string();
         } else {
-            text = python_requirements_txt(&text, &dep.name, &dep.requested, &change.to, &mut found);
+            text = python_requirements_txt(&text, &dep.name, &dep.requested, &change.to, change.loosen, &mut found);
         }
         let (old, new) = found.first().cloned().ok_or_else(|| anyhow!("{}: no versioned entry found in {file}", dep.name))?;
         plan.changes.push(PlannedChange { name: dep.name.clone(), from: dep.current.clone().unwrap_or(old.clone()), to: change.to.clone(), written_before: old, written_after: new });
@@ -1264,7 +1283,7 @@ mod tests {
         let mut cli = dep("@angular/compiler-cli", Ecosystem::Npm, "~16.2.12", "16.2.12");
         (cli.group_target, cli.latest) = (Some("22.2.0".into()), Some("22.2.0".into()));
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![ts, cli]);
-        let changes = [Change { from: None, name: "typescript".into(), to: "6.0.3".into() }, Change { from: None, name: "@angular/compiler-cli".into(), to: "22.2.0".into() }];
+        let changes = [Change { from: None, name: "typescript".into(), to: "6.0.3".into(), loosen: false }, Change { from: None, name: "@angular/compiler-cli".into(), to: "22.2.0".into(), loosen: false }];
         let plan = plan(&p, &changes, |_| None).unwrap();
         assert!(plan.edits[0].after.contains("\"typescript\": \"~6.0.3\""), "npm must not take a newer 6.x: {}", plan.edits[0].after);
         assert!(plan.edits[0].after.contains("\"@angular/compiler-cli\": \"~22.2.0\""));
@@ -1276,7 +1295,7 @@ mod tests {
         let dir = temp("npm");
         std::fs::write(dir.join("package.json"), "{\r\n  \"dependencies\": {\r\n    \"react\": \"^18.2.0\",\r\n    \"left-pad\": \"~1.0.0\"\r\n  }\r\n}\r\n").unwrap();
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^18.2.0", "18.2.0")]);
-        let plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into() }], |_| None).unwrap();
+        let plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap();
         assert_eq!(plan.edits.len(), 1);
         assert!(plan.edits[0].after.contains("\"react\": \"^19.1.0\""));
         assert!(plan.edits[0].after.contains("\"left-pad\": \"~1.0.0\""));
@@ -1290,7 +1309,7 @@ mod tests {
         std::fs::write(dir.join("requirements.txt"), "# web\r\nrequests[socks]>=2.28,<3  # http\r\nDjango==4.2.7 ; python_version >= \"3.10\"\r\nflask\r\n-r dev.txt\r\n").unwrap();
         let deps = vec![dep("requests", Ecosystem::Pypi, ">=2.28,<3", "2.31.0"), dep("django", Ecosystem::Pypi, "==4.2.7", "4.2.7")];
         let p = project(&dir, "requirements.txt", Ecosystem::Pypi, deps);
-        let changes = [Change { from: None, name: "requests".into(), to: "3.1.0".into() }, Change { from: None, name: "django".into(), to: "5.1.4".into() }];
+        let changes = [Change { from: None, name: "requests".into(), to: "3.1.0".into(), loosen: false }, Change { from: None, name: "django".into(), to: "5.1.4".into(), loosen: false }];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
         assert!(after.contains("requests[socks]>=3.1.0,<4  # http\r\n"), "{after}");
@@ -1310,7 +1329,7 @@ mod tests {
         std::fs::write(dir.join("uv.lock"), "version = 1\n").unwrap();
         let deps = vec![dep("httpx", Ecosystem::Pypi, ">=0.27", "0.27.2"), dep("pytest", Ecosystem::Pypi, ">=8.0", "8.0.2")];
         let p = project(&dir, "pyproject.toml", Ecosystem::Pypi, deps);
-        let changes = [Change { from: None, name: "httpx".into(), to: "0.28.1".into() }, Change { from: None, name: "pytest".into(), to: "8.3.4".into() }];
+        let changes = [Change { from: None, name: "httpx".into(), to: "0.28.1".into(), loosen: false }, Change { from: None, name: "pytest".into(), to: "8.3.4".into(), loosen: false }];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
         assert!(after.contains("  \"httpx>=0.28.1\",  # client\n"), "{after}");
@@ -1333,9 +1352,9 @@ mod tests {
         let deps = vec![dep("fastapi", Ecosystem::Pypi, "^0.110", "0.110.3"), dep("sqlalchemy", Ecosystem::Pypi, "^2.0", "2.0.30"), dep("ruff", Ecosystem::Pypi, "0.4.1", "0.4.1")];
         let p = project(&dir, "pyproject.toml", Ecosystem::Pypi, deps);
         let changes = [
-            Change { from: None, name: "fastapi".into(), to: "0.115.6".into() },
-            Change { from: None, name: "sqlalchemy".into(), to: "2.0.36".into() },
-            Change { from: None, name: "ruff".into(), to: "0.8.4".into() },
+            Change { from: None, name: "fastapi".into(), to: "0.115.6".into(), loosen: false },
+            Change { from: None, name: "sqlalchemy".into(), to: "2.0.36".into(), loosen: false },
+            Change { from: None, name: "ruff".into(), to: "0.8.4".into(), loosen: false },
         ];
         let poetry = plan(&p, &changes, |_| None).unwrap();
         let after = &poetry.edits[0].after;
@@ -1350,7 +1369,7 @@ mod tests {
         std::fs::write(pipenv.join("Pipfile.lock"), "{}").unwrap();
         let deps = vec![dep("flask", Ecosystem::Pypi, "==3.0.0", "3.0.0"), dep("pytest", Ecosystem::Pypi, ">=8", "8.0.0")];
         let p = project(&pipenv, "Pipfile", Ecosystem::Pypi, deps);
-        let changes = [Change { from: None, name: "flask".into(), to: "3.1.0".into() }, Change { from: None, name: "pytest".into(), to: "8.3.4".into() }];
+        let changes = [Change { from: None, name: "flask".into(), to: "3.1.0".into(), loosen: false }, Change { from: None, name: "pytest".into(), to: "8.3.4".into(), loosen: false }];
         let pipfile = plan(&p, &changes, |_| None).unwrap();
         assert!(pipfile.edits[0].after.contains("flask = \"==3.1.0\""));
         assert!(pipfile.edits[0].after.contains("pytest = {version = \">=8.3.4\"}"), "{}", pipfile.edits[0].after);
@@ -1365,7 +1384,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("test")).unwrap();
         let deps = vec![dep("http", Ecosystem::Pub, "^1.1.0", "1.2.2"), dep("intl", Ecosystem::Pub, "any", "0.19.0")];
         let p = project(&dir, "pubspec.yaml", Ecosystem::Pub, deps);
-        let changes = [Change { from: None, name: "http".into(), to: "1.4.0".into() }, Change { from: None, name: "intl".into(), to: "0.20.2".into() }];
+        let changes = [Change { from: None, name: "http".into(), to: "1.4.0".into(), loosen: false }, Change { from: None, name: "intl".into(), to: "0.20.2".into(), loosen: false }];
         let plan = plan(&p, &changes, |_| None).unwrap();
         assert!(plan.edits[0].after.contains("  http: ^1.4.0 # client\n"));
         assert!(plan.edits[0].after.contains("  intl: any\n"), "any already allows it");
@@ -1385,7 +1404,7 @@ mod tests {
         std::fs::write(dir.join("composer.lock"), "{}").unwrap();
         let deps = vec![dep("monolog/monolog", Ecosystem::Packagist, "^2.9", "2.9.3"), dep("guzzlehttp/guzzle", Ecosystem::Packagist, "^7.2 || ^8.0", "7.9.2")];
         let p = project(&dir, "composer.json", Ecosystem::Packagist, deps);
-        let changes = [Change { from: None, name: "monolog/monolog".into(), to: "3.8.1".into() }, Change { from: None, name: "guzzlehttp/guzzle".into(), to: "9.0.1".into() }];
+        let changes = [Change { from: None, name: "monolog/monolog".into(), to: "3.8.1".into(), loosen: false }, Change { from: None, name: "guzzlehttp/guzzle".into(), to: "9.0.1".into(), loosen: false }];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
         assert!(after.contains("\"monolog/monolog\": \"^3.8\""), "{after}");
@@ -1404,9 +1423,9 @@ mod tests {
         let deps = vec![dep("rails", Ecosystem::RubyGems, "~> 7.1, >= 7.1.3", "7.1.3"), dep("puma", Ecosystem::RubyGems, ">= 5.0", "6.4.2"), dep("bootsnap", Ecosystem::RubyGems, "", "1.18.3")];
         let p = project(&dir, "Gemfile", Ecosystem::RubyGems, deps);
         let changes = [
-            Change { from: None, name: "rails".into(), to: "8.0.1".into() },
-            Change { from: None, name: "puma".into(), to: "6.5.0".into() },
-            Change { from: None, name: "bootsnap".into(), to: "1.18.4".into() },
+            Change { from: None, name: "rails".into(), to: "8.0.1".into(), loosen: false },
+            Change { from: None, name: "puma".into(), to: "6.5.0".into(), loosen: false },
+            Change { from: None, name: "bootsnap".into(), to: "1.18.4".into(), loosen: false },
         ];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
@@ -1423,7 +1442,7 @@ mod tests {
         std::fs::write(dir.join("go.mod"), "module example.com/app\n\ngo 1.26\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.10.0\n\tgithub.com/google/uuid v1.6.0\n)\n").unwrap();
         std::fs::write(dir.join("go.sum"), "").unwrap();
         let p = project(&dir, "go.mod", Ecosystem::Go, vec![dep("github.com/gin-gonic/gin", Ecosystem::Go, "v1.10.0", "v1.10.0")]);
-        let plan = plan(&p, &[Change { from: None, name: "github.com/gin-gonic/gin".into(), to: "v1.12.0".into() }], |_| None).unwrap();
+        let plan = plan(&p, &[Change { from: None, name: "github.com/gin-gonic/gin".into(), to: "v1.12.0".into(), loosen: false }], |_| None).unwrap();
         assert!(plan.edits[0].after.contains("\tgithub.com/gin-gonic/gin v1.12.0\n"));
         assert!(plan.edits[0].after.contains("\tgithub.com/google/uuid v1.6.0\n"));
         assert!(plan.snapshots.iter().any(|s| s.ends_with("go.sum")), "go.sum is put back if a step fails");
@@ -1449,15 +1468,42 @@ mod tests {
         let deps = vec![dep("serde", Ecosystem::Cargo, "1.0", "1.0.100"), dep("tokio", Ecosystem::Cargo, "1.40.0", "1.40.0"), dep("regex", Ecosystem::Cargo, "1", "1.9.0")];
         let p = project(&dir, "Cargo.toml", Ecosystem::Cargo, deps);
         let changes = [
-            Change { from: None, name: "serde".into(), to: "2.1.5".into() },
-            Change { from: None, name: "tokio".into(), to: "1.53.1".into() },
-            Change { from: None, name: "regex".into(), to: "2.0.0".into() },
+            Change { from: None, name: "serde".into(), to: "2.1.5".into(), loosen: false },
+            Change { from: None, name: "tokio".into(), to: "1.53.1".into(), loosen: false },
+            Change { from: None, name: "regex".into(), to: "2.0.0".into(), loosen: false },
         ];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
         assert!(after.contains(r#"serde = { version = "2.1", features = ["derive"] } # keep me"#), "{after}");
         assert!(after.contains(r#"tokio = "1.53.1""#), "{after}");
         assert!(after.contains("[dev-dependencies.regex]\nversion = \"2\""), "{after}");
+    }
+
+    #[test]
+    fn exact_pins_are_bumped_or_loosened_on_request() {
+        let dir = temp("pins");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n\n[dependencies]\nspecta = \"=2.0.0-rc.22\"\ntauri-specta = { version = \"=2.0.0-rc.21\", features = [\"derive\"] }\n").unwrap();
+        let deps = vec![dep("specta", Ecosystem::Cargo, "=2.0.0-rc.22", "2.0.0-rc.22"), dep("tauri-specta", Ecosystem::Cargo, "=2.0.0-rc.21", "2.0.0-rc.21")];
+        let p = project(&dir, "Cargo.toml", Ecosystem::Cargo, deps);
+        let changes = [
+            Change { from: None, name: "specta".into(), to: "2.0.0-rc.25".into(), loosen: true },
+            Change { from: None, name: "tauri-specta".into(), to: "2.0.0-rc.25".into(), loosen: false },
+        ];
+        let after = &plan(&p, &changes, |_| None).unwrap().edits[0].after;
+        assert!(after.contains("specta = \"2.0.0-rc.25\""), "{after}");
+        assert!(after.contains("tauri-specta = { version = \"=2.0.0-rc.25\""), "{after}");
+
+        std::fs::write(dir.join("package.json"), "{\n  \"dependencies\": {\n    \"axios\": \"0.27.2\",\n    \"react\": \"^18.2.0\"\n  }\n}\n").unwrap();
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("axios", Ecosystem::Npm, "0.27.2", "0.27.2"), dep("react", Ecosystem::Npm, "^18.2.0", "18.2.0")]);
+        let changes = [Change { from: None, name: "axios".into(), to: "1.20.0".into(), loosen: true }, Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: true }];
+        let after = &plan(&p, &changes, |_| None).unwrap().edits[0].after;
+        assert!(after.contains("\"axios\": \"^1.20.0\""), "{after}");
+        assert!(after.contains("\"react\": \"^19.1.0\""), "a range is moved as before: {after}");
+
+        std::fs::write(dir.join("requirements.txt"), "requests==2.31.0  # pinned\n").unwrap();
+        let p = project(&dir, "requirements.txt", Ecosystem::Pypi, vec![dep("requests", Ecosystem::Pypi, "==2.31.0", "2.31.0")]);
+        let after = &plan(&p, &[Change { from: None, name: "requests".into(), to: "2.32.3".into(), loosen: true }], |_| None).unwrap().edits[0].after;
+        assert_eq!(after, "requests>=2.32.3,<3  # pinned\n");
     }
 
     #[test]
@@ -1471,9 +1517,9 @@ mod tests {
         let deps = vec![dep("Newtonsoft.Json", Ecosystem::Nuget, "12.0.1", "12.0.1"), dep("Serilog", Ecosystem::Nuget, "1.0.0", "1.0.0"), dep("Dapper", Ecosystem::Nuget, "2.0.0", "2.0.0")];
         let p = project(&dir, "app.csproj", Ecosystem::Nuget, deps);
         let changes = [
-            Change { from: None, name: "Newtonsoft.Json".into(), to: "13.0.3".into() },
-            Change { from: None, name: "Serilog".into(), to: "4.0.0".into() },
-            Change { from: None, name: "Dapper".into(), to: "2.1.35".into() },
+            Change { from: None, name: "Newtonsoft.Json".into(), to: "13.0.3".into(), loosen: false },
+            Change { from: None, name: "Serilog".into(), to: "4.0.0".into(), loosen: false },
+            Change { from: None, name: "Dapper".into(), to: "2.1.35".into(), loosen: false },
         ];
         let plan = plan(&p, &changes, |_| None).unwrap();
         let after = &plan.edits[0].after;
@@ -1504,7 +1550,7 @@ mod tests {
                 _ => PackageInfo { latest: Some("v4.1.0".into()), versions: vec![], requirements: vec![], tags: vec![("v4.1.0".into(), "2".repeat(40))] },
             })
         };
-        let changes = [Change { from: None, name: "actions/checkout".into(), to: "v7.0.1".into() }, Change { from: None, name: "docker/login-action".into(), to: "v4.1.0".into() }];
+        let changes = [Change { from: None, name: "actions/checkout".into(), to: "v7.0.1".into(), loosen: false }, Change { from: None, name: "docker/login-action".into(), to: "v4.1.0".into(), loosen: false }];
         let plan = plan(&p, &changes, info).unwrap();
         let after = &plan.edits[0].after;
         assert!(after.contains("uses: actions/checkout@v7\n"), "{after}");
@@ -1527,7 +1573,7 @@ mod tests {
         git(&["add", "other.txt"]);
 
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^18.2.0", "18.2.0")]);
-        let mut first = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into() }], |_| None).unwrap();
+        let mut first = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap();
         assert!(first.commit_blocked.is_none(), "{:?}", first.commit_blocked);
         first.steps.clear();
         let outcome = apply(&first, false, Some("chore(deps): update react to 19.1.0"), |_| {}).await;
@@ -1541,7 +1587,7 @@ mod tests {
         // A manifest with uncommitted edits cannot be committed by Mehen.
         std::fs::write(dir.join("package.json"), "{ \"dependencies\": { \"react\": \"^19.1.0\" }, \"x\": 1 }").unwrap();
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^19.1.0", "19.1.0")]);
-        let second = plan(&p, &[Change { from: None, name: "react".into(), to: "19.2.0".into() }], |_| None).unwrap();
+        let second = plan(&p, &[Change { from: None, name: "react".into(), to: "19.2.0".into(), loosen: false }], |_| None).unwrap();
         assert!(second.commit_blocked.is_none() && second.uncommitted == ["package.json"], "{:?} {:?}", second.commit_blocked, second.uncommitted);
     }
 
@@ -1552,7 +1598,7 @@ mod tests {
         std::fs::write(&manifest, "{ \"dependencies\": { \"react\": \"^18.2.0\" } }").unwrap();
         std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "^18.2.0", "18.2.0")]);
-        let mut plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into() }], |_| None).unwrap();
+        let mut plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap();
         // Swap the install for a command that always fails and edits the lockfile first.
         plan.steps = vec![Step {
             kind: StepKind::Install,

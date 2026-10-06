@@ -1,3 +1,4 @@
+import type { PinMode } from './prefs'
 import type { Change, Conflict, Dependency, Ecosystem, Inventory, Project, Status, VersionPolicies, VersionPolicy, Vulnerability } from './types'
 
 export const ECOSYSTEMS: Ecosystem[] = ['npm', 'pypi', 'cargo', 'nuget', 'go', 'pub', 'packagist', 'rubygems', 'github-actions']
@@ -496,6 +497,21 @@ export interface UpdateUnit {
 const depFor = (project: Project, change: Change) => {
   const named = project.dependencies.filter((d) => d.name.toLowerCase() === change.name.toLowerCase())
   return named.find((d) => d.requested === change.from) ?? named[0]
+}
+
+/**
+ * The changes with each exact pin marked to be loosened or kept, per `mode`.
+ * A pin on a vulnerable package loosens unless pins are kept: the next fix
+ * then comes in with the lockfile instead of another edit.
+ */
+export function applyPins<T extends { project: Project; changes: Change[] }>(targets: T[], mode: PinMode): T[] {
+  return targets.map((t) => ({
+    ...t,
+    changes: t.changes.map((c) => {
+      const dep = depFor(t.project, c)
+      return { ...c, loosen: !!dep?.pinned && (mode === 'all' || (mode === 'vulnerable' && dep.vulns.length > 0)) }
+    }),
+  }))
 }
 
 export function unitsOf(targets: { project: Project; changes: Change[] }[]): UpdateUnit[] {

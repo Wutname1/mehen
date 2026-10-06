@@ -658,6 +658,7 @@ mod tests {
             uncommitted: Vec::new(),
             branch: None,
             clean_retry: Vec::new(),
+            pinned: Vec::new(),
         }
     }
 

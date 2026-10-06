@@ -9,6 +9,15 @@ export const COMMIT_MODES: { value: CommitMode; label: string; detail: string }[
   { value: 'push', label: 'Commit & push', detail: 'Commits only the files Mehen changed, then pushes the branch to its remote.' },
 ]
 
+/** What an update writes for a package pinned to one exact version. */
+export type PinMode = 'keep' | 'vulnerable' | 'all'
+
+export const PIN_MODES: { value: PinMode; label: string; detail: string }[] = [
+  { value: 'keep', label: 'Keep exact', detail: 'Moves each pin to the new version and keeps it exact.' },
+  { value: 'vulnerable', label: 'Loosen vulnerable', detail: 'A pin on a package with a known vulnerability becomes a range, so later fixes come in without another edit. Other pins stay exact.' },
+  { value: 'all', label: 'Loosen all', detail: 'Every pin becomes a range from the new version up to its next breaking release.' },
+]
+
 /** Choices that only affect this window, kept in the webview's storage. */
 export interface Prefs {
   palette: 'faience' | 'parchment'
@@ -19,6 +28,8 @@ export interface Prefs {
   test: boolean
   /** Commit (and maybe push) each repository once its update succeeds. */
   commit: CommitMode
+  /** What an update writes for exact pins. */
+  pins: PinMode
   /** Check every project when Mehen opens. */
   scanOnOpen: boolean
   /** Stop a project at its first failed check instead of running the rest. */
@@ -29,7 +40,7 @@ export interface Prefs {
   railSort: 'az' | 'za' | 'updates'
 }
 
-const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', build: true, test: true, commit: 'off', scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
+const DEFAULTS: Prefs = { palette: 'faience', theme: 'dark', build: true, test: true, commit: 'off', pins: 'vulnerable', scanOnOpen: true, stopOnFailure: true, riskFirst: true, railSort: 'az' }
 
 /** Bumped when a default changes and older saved choices should pick it up. */
 const VERSION = 2

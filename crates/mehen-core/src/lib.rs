@@ -15,6 +15,7 @@ pub mod lockfiles;
 pub mod model;
 pub mod osv;
 pub mod php;
+pub mod pin;
 pub mod python;
 pub mod registry;
 pub mod ruby;

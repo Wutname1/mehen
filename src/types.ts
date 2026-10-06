@@ -29,6 +29,8 @@ export interface Dependency {
   status: Status
   vulns: string[]
   note: string | null
+  /** Written as one exact version, so nothing newer comes in until the manifest is edited. */
+  pinned?: boolean
 }
 
 export interface Project {
@@ -180,6 +182,8 @@ export interface Change {
   name: string
   from: string
   to: string
+  /** Write an exact pin as a range from `to`. */
+  loosen?: boolean
 }
 
 export interface PlannedChange {
@@ -223,6 +227,8 @@ export interface UpdatePlan {
   uncommitted?: string[]
   /** The checked-out branch, where a commit would land. */
   branch: string | null
+  /** Packages whose entry was an exact pin before this update. */
+  pinned?: string[]
 }
 
 export interface StepResult {

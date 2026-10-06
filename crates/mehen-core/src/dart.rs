@@ -111,6 +111,11 @@ pub fn rewrite(constraint: &str, to: &str) -> String {
 /// `  name: ^1.2.0` and as a nested `    version: ^1.2.0`, keeping quotes,
 /// comments and layout. Returns the text and the constraint before and after.
 pub fn set_constraint(source: &str, name: &str, to: &str) -> Option<(String, String, String)> {
+    set_constraint_with(source, name, to, rewrite)
+}
+
+/// [`set_constraint`] with the new constraint worked out by `rewrite(old, to)`.
+pub fn set_constraint_with(source: &str, name: &str, to: &str, rewrite: impl Fn(&str, &str) -> String) -> Option<(String, String, String)> {
     let mut out = String::with_capacity(source.len());
     let mut section = "";
     let mut entry_indent: Option<usize> = None;

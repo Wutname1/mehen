@@ -118,6 +118,10 @@ pub struct Dependency {
     pub status: Status,
     pub vulns: Vec<String>,
     pub note: Option<String>,
+    /// Written as an exact version (`=2.0.0-rc.22`, `"1.2.3"` in package.json),
+    /// so nothing newer comes in until the manifest is edited.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 impl Dependency {
@@ -143,6 +147,7 @@ impl Dependency {
             status: Status::Pending,
             vulns: Vec::new(),
             note: None,
+            pinned: false,
         }
     }
 }

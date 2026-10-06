@@ -246,6 +246,7 @@ fn reset(dep: &mut Dependency) {
     dep.group_target = None;
     dep.vulns.clear();
     dep.approximate = false;
+    dep.pinned = crate::pin::is_exact(dep.ecosystem, &dep.requested);
     if dep.status == Status::Local {
         return;
     }

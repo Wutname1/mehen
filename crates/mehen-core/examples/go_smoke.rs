@@ -42,7 +42,7 @@ async fn main() {
             d.current = d.installed.clone();
         }
         let before = std::fs::read_to_string(dir.join("go.mod")).unwrap();
-        let plan = plan(&dep_project, &[Change { from: None, name: dep.name.clone(), to: version.into() }], |_| None).unwrap();
+        let plan = plan(&dep_project, &[Change { from: None, name: dep.name.clone(), to: version.into(), loosen: false }], |_| None).unwrap();
         println!("== {label}: {} {} -> {version}", dep.name, dep.requested);
         let options = BatchOptions { build: !args.iter().any(|a| a == "--no-checks"), test: !args.iter().any(|a| a == "--no-checks"), commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
         let outcomes = run(vec![plan], options, &Default::default(), |s, c| async move { update::run_step(&s, &c).await }, |e| println!("   [{:?}] {}", e.state, e.label.unwrap_or_default())).await;

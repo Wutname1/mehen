@@ -21,7 +21,7 @@ async fn main() {
                 .filter(|d| matches!(d.status, Status::Major | Status::Minor | Status::Patch))
                 .filter(|d| eco != Ecosystem::GithubActions || d.requested.len() == 40 || d.requested.starts_with('v'))
                 .take(2)
-                .filter_map(|d| Some(Change { from: None, name: d.name.clone(), to: d.safe_latest.clone().or(d.latest.clone())? }))
+                .filter_map(|d| Some(Change { from: None, name: d.name.clone(), to: d.safe_latest.clone().or(d.latest.clone())?, loosen: false }))
                 .collect();
             (!changes.is_empty()).then_some((p, changes))
         });

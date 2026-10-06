@@ -1,14 +1,14 @@
-import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
+import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Lock, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import { bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
+import { applyPins, bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { FeedbackDialog } from './FeedbackDialog'
 import { Checkbox } from './Queue'
 import { Segmented } from './controls'
-import { COMMIT_MODES, type CommitMode } from '../prefs'
+import { COMMIT_MODES, PIN_MODES, type CommitMode, type PinMode } from '../prefs'
 import { sendReport, type Report } from '../lib/telemetry'
 import { batchErrorReport, planFailureReport, updateFailureReport } from '../lib/updateReport'
 import { RepoAvatar } from './RepoAvatar'
@@ -197,6 +197,7 @@ export function UpdateFlow({
   build,
   test,
   commitMode,
+  pinMode,
   stopOnFailure,
   onOptions,
   nameOf,
@@ -211,8 +212,9 @@ export function UpdateFlow({
   build: boolean
   test: boolean
   commitMode: CommitMode
+  pinMode: PinMode
   stopOnFailure: boolean
-  onOptions: (patch: { build?: boolean; test?: boolean; commit?: CommitMode }) => void
+  onOptions: (patch: { build?: boolean; test?: boolean; commit?: CommitMode; pins?: PinMode }) => void
   nameOf: (key: string) => string
   icons: Record<string, string>
   /** Keeps a package on its line in `scope` (a repository) from now on. */
@@ -249,11 +251,13 @@ export function UpdateFlow({
   const [tried, setTried] = useState(targets)
   /** Packages held back after a failure, by job key (lowercased). */
   const [fallbacks, setFallbacks] = useState<Record<string, Fallback[]>>({})
+  /** The step to come back to when the plans are worked out again (pins changed on it). */
+  const resume = useRef<Stage | null>(null)
 
   useEffect(() => {
     let cancelled = false
     Promise.all(
-      current.map((t) =>
+      applyPins(current, pinMode).map((t) =>
         api.planUpdate(t.project.id, t.changes).then(
           (plan) => (plan.edits.length || plan.steps.length ? { plan } : { error: 'Nothing to change', project: t.project }),
           (e) => ({ error: String(e), project: t.project }),
@@ -265,12 +269,13 @@ export function UpdateFlow({
       setFailed(results.flatMap((r) => ('error' in r && r.error ? [{ project: r.project, error: r.error }] : [])))
       setTried(current)
       setFallbacks({})
-      setStage(start)
+      setStage(resume.current ?? start)
+      resume.current = null
     })
     return () => {
       cancelled = true
     }
-  }, [current, start])
+  }, [current, start, pinMode])
 
   useEffect(() => {
     const unlisten = api.onBatchEvent((e: BatchEvent) => {
@@ -316,7 +321,7 @@ export function UpdateFlow({
       // run, breaking moves go one at a time after the rest; a part that fails
       // without saying why is split in half until the update that breaks is found.
       const byJob = new Map<string, UpdateTarget[]>()
-      for (const t of current) byJob.set(keyOf(t.project.id), [...(byJob.get(keyOf(t.project.id)) ?? []), t])
+      for (const t of applyPins(current, pinMode)) byJob.set(keyOf(t.project.id), [...(byJob.get(keyOf(t.project.id)) ?? []), t])
       const queue = new Map<string, UpdateUnit[][]>()
       for (const [key, targets] of byJob) {
         const units = unitsOf(targets)
@@ -507,6 +512,28 @@ export function UpdateFlow({
     )
   }
 
+  const pinned = [...new Set(plans.flatMap((p) => p.pinned ?? []))].sort()
+  const vulnerablePins = pinned.filter((name) => current.some((t) => t.project.dependencies.some((d) => d.name === name && d.pinned && d.vulns.length > 0)))
+  const pins =
+    pinned.length > 0 ? (
+      <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[3px] border border-line bg-paper px-3 py-2.5 text-[12.5px]">
+        <Lock size={15} className="shrink-0 text-muted" />
+        <span className="min-w-[220px] flex-1" title={pinned.join('\n')}>
+          {pinned.length === 1 ? `${pinned[0]} is` : `${pinned.length} packages are`} pinned to one exact version, so newer releases and their fixes only come in when the file is edited.
+          {vulnerablePins.length > 0 && <span className="text-risk-security"> {vulnerablePins.length === pinned.length && pinned.length === 1 ? 'It has' : `${vulnerablePins.length} ${vulnerablePins.length === 1 ? 'has' : 'have'}`} known vulnerabilities.</span>}
+        </span>
+        <Segmented
+          value={pinMode}
+          options={PIN_MODES}
+          onChange={(next) => {
+            resume.current = stage
+            onOptions({ pins: next })
+          }}
+          label="Pinned versions"
+        />
+      </div>
+    ) : null
+
   if (stage === 'preview') {
     return (
       <Dialog
@@ -540,6 +567,7 @@ export function UpdateFlow({
           </>
         }
       >
+        {pins}
         {jobs.map((job) => {
           const { install, checks: steps } = stepsOf(job, build, test)
           return (
@@ -591,6 +619,7 @@ export function UpdateFlow({
         }
       >
         {failed.length > 0 && <Unplannable failed={failed} roots={roots} onNote={setNote} />}
+        {pins}
         <div className="grid gap-2.5">
           {jobs.map((job) => {
             const changes = changesOf(job)
@@ -1065,6 +1094,7 @@ function PlanFiles({ job }: { job: Job }) {
         // A workflow folder edits several files under one project.
         others: paths.length > 1 ? paths : [],
         changes: [...plan.changes].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })),
+        pinned: new Set(plan.pinned ?? []),
       }
     })
     .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
@@ -1115,6 +1145,12 @@ function PlanFiles({ job }: { job: Job }) {
                   <code className="shrink-0 font-mono text-[12px] text-muted">{c.from}</code>
                   <span className="shrink-0 text-muted">to</span>
                   <code className={cx('shrink-0 font-mono text-[12px]', bumpOf(c.from, c.to) === 'major' && 'text-risk-major')}>{c.to}</code>
+                  {file.pinned.has(c.name) && (
+                    <span className="inline-flex shrink-0 items-center gap-1 text-[12px] text-muted" title={`Written as ${c.writtenBefore} now; the update writes ${c.writtenAfter}`}>
+                      <Lock size={12} />
+                      written as <code className="font-mono">{c.writtenAfter}</code>
+                    </span>
+                  )}
                 </li>
               ))}
               {file.others.length > 0 && <li className="truncate text-[12px] text-muted">Files: {file.others.join(', ')}</li>}

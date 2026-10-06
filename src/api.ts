@@ -357,6 +357,9 @@ const mock = (() => {
       const res = await fetch('/dev-inventory.json')
       if (!res.ok) return null
       const inv = (await res.json()) as Inventory & { root?: string }
+      // The engine marks exact pins during a check; saved inventories may predate that.
+      const exact = /^=?v?\d+\.\d+\.\d+(-[\w.-]+)?$/
+      for (const p of inv.projects) for (const d of p.dependencies) d.pinned ??= d.ecosystem === 'npm' && exact.test(d.requested.trim())
       cached = { ...inv, roots: inv.roots ?? [inv.root ?? 'C:\\code'], ignored: inv.ignored ?? [] }
       return cached
     } catch {
@@ -477,7 +480,8 @@ const mock = (() => {
       const inv = await load()
       const project = inv?.projects.find((p) => p.id === projectId)
       if (!project) throw new Error('Project not found')
-      const planned = changes.map((c) => ({ name: c.name, from: c.from, to: c.to, writtenBefore: c.from, writtenAfter: c.to }))
+      const pinnedDep = (c: Change) => project.dependencies.some((d) => d.name === c.name && d.requested === c.from && d.pinned)
+      const planned = changes.map((c) => ({ name: c.name, from: c.from, to: c.to, writtenBefore: c.from, writtenAfter: pinnedDep(c) ? (c.loosen ? `^${c.to}` : c.to) : c.to }))
       const diff = [`--- ${project.manifest}`, `+++ ${project.manifest}`, '@@ -1,3 +1,3 @@', ...planned.flatMap((c) => [`-  "${c.name}": "${c.writtenBefore}",`, `+  "${c.name}": "${c.writtenAfter}",`])].join('\n')
       return {
         projectId,
@@ -501,6 +505,7 @@ const mock = (() => {
         // Pretend opencode's files already have changes, so forcing a commit can be tried here.
         uncommitted: /opencode/i.test(project.repo ?? '') ? ['package.json', 'package-lock.json'] : [],
         branch: project.repo ? 'main' : null,
+        pinned: changes.filter(pinnedDep).map((c) => c.name),
       }
     },
     // Mirrors the Rust runner: one job per repository, one step per tool at a time.

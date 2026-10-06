@@ -1,4 +1,4 @@
-import { ArrowDownUp, Check, ChevronDown, Info, Link2, ListTree, MoreHorizontal, Pin, Plus, ShieldAlert, X } from 'lucide-react'
+import { ArrowDownUp, Check, ChevronDown, Info, Link2, ListTree, Lock, MoreHorizontal, Pin, Plus, ShieldAlert, X } from 'lucide-react'
 import { useLayoutEffect, useRef, useState, type InputHTMLAttributes, type KeyboardEvent, type ReactNode } from 'react'
 import { ECOSYSTEM_LABEL, ECOSYSTEMS, POLICY_LABEL, PROJECT_TYPE_LABEL, distinctVersions, displayVersion, holdLine, reasonText, relativePath, samePath, type ProjectType, type QueueRow, type QueueUsage, type Repo, type Risk } from '../derive'
 import type { Ecosystem, Hold, VersionPolicy } from '../types'
@@ -425,6 +425,12 @@ export function Queue({
                           )
                         )
                       })()}
+                      {usages.some((u) => u.dep.pinned) && (
+                        <span className="inline-flex items-center gap-1 font-sans text-[12px]" title="Pinned to one exact version in the manifest. Updating moves the pin, and can loosen it into a range so later fixes come in by themselves.">
+                          <Lock size={12} />
+                          exact
+                        </span>
+                      )}
                       {holdsOf(row).map((h) => (
                         <button
                           key={h.id}
