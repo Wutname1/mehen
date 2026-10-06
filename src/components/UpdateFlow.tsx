@@ -1,7 +1,7 @@
 import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch, GitCommitHorizontal, Loader2, Pin, Play, RefreshCw, RotateCcw, Send, ShieldCheck, Terminal, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
-import { bumpOf, folderName, relativePath, runLabel, withoutCulprits, type Fallback } from '../derive'
+import { bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
 import type { BatchEvent, Change, CommitOutcome, Conflict, Inventory, JobOutcome, JobState, Project, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
@@ -20,8 +20,36 @@ export interface UpdateTarget {
 
 type Stage = 'planning' | 'preview' | 'confirm' | 'running' | 'done' | 'commit'
 
-/** How many times a repository runs again after its failure points at a package. */
-const FALLBACK_ROUNDS = 2
+/** How many tries Mehen makes at most, across every repository, while it works out what breaks. */
+const MAX_TRIES = 16
+
+/** What happened to one repository over every try. */
+interface Tally {
+  ok: JobOutcome[]
+  /** Plans of the tries that went in, and of the last one that did not. */
+  plans: UpdatePlan[]
+  failed: { outcome: JobOutcome; plans: UpdatePlan[]; targets: UpdateTarget[] } | null
+  notes: string[]
+}
+
+/** One outcome for a repository that was tried in several parts. */
+function combine(t: Tally): JobOutcome | null {
+  if (!t.ok.length) return t.failed ? { ...t.failed.outcome, notes: [...(t.failed.outcome.notes ?? []), ...t.notes] } : null
+  const last = t.ok[t.ok.length - 1]
+  const committed = t.ok.map((o) => o.committed).filter((h): h is string => !!h)
+  return {
+    ...last,
+    projects: [...new Set(t.ok.flatMap((o) => o.projects))],
+    steps: t.ok.flatMap((o) => o.steps),
+    committed: committed.length ? committed.join(', ') : null,
+    commitError: t.ok.map((o) => o.commitError).find(Boolean) ?? null,
+    commitSkipped: t.ok.map((o) => o.commitSkipped).find(Boolean) ?? null,
+    pushed: committed.length > 0 && t.ok.every((o) => !o.committed || o.pushed),
+    pushError: t.ok.map((o) => o.pushError).find(Boolean) ?? null,
+    conflicts: t.ok.flatMap((o) => o.conflicts),
+    notes: [...t.ok.flatMap((o) => o.notes ?? []), ...t.notes],
+  }
+}
 
 interface Job {
   key: string
@@ -276,45 +304,103 @@ export function UpdateFlow({
     setStage('running')
     setError(null)
     try {
-      const first = await api.applyBatch(plans, { build, test }, commit, stopOnFailure, forceCommit, push)
-      let all = first.outcomes
-      let inventory = first.inventory
-      let shown = plans
-      let now = current
+      const keyOf = (projectId: string) => {
+        const plan = plans.find((p) => p.projectId.toLowerCase() === projectId.toLowerCase())
+        return (plan ? jobKey(plan) : projectId).toLowerCase()
+      }
+      // Files someone else had already changed. After a part goes in uncommitted,
+      // its own edits show as changed too, and must not block the next part's commit.
+      const dirtyBefore = new Map<string, Set<string>>()
+      for (const p of plans) dirtyBefore.set(keyOf(p.projectId), new Set([...(dirtyBefore.get(keyOf(p.projectId)) ?? []), ...(p.uncommitted ?? [])]))
+      // Each repository's updates in the order they are tried. With checks to
+      // run, breaking moves go one at a time after the rest; a part that fails
+      // without saying why is split in half until the update that breaks is found.
+      const byJob = new Map<string, UpdateTarget[]>()
+      for (const t of current) byJob.set(keyOf(t.project.id), [...(byJob.get(keyOf(t.project.id)) ?? []), t])
+      const queue = new Map<string, UpdateUnit[][]>()
+      for (const [key, targets] of byJob) {
+        const units = unitsOf(targets)
+        queue.set(key, checks ? stagesOf(units) : [units])
+      }
+      const tally = new Map<string, Tally>()
+      const tallyOf = (key: string) => tally.get(key) ?? (tally.set(key, { ok: [], plans: [], failed: null, notes: [] }), tally.get(key)!)
       const left: Record<string, Fallback[]> = {}
-      // A repository that broke on a package the failure points at runs again
-      // with that package on its old line, or without it.
-      for (let round = 0; round < FALLBACK_ROUNDS; round++) {
-        const redo = all.filter((o) => !o.ok && !o.cancelled && o.rolledBack && o.failedBefore !== true && !stopAsked.current.has('*') && !stopAsked.current.has(o.job.toLowerCase()))
-        const again: { ids: Set<string>; targets: UpdateTarget[]; plans: UpdatePlan[]; key: string; fallbacks: Fallback[] }[] = []
-        for (const o of redo) {
-          const culprits = o.conflicts.filter((x) => x.blocking && x.keep).map((x) => x.keep!)
-          const ids = new Set(o.projects.map((id) => id.toLowerCase()))
-          const next = culprits.length ? withoutCulprits(now.filter((t) => ids.has(t.project.id.toLowerCase())), culprits) : null
-          if (!next) continue
-          const planned = await Promise.all(next.targets.map((t) => api.planUpdate(t.project.id, t.changes).catch(() => null)))
-          if (planned.some((p) => !p)) continue
-          again.push({ ids, targets: next.targets, plans: planned as UpdatePlan[], key: o.job.toLowerCase(), fallbacks: next.fallbacks })
+      let inventory: Inventory | null = null
+
+      for (let tries = 0; queue.size > 0 && tries < MAX_TRIES && !stopAsked.current.has('*'); tries++) {
+        const round: { key: string; units: UpdateUnit[]; plans: UpdatePlan[] }[] = []
+        for (const [key, stages] of [...queue]) {
+          const units = stages.shift()
+          if (!stages.length) queue.delete(key)
+          if (!units || stopAsked.current.has(key)) {
+            queue.delete(key)
+            continue
+          }
+          const planned = await Promise.all(targetsOf(units).map((t) => api.planUpdate(t.project.id, t.changes).then((p) => p, (e) => `${t.project.name}: ${e}`)))
+          const unplanned = planned.filter((p): p is string => typeof p === 'string')
+          if (unplanned.length) {
+            tallyOf(key).notes.push(...unplanned.map((e) => `Not tried: ${e}`))
+            continue
+          }
+          const dirty = dirtyBefore.get(key) ?? new Set()
+          round.push({ key, units, plans: (planned as UpdatePlan[]).map((p) => ({ ...p, uncommitted: (p.uncommitted ?? []).filter((f) => dirty.has(f)) })) })
         }
-        if (!again.length || stopAsked.current.has('*')) break
-        const redone = (id: string) => again.some((a) => a.ids.has(id.toLowerCase()))
-        shown = [...shown.filter((p) => !redone(p.projectId)), ...again.flatMap((a) => a.plans)]
-        now = [...now.filter((t) => !redone(t.project.id)), ...again.flatMap((a) => a.targets)]
-        for (const a of again) left[a.key] = [...(left[a.key] ?? []), ...a.fallbacks]
-        setPlans(shown)
-        setFallbacks({ ...left })
+        if (!round.length) break
         const result = await api.applyBatch(
-          again.flatMap((a) => a.plans),
+          round.flatMap((r) => r.plans),
           { build, test },
           commit,
           stopOnFailure,
           forceCommit,
           push,
         )
-        all = [...all.filter((o) => !o.projects.some(redone)), ...result.outcomes]
         inventory = result.inventory ?? inventory
+        for (const o of result.outcomes) {
+          const key = keyOf(o.projects[0] ?? o.job)
+          const tried = round.find((r) => r.key === key)
+          if (!tried) continue
+          const t = tallyOf(key)
+          if (o.ok) {
+            t.ok.push(o)
+            t.plans.push(...tried.plans)
+            continue
+          }
+          t.failed = { outcome: o, plans: tried.plans, targets: targetsOf(tried.units) }
+          // Stopped, missing a tool, already broken before the update, or its
+          // files could not be put back: trying more parts would not help.
+          if (o.cancelled || o.missingTool || o.failedBefore === true || !o.rolledBack) {
+            const skipped = [...new Set([tried.units, ...(queue.get(key) ?? [])].flat().flatMap((u) => u.parts.map((p) => p.change.name)))]
+            if (!o.cancelled && t.ok.length) {
+              const why = o.failedBefore === true ? 'The project fails its checks even without these updates' : o.missingTool ? `\`${o.missingTool}\` is not installed` : (o.error ?? 'A step failed')
+              t.notes.push(`${why}, so Mehen stopped. Not updated: ${skipped.join(', ')}.`)
+            }
+            queue.delete(key)
+            continue
+          }
+          const culprits = o.conflicts.filter((x) => x.blocking && x.keep).map((x) => x.keep!)
+          const next = culprits.length ? withoutCulprits(targetsOf(tried.units), culprits) : null
+          const stages = queue.get(key) ?? []
+          if (next) {
+            left[key] = [...(left[key] ?? []), ...next.fallbacks]
+            stages.unshift(unitsOf(next.targets))
+          } else if (tried.units.length > 1) {
+            stages.unshift(...halves(tried.units))
+          } else {
+            left[key] = [...(left[key] ?? []), ...leftOut(tried.units[0])]
+          }
+          if (stages.length) queue.set(key, stages)
+        }
+        setFallbacks({ ...left })
       }
-      setTried(now)
+      for (const [key, stages] of queue) {
+        const names = [...new Set(stages.flat().flatMap((u) => u.parts.map((p) => p.change.name)))]
+        if (names.length) tallyOf(key).notes.push(`Mehen stopped trying after ${MAX_TRIES} runs. Not tried yet: ${names.join(', ')}.`)
+      }
+
+      const all = [...tally.values()].map(combine).filter((o): o is JobOutcome => !!o)
+      const shown = [...tally.values()].flatMap((t) => (t.ok.length ? t.plans : (t.failed?.plans ?? [])))
+      setPlans(shown.length ? shown : plans)
+      setTried([...tally.values()].flatMap((t) => t.failed?.targets ?? []))
       setOutcomes(all)
       if (inventory) setRefreshed(inventory)
     } catch (e) {
@@ -582,7 +668,7 @@ export function UpdateFlow({
           })}
         </div>
         <p className="mt-3 border-l-2 border-line-strong pl-3 text-[12.5px] leading-relaxed text-muted">
-          {filesOnly ? 'Workflow files have nothing to install or test here; your CI runs them next time it starts.' : checks ? (stopOnFailure ? "If a check fails, Mehen puts that project's files back and keeps its updates selected." : "If a check fails, the remaining checks still run so you see every failure, then Mehen puts that project's files back.") : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
+          {filesOnly ? 'Workflow files have nothing to install or test here; your CI runs them next time it starts.' : checks ? `Updates that stay on their release line go in together, then each bigger one on its own. If a check fails, Mehen puts the files back, works out which update caused it, and keeps the rest${stopOnFailure ? '' : ' (every check still runs first, so you see each failure)'}.` : 'Nothing is built or tested. Run your tests or let CI check before merging.'}{' '}
           {push ? 'Each commit is pushed once it is made.' : commit ? 'Commits stay local; nothing is pushed.' : 'Nothing is committed until you choose to.'}
           {!filesOnly && ' Different projects update side by side; projects that need the same tool take turns.'}
         </p>
@@ -721,6 +807,7 @@ export function UpdateFlow({
   const pushedOf = (j: Job) => !!(outcomeOf(j)?.pushed || commitOf(j)?.pushed)
   const allPushed = anyCommitted && committedJobs.every(pushedOf)
   const somePushed = committedJobs.some(pushedOf)
+  const heldBack = Object.values(fallbacks).flat().filter((f) => !f.to).length
   return (
     <Dialog
       title={error ? 'Update could not run' : broke.length ? 'Update finished with a problem' : stopped.length && !passed.length ? 'Update cancelled' : 'Update finished'}
@@ -786,7 +873,9 @@ export function UpdateFlow({
                   : filesOnly
                   ? 'Workflow files updated. They take effect the next time your CI runs.'
                   : ran.checks
-                  ? 'Every build and test passed.'
+                  ? heldBack
+                    ? `Every build and test passed. ${heldBack} update${heldBack === 1 ? '' : 's'} broke a check and ${heldBack === 1 ? 'was' : 'were'} left out.`
+                    : 'Every build and test passed.'
                   : 'Checks were skipped. Run your tests or let CI check before merging.'}
             </span>
           </div>
@@ -826,7 +915,7 @@ export function UpdateFlow({
                       <li key={f.name} className="flex items-center gap-2 text-[12.5px]">
                         <RotateCcw size={14} className="shrink-0 text-risk-review" />
                         <span className="min-w-0 flex-1">
-                          {f.with ? `${f.name} ${f.tried} only goes with the new ${f.with}` : `${f.name} ${f.tried} broke it`}, so Mehen {f.to ? `used ${f.to} instead` : `left it on ${f.stays}`} and tried again.
+                          {f.with ? `${f.name} ${f.tried} only goes with the new ${f.with}` : `${f.name} ${f.tried} broke it`}, so Mehen {f.to ? `used ${f.to} instead` : `left it on ${f.stays}`}.
                         </span>
                         {done ? (
                           <span className="inline-flex items-center gap-1 text-[12px] whitespace-nowrap text-state">

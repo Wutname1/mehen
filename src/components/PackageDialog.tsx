@@ -1,18 +1,15 @@
 import { Check, ChevronRight, Link2, Pin, ShieldAlert } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import * as api from '../api'
-import { ECOSYSTEM_LABEL, POLICY_LABEL, compareVersions, displayVersion, reasonText, repoKey, samePath, type QueueRow, type QueueUsage } from '../derive'
+import { ECOSYSTEM_LABEL, POLICY_LABEL, compareVersions, displayVersion, holdLine, reasonText, repoKey, samePath, type QueueRow, type QueueUsage } from '../derive'
 import type { Hold, Move, Project, Requirement, VersionPolicy, VersionView } from '../types'
 import { cx } from './bits'
 import { Select } from './controls'
 import { Button, Dialog } from './Dialog'
 import { EcoIcon } from './EcoIcon'
 
-/** `22` for 22.1.0, `0.15` for 0.15.1: the line inside which updates should not break anything. */
-const lineOf = (version: string) => {
-  const [major, minor] = version.replace(/^[^\d]+/, '').split(/[.-]/)
-  return major === '0' && minor ? `0.${minor}` : major
-}
+/** The line inside which updates should not break anything. */
+const lineOf = holdLine
 
 const DAY = 86_400_000
 
@@ -30,6 +27,8 @@ function requirementLines(r: Requirement): string[] {
   switch (r.kind) {
     case 'peers':
       return r.peers.map(([name, range]) => `${name} ${range}`)
+    case 'crates':
+      return r.deps.map(([name, req]) => `${name} ${req}`)
     case 'node':
       return [`Node ${r.range}`]
     case 'rust':

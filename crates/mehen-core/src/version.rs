@@ -9,25 +9,54 @@ use crate::model::Status;
 pub struct Version {
     pub parts: Vec<u64>,
     pub prerelease: bool,
+    /// The prerelease identifiers: `["rc", "22"]` for `2.0.0-rc.22`.
+    pub pre: Vec<String>,
 }
 
 impl Version {
     pub fn parse(raw: &str) -> Option<Self> {
         let s = raw.trim().trim_start_matches(['v', 'V']);
-        let (core, prerelease) = match s.find(['-', '+']) {
-            Some(i) => (&s[..i], s[i..].starts_with('-')),
-            None => (s, false),
+        let (core, prerelease, pre) = match s.find(['-', '+']) {
+            Some(i) if s[i..].starts_with('-') => {
+                let tag = s[i + 1..].split('+').next().unwrap_or_default();
+                (&s[..i], true, tag.split('.').map(str::to_string).collect())
+            }
+            Some(i) => (&s[..i], false, Vec::new()),
+            None => (s, false, Vec::new()),
         };
         if core.is_empty() {
             return None;
         }
         let parts = core.split('.').map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>()?;
-        Some(Self { parts, prerelease })
+        Some(Self { parts, prerelease, pre })
     }
 
     pub fn part(&self, i: usize) -> u64 {
         self.parts.get(i).copied().unwrap_or(0)
     }
+
+    /// The part a breaking release bumps: the major, or for 0.x the first
+    /// part that is not zero (`0.13` breaks at the minor, `0.0.9` at the patch).
+    fn breaking_part(&self) -> usize {
+        self.parts.iter().position(|p| *p != 0).unwrap_or(self.parts.len().saturating_sub(1)).min(2)
+    }
+}
+
+/// Semver's rule for prerelease tags: numbers compare as numbers and sort
+/// before words, and a shorter tag sorts first when the rest is equal.
+fn compare_pre(a: &[String], b: &[String]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 impl Ord for Version {
@@ -40,8 +69,21 @@ impl Ord for Version {
             }
         }
         // A prerelease sorts before its release.
-        other.prerelease.cmp(&self.prerelease)
+        match (self.prerelease, other.prerelease) {
+            (true, true) => compare_pre(&self.pre, &other.pre),
+            (a, b) => b.cmp(&a),
+        }
     }
+}
+
+/// The release line `version` is on, as far as breaking changes go: `9` for
+/// 9.4.1, `0.13` for 0.13.4, and `0.0.9` for 0.0.9, where every release can
+/// break. The same lines Cargo and npm's `^` keep to.
+pub fn release_line(version: &str) -> Option<String> {
+    let digits = version.trim().trim_start_matches(|c: char| !c.is_ascii_digit());
+    let v = Version::parse(digits)?;
+    let upto = v.breaking_part().min(v.parts.len() - 1);
+    Some(v.parts[..=upto].iter().map(u64::to_string).collect::<Vec<_>>().join("."))
 }
 
 impl PartialOrd for Version {
@@ -63,12 +105,16 @@ pub fn max_version<'a>(versions: impl IntoIterator<Item = &'a str>) -> Option<St
         .map(|(_, raw)| raw.to_string())
 }
 
-/// Newest stable version on the same release line as `current` - same major,
-/// or same minor for 0.x, where minor bumps are the breaking ones. `None`
-/// when nothing newer exists on that line.
+/// Newest stable version on the same release line as `current` (see
+/// [`release_line`]). `None` when nothing newer exists on that line, and for
+/// a prerelease, which promises nothing about the next release.
 pub fn safe_target(current: &str, versions: &[String]) -> Option<String> {
     let c = Version::parse(current)?;
-    let same_line = |v: &Version| if c.part(0) == 0 { v.part(0) == 0 && v.part(1) == c.part(1) } else { v.part(0) == c.part(0) };
+    if c.prerelease {
+        return None;
+    }
+    let upto = c.breaking_part();
+    let same_line = |v: &Version| (0..=upto).all(|i| v.part(i) == c.part(i));
     versions
         .iter()
         .filter_map(|raw| Version::parse(raw).map(|v| (v, raw)))
@@ -78,9 +124,13 @@ pub fn safe_target(current: &str, versions: &[String]) -> Option<String> {
 }
 
 /// Newest stable version with the same major and minor as `current`: bug
-/// fixes only. `None` when nothing newer exists on that line.
+/// fixes only. `None` when nothing newer exists on that line, and for 0.0.x
+/// or a prerelease, where no release is only a bug fix.
 pub fn patch_target(current: &str, versions: &[String]) -> Option<String> {
     let c = Version::parse(current)?;
+    if c.prerelease || c.breaking_part() >= 2 {
+        return None;
+    }
     versions
         .iter()
         .filter_map(|raw| Version::parse(raw).map(|v| (v, raw)))
@@ -91,25 +141,37 @@ pub fn patch_target(current: &str, versions: &[String]) -> Option<String> {
 
 /// Compares only as precisely as `current` was written, so a floating `v7`
 /// tag counts as up to date against `7.0.1`, and `1.2` against `1.2.9`.
+/// Levels follow [`release_line`], so 0.12 to 0.13 is a major move, and so
+/// is any move off a prerelease.
 pub fn compare(current: &str, latest: &str) -> Status {
     let (Some(c), Some(l)) = (Version::parse(current), Version::parse(latest)) else {
         return Status::Unknown;
     };
-    let precision = c.parts.len();
-    for i in 0..precision {
+    let shift = c.breaking_part();
+    for i in 0..c.parts.len() {
         match c.part(i).cmp(&l.part(i)) {
-            Ordering::Less => {
-                return match i {
-                    0 => Status::Major,
-                    1 => Status::Minor,
-                    _ => Status::Patch,
-                };
-            }
+            Ordering::Less if c.prerelease || i <= shift => return Status::Major,
+            Ordering::Less if i == shift + 1 => return Status::Minor,
+            Ordering::Less => return Status::Patch,
             Ordering::Greater => return Status::UpToDate,
             Ordering::Equal => {}
         }
     }
+    if c.prerelease && c < l {
+        return Status::Major;
+    }
     Status::UpToDate
+}
+
+/// Where a prerelease can go: the newest stable release past it, else the
+/// newest prerelease past it. `None` for a stable `current`, which is never
+/// moved onto a prerelease.
+pub fn prerelease_target<'a>(current: &str, versions: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let c = Version::parse(current)?;
+    if !c.prerelease {
+        return None;
+    }
+    max_version(versions.into_iter().filter(|v| Version::parse(v).is_some_and(|v| v > c)))
 }
 
 /// Pulls a concrete version out of a range spec: `^18.2.0` -> `18.2.0`,
@@ -152,6 +214,33 @@ mod tests {
         assert_eq!(safe_target("4.9.2", &versions), None);
         assert_eq!(safe_target("0.3.1", &versions).as_deref(), Some("0.3.9"));
         assert_eq!(safe_target("5.0.0", &versions), None);
+    }
+
+    #[test]
+    fn leading_zeros_move_the_breaking_part() {
+        assert_eq!(compare("0.12.28", "0.13.5"), Status::Major);
+        assert_eq!(compare("0.12.28", "0.12.30"), Status::Minor);
+        assert_eq!(compare("0.0.9", "0.0.12"), Status::Major);
+        assert_eq!(release_line("0.0.9").as_deref(), Some("0.0.9"));
+        assert_eq!(release_line("^0.13.4").as_deref(), Some("0.13"));
+        assert_eq!(release_line("9.4.1").as_deref(), Some("9"));
+        let versions: Vec<String> = ["0.0.10", "0.0.12", "0.1.0"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(safe_target("0.0.9", &versions), None);
+        assert_eq!(patch_target("0.0.9", &versions), None);
+    }
+
+    #[test]
+    fn prereleases_order_by_their_tags() {
+        assert!(Version::parse("2.0.0-rc.25").unwrap() > Version::parse("2.0.0-rc.22").unwrap());
+        assert!(Version::parse("2.0.0-rc.10").unwrap() > Version::parse("2.0.0-rc.9").unwrap());
+        assert!(Version::parse("2.0.0-rc.1").unwrap() > Version::parse("2.0.0-beta.4").unwrap());
+        assert!(Version::parse("2.0.0-alpha.1").unwrap() > Version::parse("2.0.0-alpha").unwrap());
+        assert_eq!(compare("2.0.0-rc.22", "2.0.0-rc.25"), Status::Major);
+        assert_eq!(compare("2.0.0-rc.22", "2.0.0-rc.22"), Status::UpToDate);
+        let versions = ["1.0.5", "2.0.0-rc.21", "2.0.0-rc.22", "2.0.0-rc.25"];
+        assert_eq!(prerelease_target("2.0.0-rc.22", versions).as_deref(), Some("2.0.0-rc.25"));
+        assert_eq!(prerelease_target("2.0.0-rc.22", ["1.0.5", "2.0.0-rc.25", "2.0.0"]).as_deref(), Some("2.0.0"));
+        assert_eq!(prerelease_target("1.0.5", versions), None);
     }
 
     #[test]

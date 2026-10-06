@@ -19,6 +19,8 @@ pub enum Requirement {
     Node { range: String },
     /// npm: `peerDependencies`, packages this version expects the project to already have.
     Peers { peers: Vec<(String, String)> },
+    /// Cargo: the crates this version depends on (not dev-only), by name and requirement.
+    Crates { deps: Vec<(String, String)> },
     /// PyPI: the `requires-python` specifier.
     Python { range: String },
     /// Pub: the `environment: sdk:` constraint.
@@ -59,6 +61,13 @@ pub fn failures(requirement: &Requirement, env: &ProjectEnv) -> Vec<(String, Str
                 (!semver_satisfies(have, range)).then(|| (format!("peer:{name}"), format!("needs {name} {}; this project has {have}", range.trim())))
             })
             .collect(),
+        Requirement::Crates { deps } => deps
+            .iter()
+            .filter_map(|(name, req)| {
+                let have = env.installed.get(name)?;
+                (!crate_fits(have, req)).then(|| (format!("peer:{name}"), format!("needs {name} {}; this project has {have}", req.trim())))
+            })
+            .collect(),
         other => {
             let key = match other {
                 Requirement::Frameworks { .. } => "frameworks",
@@ -68,7 +77,7 @@ pub fn failures(requirement: &Requirement, env: &ProjectEnv) -> Vec<(String, Str
                 Requirement::Dart { .. } => "dart",
                 Requirement::Php { .. } => "php",
                 Requirement::Ruby { .. } => "ruby",
-                Requirement::Peers { .. } => unreachable!(),
+                Requirement::Peers { .. } | Requirement::Crates { .. } => unreachable!(),
             };
             check(other, env).err().map(|reason| (key.to_string(), reason)).into_iter().collect()
         }
@@ -101,6 +110,16 @@ pub fn check(requirement: &Requirement, env: &ProjectEnv) -> Result<(), String> 
                 if let Some(have) = env.installed.get(name) {
                     if !semver_satisfies(have, range) {
                         return Err(format!("needs {name} {}; this project has {have}", range.trim()));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Requirement::Crates { deps } => {
+            for (name, req) in deps {
+                if let Some(have) = env.installed.get(name) {
+                    if !crate_fits(have, req) {
+                        return Err(format!("needs {name} {}; this project has {have}", req.trim()));
                     }
                 }
             }
@@ -139,6 +158,15 @@ pub fn node_satisfies(version: &str, range: &str) -> bool {
         (Some(v), Ok(r)) => v.satisfies(&r),
         _ => true,
     }
+}
+
+/// Whether a crate at `version` can sit beside a package that asks for `req`
+/// of it. Cargo keeps one copy per release line, so only a requirement on the
+/// same line as `version` has to be met; one on another line gets a copy of
+/// its own. Unparseable input counts as yes.
+pub fn crate_fits(version: &str, req: &str) -> bool {
+    let (Ok(v), Ok(r)) = (semver::Version::parse(version.trim()), semver::VersionReq::parse(req)) else { return true };
+    r.matches(&v) || crate::version::from_spec(req).and_then(|f| crate::version::release_line(&f)) != crate::version::release_line(version)
 }
 
 /// Does an npm `version` fall inside an npm `range`? Unparseable input counts as yes.

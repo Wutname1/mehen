@@ -17,11 +17,19 @@ pub struct Pkg {
     pub versions: Vec<String>,
     /// The peer ranges each version asks for, only for the project's own packages.
     pub peers: HashMap<String, Vec<(String, String)>>,
+    /// A crate: ranges on it are Cargo requirements, and only bind on its own
+    /// release line (see [`crate::compat::crate_fits`]).
+    pub cargo: bool,
 }
 
 impl Pkg {
     fn peers_of(&self, version: &str) -> &[(String, String)] {
         self.peers.get(version).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Whether this package at `version` meets a range another package puts on it.
+    fn meets(&self, version: &str, range: &str) -> bool {
+        if self.cargo { crate::compat::crate_fits(version, range) } else { semver_satisfies(version, range) }
     }
 }
 
@@ -54,7 +62,7 @@ pub fn settle(seed: &str, version: &str, pkgs: &HashMap<String, Pkg>, allowed: &
     // Packages released in step with the seed (on the same line today, like a
     // framework's parts) follow it to its exact version, else its line, so
     // picking an older line does not drag the others up to the newest one.
-    let line = |v: &str| Version::parse(v).map(|p| if p.part(0) == 0 { (0, p.part(1)) } else { (p.part(0), 0) });
+    let line = |v: &str| crate::version::release_line(v);
     let seed_line = line(&pkgs[seed].current);
     let pick = |name: &str, fits: &dyn Fn(&str) -> bool| -> Option<String> {
         let versions = &pkgs[name].versions;
@@ -74,7 +82,7 @@ pub fn settle(seed: &str, version: &str, pkgs: &HashMap<String, Pkg>, allowed: &
             pkg.peers_of(&at)
                 .iter()
                 .filter(|(peer, _)| pkgs.contains_key(peer))
-                .find(|(peer, range)| !semver_satisfies(&version_of(peer, &moved), range))
+                .find(|(peer, range)| !pkgs[peer].meets(&version_of(peer, &moved), range))
                 .map(|(peer, range)| (owner.to_string(), peer.clone(), range.clone()))
         });
         let Some((owner, peer, range)) = conflict else {
@@ -84,10 +92,10 @@ pub fn settle(seed: &str, version: &str, pkgs: &HashMap<String, Pkg>, allowed: &
         // or the owner up to a version that accepts where the moved packages
         // are going. What else that version needs becomes the next conflict.
         let (name, pick) = if !moved.contains_key(&peer) {
-            let pick = pick(&peer, &|v| allowed(&peer, v) && semver_satisfies(v, &range));
+            let pick = pick(&peer, &|v| allowed(&peer, v) && pkgs[&peer].meets(v, &range));
             (peer, pick)
         } else {
-            let accepts = |v: &str| pkgs[&owner].peers_of(v).iter().filter(|(p, _)| moved.contains_key(p)).all(|(p, r)| semver_satisfies(&moved[p], r));
+            let accepts = |v: &str| pkgs[&owner].peers_of(v).iter().filter(|(p, _)| moved.contains_key(p)).all(|(p, r)| pkgs[p].meets(&moved[p], r));
             let pick = pick(&owner, &|v| allowed(&owner, v) && accepts(v));
             (owner, pick)
         };
@@ -104,11 +112,15 @@ pub fn settle(seed: &str, version: &str, pkgs: &HashMap<String, Pkg>, allowed: &
     None
 }
 
-/// Stable versions from `current` up, newest first, for `Pkg::versions`.
+/// Versions from `current` up, newest first, for `Pkg::versions`: stable
+/// ones, and prereleases too when `current` is one.
 pub fn candidates(current: &str, versions: &[String]) -> Vec<String> {
     let Some(floor) = Version::parse(current) else { return Vec::new() };
-    let mut out: Vec<(Version, String)> =
-        versions.iter().filter_map(|v| Version::parse(v).map(|p| (p, v.clone()))).filter(|(p, _)| !p.prerelease && *p >= floor).collect();
+    let mut out: Vec<(Version, String)> = versions
+        .iter()
+        .filter_map(|v| Version::parse(v).map(|p| (p, v.clone())))
+        .filter(|(p, _)| (!p.prerelease || floor.prerelease) && *p >= floor)
+        .collect();
     out.sort_by(|a, b| b.0.cmp(&a.0));
     out.into_iter().map(|(_, v)| v).collect()
 }
@@ -122,6 +134,7 @@ mod tests {
             current: current.into(),
             versions: versions.iter().map(|v| v.to_string()).collect(),
             peers: peers.iter().map(|(v, list)| (v.to_string(), list.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect())).collect(),
+            cargo: false,
         }
     }
 

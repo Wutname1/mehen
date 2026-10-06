@@ -1,7 +1,7 @@
 import { Check, ChevronRight, ShieldAlert } from 'lucide-react'
 import { useState } from 'react'
 import * as api from '../api'
-import { compareVersions, distinctVersions, displayVersion, normalizeSeverity, repoKey, vulnById, type QueueRow, type QueueUsage } from '../derive'
+import { compareVersions, distinctVersions, displayVersion, holdLine, normalizeSeverity, repoKey, vulnById, type QueueRow, type QueueUsage } from '../derive'
 import type { AffectedRange, Inventory } from '../types'
 import { cx } from './bits'
 import { Button, Dialog } from './Dialog'
@@ -22,11 +22,7 @@ function rangeText(range: AffectedRange): string {
   return from ? `${from} and later` : 'every version'
 }
 
-/** `15` for 15.1.3, `0.13` for 0.13.4. */
-const lineOf = (version: string) => {
-  const [major, minor] = version.replace(/^[^\d]+/, '').split('.')
-  return major === '0' && minor ? `0.${minor}` : major
-}
+const lineOf = holdLine
 
 /**
  * The advisories behind a vulnerable package. The newest release is the

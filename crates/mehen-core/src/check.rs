@@ -15,7 +15,7 @@ use crate::osv::{self, Query};
 use crate::registry::{self, PackageInfo};
 use crate::store::{self, Hold, Store};
 use crate::together;
-use crate::version::{Version, compare, from_spec, max_version, safe_target, patch_target};
+use crate::version::{Version, compare, from_spec, max_version, patch_target, prerelease_target, safe_target};
 
 const LOOKUP_CONCURRENCY: usize = 24;
 
@@ -127,12 +127,7 @@ pub async fn check(mut inventory: Inventory, store: &Store, options: CheckOption
     let toolchain = Toolchain::detect().await;
     let holds = store.holds();
     for project in &mut inventory.projects {
-        let installed: HashMap<String, String> = project
-            .dependencies
-            .iter()
-            .filter(|d| d.ecosystem == Ecosystem::Npm)
-            .filter_map(|d| d.current.clone().map(|c| (d.name.clone(), c)))
-            .collect();
+        let installed = installed_versions(project);
         let limits = peer_limits(project, &infos);
         let folder = project.repo.clone().unwrap_or_else(|| project.dir.clone());
         let env = project_env(project, installed, &toolchain);
@@ -271,7 +266,8 @@ fn reset(dep: &mut Dependency) {
 /// installed package's peer range, or the user keeping it on a release line.
 #[derive(Debug, Clone)]
 enum Limit {
-    Peer { owner: String, range: String },
+    /// `cargo` reads `range` as a Cargo requirement rather than an npm range.
+    Peer { owner: String, range: String, cargo: bool },
     Hold(Hold),
 }
 
@@ -287,26 +283,54 @@ impl Limit {
 
     fn check(&self, dep: &str, version: &str) -> Result<(), String> {
         match self {
-            Limit::Peer { owner, range } if !compat::semver_satisfies(version, range) => Err(format!("{owner} needs {dep} {}", range.trim())),
+            Limit::Peer { owner, range, cargo } if !fits(*cargo, version, range) => Err(format!("{owner} needs {dep} {}", range.trim())),
             Limit::Hold(h) if !h.allows(version) => Err(format!("kept on {}.x", h.line)),
             _ => Ok(()),
         }
     }
 }
 
-/// For each npm package, the peer ranges other installed packages put on it:
-/// `@mui/material 5.1.2` asking for `react ^17 || ^18` limits react.
+/// Whether `version` meets what another package asks for: an npm peer
+/// range, or for Cargo a dependency requirement (see [`compat::crate_fits`]).
+fn fits(cargo: bool, version: &str, range: &str) -> bool {
+    if cargo { compat::crate_fits(version, range) } else { compat::semver_satisfies(version, range) }
+}
+
+/// The version of each npm package or crate the project uses, by name, for
+/// checking what other packages ask of them.
+fn installed_versions(project: &Project) -> HashMap<String, String> {
+    project
+        .dependencies
+        .iter()
+        .filter(|d| matches!(d.ecosystem, Ecosystem::Npm | Ecosystem::Cargo))
+        .filter_map(|d| d.current.clone().map(|c| (d.name.clone(), c)))
+        .collect()
+}
+
+/// What a package version asks of the others beside it: npm peers, or the
+/// crates a crate depends on.
+fn asks(requirement: &Requirement) -> Option<(&[(String, String)], bool)> {
+    match requirement {
+        Requirement::Peers { peers } => Some((peers, false)),
+        Requirement::Crates { deps } => Some((deps, true)),
+        _ => None,
+    }
+}
+
+/// For each npm package or crate, the ranges other installed packages put on
+/// it: `@mui/material 5.1.2` asking for `react ^17 || ^18` limits react, and
+/// `tauri-specta 2.0.0-rc.21` asking for `specta =2.0.0-rc.22` limits specta.
 fn peer_limits(project: &Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>) -> HashMap<String, Vec<Limit>> {
     let mut limits: HashMap<String, Vec<Limit>> = HashMap::new();
-    for dep in project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm) {
-        let (Some(current), Some(Ok(info))) = (dep.current.as_deref(), infos.get(&(Ecosystem::Npm, dep.name.clone()))) else { continue };
+    for dep in project.dependencies.iter().filter(|d| matches!(d.ecosystem, Ecosystem::Npm | Ecosystem::Cargo)) {
+        let (Some(current), Some(Ok(info))) = (dep.current.as_deref(), infos.get(&(dep.ecosystem, dep.name.clone()))) else { continue };
         for (version, requirement) in &info.requirements {
             if version != current {
                 continue;
             }
-            if let Requirement::Peers { peers } = requirement {
-                for (name, range) in peers {
-                    limits.entry(name.clone()).or_default().push(Limit::Peer { owner: format!("{} {current}", dep.name), range: range.clone() });
+            if let Some((list, cargo)) = asks(requirement) {
+                for (name, range) in list {
+                    limits.entry(name.clone()).or_default().push(Limit::Peer { owner: format!("{} {current}", dep.name), range: range.clone(), cargo });
                 }
             }
         }
@@ -399,6 +423,12 @@ fn apply_info(dep: &mut Dependency, info: Option<&Result<PackageInfo, String>>, 
             dep.blocked_reason = Some(reason);
             dep.latest = max_version(usable_versions.iter().map(String::as_str));
         }
+    }
+
+    // A prerelease (often pinned exactly, like `=2.0.0-rc.22`) moves on to the
+    // next prerelease until a stable release passes it.
+    if let Some(next) = dep.current.as_deref().and_then(|c| prerelease_target(c, usable_versions.iter().map(String::as_str))) {
+        dep.latest = Some(next);
     }
 
     if dep.ecosystem == Ecosystem::GithubActions && is_commit_sha(&dep.requested) {
@@ -521,12 +551,11 @@ fn merge_aliases(vulns: Vec<Vulnerability>, inventory: &mut Inventory) -> Vec<Vu
 }
 
 /// Finds npm packages held back only because others must move with them
-/// (Angular's parts pin each other) and marks each group's members with
-/// where they go together. Holds and runtime limits (Node and the like)
-/// still count; peers are what the search works out.
-/// What the group search needs about a project's npm packages: each one's
-/// versions and peers, and everything else its versions require.
+/// What the group search needs about a project's npm packages or crates:
+/// each one's versions and what they ask of each other (npm peers, or the
+/// crates a crate depends on), and everything else its versions require.
 struct GroupInputs<'a> {
+    ecosystem: Ecosystem,
     pkgs: HashMap<String, together::Pkg>,
     other_reqs: HashMap<String, HashMap<String, Vec<&'a Requirement>>>,
 }
@@ -534,44 +563,55 @@ struct GroupInputs<'a> {
 impl GroupInputs<'_> {
     /// Everything besides peers: holds, Node and the like.
     fn allowed(&self, name: &str, version: &str, env: &ProjectEnv, holds: &[&Hold]) -> bool {
-        holds.iter().filter(|h| h.name == name && h.ecosystem == Ecosystem::Npm).all(|h| h.allows(version))
+        holds.iter().filter(|h| h.name == name && h.ecosystem == self.ecosystem).all(|h| h.allows(version))
             && self.other_reqs.get(name).and_then(|m| m.get(version)).into_iter().flatten().all(|r| compat::check(r, env).is_ok())
     }
 }
 
-fn group_inputs<'a>(project: &Project, infos: &'a HashMap<(Ecosystem, String), Result<PackageInfo, String>>) -> GroupInputs<'a> {
-    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
-    let own: HashSet<&str> = npm.iter().map(|d| d.name.as_str()).collect();
-    let mut inputs = GroupInputs { pkgs: HashMap::new(), other_reqs: HashMap::new() };
-    for dep in &npm {
-        let Some(Ok(info)) = infos.get(&(Ecosystem::Npm, dep.name.clone())) else { continue };
+/// Packages and crates that can move together; other ecosystems move one at a time.
+fn groups_by(ecosystem: Ecosystem) -> bool {
+    matches!(ecosystem, Ecosystem::Npm | Ecosystem::Cargo)
+}
+
+fn group_inputs<'a>(project: &Project, infos: &'a HashMap<(Ecosystem, String), Result<PackageInfo, String>>, ecosystem: Ecosystem) -> GroupInputs<'a> {
+    let deps: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == ecosystem && d.status != Status::Local && d.current.is_some()).collect();
+    let own: HashSet<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+    let mut inputs = GroupInputs { ecosystem, pkgs: HashMap::new(), other_reqs: HashMap::new() };
+    for dep in &deps {
+        let Some(Ok(info)) = infos.get(&(ecosystem, dep.name.clone())) else { continue };
         let current = dep.current.clone().unwrap_or_default();
         let versions = together::candidates(&current, &info.versions);
         let wanted: HashSet<&str> = versions.iter().map(String::as_str).collect();
         let mut peers: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (version, requirement) in info.requirements.iter().filter(|(v, _)| wanted.contains(v.as_str())) {
-            match requirement {
-                Requirement::Peers { peers: list } => {
+            match asks(requirement) {
+                Some((list, _)) => {
                     peers.entry(version.clone()).or_default().extend(list.iter().filter(|(n, _)| own.contains(n.as_str())).cloned());
                 }
-                other => inputs.other_reqs.entry(dep.name.clone()).or_default().entry(version.clone()).or_default().push(other),
+                None => inputs.other_reqs.entry(dep.name.clone()).or_default().entry(version.clone()).or_default().push(requirement),
             }
         }
-        inputs.pkgs.insert(dep.name.clone(), together::Pkg { current, versions, peers });
+        inputs.pkgs.insert(dep.name.clone(), together::Pkg { current, versions, peers, cargo: ecosystem == Ecosystem::Cargo });
     }
     inputs
 }
 
 fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, env: &ProjectEnv, holds: &[&Hold]) {
-    if !project.dependencies.iter().any(|d| d.ecosystem == Ecosystem::Npm && d.newest.is_some()) {
+    for ecosystem in [Ecosystem::Npm, Ecosystem::Cargo] {
+        set_groups_in(project, infos, env, holds, ecosystem);
+    }
+}
+
+fn set_groups_in(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>, env: &ProjectEnv, holds: &[&Hold], ecosystem: Ecosystem) {
+    if !project.dependencies.iter().any(|d| d.ecosystem == ecosystem && d.newest.is_some()) {
         return;
     }
-    let inputs = group_inputs(project, infos);
+    let inputs = group_inputs(project, infos, ecosystem);
     let pkgs = &inputs.pkgs;
     let allowed = |name: &str, version: &str| inputs.allowed(name, version, env, holds);
-    let npm: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm && d.status != Status::Local && d.current.is_some()).collect();
+    let own: Vec<&Dependency> = project.dependencies.iter().filter(|d| d.ecosystem == ecosystem && d.status != Status::Local && d.current.is_some()).collect();
 
-    let mut seeds: Vec<&str> = npm.iter().filter(|d| d.newest.is_some()).map(|d| d.name.as_str()).collect();
+    let mut seeds: Vec<&str> = own.iter().filter(|d| d.newest.is_some()).map(|d| d.name.as_str()).collect();
     seeds.sort();
     seeds.dedup();
     let mut groups: Vec<(String, BTreeMap<String, String>)> = Vec::new();
@@ -592,7 +632,7 @@ fn set_groups(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result
             None => groups.push((seed.to_string(), found)),
         }
     }
-    for dep in project.dependencies.iter_mut().filter(|d| d.ecosystem == Ecosystem::Npm) {
+    for dep in project.dependencies.iter_mut().filter(|d| d.ecosystem == ecosystem) {
         if let Some((lead, group)) = groups.iter().find(|(_, g)| g.contains_key(&dep.name)) {
             dep.group = Some(lead.clone());
             dep.group_target = group.get(&dep.name).cloned();
@@ -636,7 +676,7 @@ pub struct ProjectContext {
 pub async fn project_context(store: &Store, project: &Project) -> ProjectContext {
     let infos: HashMap<(Ecosystem, String), Result<PackageInfo, String>> =
         project.dependencies.iter().filter_map(|d| store.package_any_age(d.ecosystem, &d.name).map(|info| ((d.ecosystem, d.name.clone()), Ok(info)))).collect();
-    let installed: HashMap<String, String> = project.dependencies.iter().filter(|d| d.ecosystem == Ecosystem::Npm).filter_map(|d| d.current.clone().map(|c| (d.name.clone(), c))).collect();
+    let installed = installed_versions(project);
     let toolchain = Toolchain::detect().await;
     let folder = project.repo.clone().unwrap_or_else(|| project.dir.clone());
     ProjectContext { env: project_env(project, installed, &toolchain), limits: peer_limits(project, &infos), holds: store.holds(), folder, infos, project: project.clone() }
@@ -652,7 +692,7 @@ impl ProjectContext {
         let usable = verdict(dep, info, &self.env, &limits);
         // A version that only clashes with packages that can move too is fine,
         // as long as a set of versions fits together.
-        let inputs = (dep.ecosystem == Ecosystem::Npm).then(|| group_inputs(&self.project, &self.infos));
+        let inputs = groups_by(dep.ecosystem).then(|| group_inputs(&self.project, &self.infos, dep.ecosystem));
         let installed = dep.current.as_deref().and_then(Version::parse);
         let mut requirements: HashMap<&str, Vec<Requirement>> = HashMap::new();
         for (v, r) in &info.requirements {
@@ -693,10 +733,10 @@ impl ProjectContext {
     pub fn move_with(&self, name: &str, version: &str) -> Result<Vec<Move>, String> {
         let dep = self.project.dependencies.iter().find(|d| d.name == name).ok_or_else(|| format!("{name} is not in {}", self.project.name))?;
         let from = |n: &str| self.project.dependencies.iter().find(|d| d.name == n).and_then(|d| d.current.clone()).unwrap_or_default();
-        if dep.ecosystem != Ecosystem::Npm {
+        if !groups_by(dep.ecosystem) {
             return Ok(vec![Move { name: name.to_string(), from: from(name), to: version.to_string() }]);
         }
-        self.settle(&group_inputs(&self.project, &self.infos), name, version)
+        self.settle(&group_inputs(&self.project, &self.infos, dep.ecosystem), name, version)
     }
 
     fn settle(&self, inputs: &GroupInputs, name: &str, version: &str) -> Result<Vec<Move>, String> {
@@ -963,7 +1003,7 @@ mod tests {
     #[test]
     fn an_installed_package_caps_its_peer() {
         let mut react = npm_dep("react", "18.2.0");
-        let limits = [Limit::Peer { owner: "@mui/material 5.1.2".into(), range: "^17.0.0 || ^18.0.0".into() }];
+        let limits = [Limit::Peer { owner: "@mui/material 5.1.2".into(), range: "^17.0.0 || ^18.0.0".into(), cargo: false }];
         apply_info(&mut react, Some(&Ok(npm_info(&["18.2.0", "18.3.1", "19.1.0"], &[]))), &ProjectEnv::default(), &limits);
         assert_eq!(react.latest.as_deref(), Some("18.3.1"));
         assert_eq!(react.newest.as_deref(), Some("19.1.0"));
@@ -1008,6 +1048,96 @@ mod tests {
         assert_eq!(react.len(), 1, "only the installed 5.1.2 limits react, not 7.0.0");
         assert!(react[0].check("react", "19.0.0").is_err());
         assert!(react[0].check("react", "18.3.1").is_ok());
+    }
+
+    fn crate_info(versions: &[(&str, &[(&str, &str)])]) -> PackageInfo {
+        let names: Vec<String> = versions.iter().map(|(v, _)| v.to_string()).collect();
+        PackageInfo {
+            latest: max_version(names.iter().map(String::as_str)),
+            versions: names,
+            tags: Vec::new(),
+            requirements: versions
+                .iter()
+                .filter(|(_, deps)| !deps.is_empty())
+                .map(|(v, deps)| (v.to_string(), Requirement::Crates { deps: deps.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect() }))
+                .collect(),
+        }
+    }
+
+    fn crate_dep(name: &str, requested: &str, locked: &str) -> Dependency {
+        let mut dep = Dependency::new(name, Ecosystem::Cargo, DepKind::Normal, requested);
+        dep.installed = Some(locked.into());
+        reset(&mut dep);
+        dep
+    }
+
+    /// Runs the part of a check that works from registry answers.
+    fn settle_project(project: &mut Project, infos: &HashMap<(Ecosystem, String), Result<PackageInfo, String>>) {
+        let env = ProjectEnv { installed: installed_versions(project), ..Default::default() };
+        let limits = peer_limits(project, infos);
+        for dep in &mut project.dependencies {
+            let own = limits_for(dep, &limits, &[], "");
+            apply_info(dep, infos.get(&(dep.ecosystem, dep.name.clone())), &env, &own);
+        }
+        set_groups(project, infos, &env, &[]);
+    }
+
+    #[test]
+    fn crates_that_pin_each_other_move_together() {
+        let mut project = Project {
+            id: "p".into(),
+            name: "p".into(),
+            ecosystem: Ecosystem::Cargo,
+            dir: "C:\\app".into(),
+            manifest: "C:\\app\\Cargo.toml".into(),
+            repo: None,
+            frameworks: Vec::new(),
+            rust_version: None,
+            node_version: None,
+            node_engines: None,
+            python_version: None,
+            php_version: None,
+            dependencies: vec![
+                crate_dep("specta", "=2.0.0-rc.22", "2.0.0-rc.22"),
+                crate_dep("specta-typescript", "0.0.9", "0.0.9"),
+                crate_dep("tauri-specta", "=2.0.0-rc.21", "2.0.0-rc.21"),
+                crate_dep("rand", "0.8", "0.8.5"),
+            ],
+        };
+        let mut infos = HashMap::new();
+        infos.insert((Ecosystem::Cargo, "specta".to_string()), Ok(crate_info(&[("1.0.5", &[]), ("2.0.0-rc.22", &[]), ("2.0.0-rc.25", &[])])));
+        infos.insert(
+            (Ecosystem::Cargo, "specta-typescript".to_string()),
+            Ok(crate_info(&[("0.0.9", &[("specta", "=2.0.0-rc.22")]), ("0.0.12", &[("specta", "=2.0.0-rc.25")])])),
+        );
+        infos.insert(
+            (Ecosystem::Cargo, "tauri-specta".to_string()),
+            Ok(crate_info(&[
+                ("2.0.0-rc.21", &[("specta", "=2.0.0-rc.22"), ("specta-typescript", "^0.0.9")]),
+                ("2.0.0-rc.25", &[("specta", "=2.0.0-rc.25"), ("specta-typescript", "^0.0.12"), ("rand", "^0.9")]),
+            ])),
+        );
+        infos.insert((Ecosystem::Cargo, "rand".to_string()), Ok(crate_info(&[("0.8.5", &[]), ("0.9.1", &[])])));
+        settle_project(&mut project, &infos);
+
+        let dep = |name: &str| project.dependencies.iter().find(|d| d.name == name).unwrap();
+        assert_eq!(dep("specta-typescript").newest.as_deref(), Some("0.0.12"));
+        assert_eq!(dep("specta-typescript").blocked_reason.as_deref(), Some("needs specta =2.0.0-rc.25; this project has 2.0.0-rc.22"));
+        for (name, to) in [("specta", "2.0.0-rc.25"), ("specta-typescript", "0.0.12"), ("tauri-specta", "2.0.0-rc.25")] {
+            assert_eq!(dep(name).group.as_deref(), Some("specta-typescript"), "{name} is in the group");
+            assert_eq!(dep(name).group_target.as_deref(), Some(to), "{name} goes to {to}");
+        }
+        // A crate on another release line gets its own copy, so it is not dragged along.
+        assert_eq!(dep("rand").group, None);
+        assert_eq!(dep("rand").status, Status::Major);
+    }
+
+    #[test]
+    fn a_pinned_prerelease_is_offered_the_next_prerelease() {
+        let mut dep = crate_dep("specta", "=2.0.0-rc.22", "2.0.0-rc.22");
+        apply_info(&mut dep, Some(&Ok(crate_info(&[("1.0.5", &[]), ("2.0.0-rc.22", &[]), ("2.0.0-rc.25", &[])]))), &ProjectEnv::default(), &[]);
+        assert_eq!(dep.latest.as_deref(), Some("2.0.0-rc.25"));
+        assert_eq!(dep.status, Status::Major);
     }
 }
 

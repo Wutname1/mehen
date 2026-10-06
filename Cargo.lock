@@ -2470,6 +2470,7 @@ dependencies = [
  "reqwest",
  "roxmltree",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "similar",

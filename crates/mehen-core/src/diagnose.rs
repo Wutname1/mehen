@@ -49,12 +49,7 @@ struct Finding {
     text: Option<String>,
 }
 
-/// `9` for 9.4.1, `0.13` for 0.13.4 (where minor releases break).
-pub fn release_line(version: &str) -> Option<String> {
-    let digits = version.trim().trim_start_matches(|c: char| !c.is_ascii_digit());
-    let v = Version::parse(digits)?;
-    Some(if v.part(0) == 0 { format!("0.{}", v.part(1)) } else { v.part(0).to_string() })
-}
+pub use crate::version::release_line;
 
 /// The ecosystem a step's program works on.
 pub fn ecosystem_of(program: &str) -> Option<Ecosystem> {
@@ -414,6 +409,14 @@ npm ERR! Conflicting peer dependency: @typescript-eslint/parser@7.18.0"#;
         let c = diagnose(output, false, Ecosystem::Cargo, &[change("windows-sys", "0.52.0", "0.59.0")]);
         assert_eq!(c[0].summary, "No version of windows-sys fits both this project and mio 1.0.2");
         assert_eq!(c[0].keep.as_ref().unwrap().line, "0.52");
+    }
+
+    #[test]
+    fn a_0_0_x_update_that_needs_a_newer_crate_keeps_the_update() {
+        let output = "error: failed to select a version for `specta`.\n    ... required by package `specta-typescript v0.0.12`\n    ... which satisfies dependency `specta-typescript = \"^0.0.12\"` of package `gitwyrm v0.0.0`\nversions that meet the requirements `=2.0.0-rc.25` are: 2.0.0-rc.25";
+        let c = diagnose(output, false, Ecosystem::Cargo, &[change("specta-typescript", "0.0.9", "0.0.12")]);
+        let keep = c[0].keep.as_ref().expect("0.0.9 to 0.0.12 leaves its line");
+        assert_eq!((keep.name.as_str(), keep.line.as_str()), ("specta-typescript", "0.0.9"));
     }
 
     #[test]

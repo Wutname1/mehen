@@ -98,31 +98,52 @@ export function groupPackages(inventory: Inventory): PackageGroup[] {
   return [...groups.values()]
 }
 
-export function compareVersions(a: string, b: string): number {
-  const parse = (v: string) => v.replace(/^v/i, '').split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0)
-  const pa = parse(a)
-  const pb = parse(b)
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+/** `2.0.0-rc.22` -> parts [2, 0, 0], pre ['rc', '22']; a spec like `^1.2` is read as its version. */
+function parseVersion(v: string): { parts: number[]; pre: string[] | null } {
+  const s = v.trim().replace(/^[^\d]+/, '')
+  const dash = s.search(/[-+]/)
+  const core = dash < 0 ? s : s.slice(0, dash)
+  const pre = dash >= 0 && s[dash] === '-' ? s.slice(dash + 1).split('+')[0].split('.') : null
+  return { parts: core.split('.').map((p) => Number.parseInt(p, 10) || 0), pre }
+}
+
+/** Semver's prerelease order: none sorts last, numbers before words, shorter first. */
+function comparePre(a: string[] | null, b: string[] | null): number {
+  if (!a || !b) return a ? -1 : b ? 1 : 0
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const [x, y] = [/^\d+$/.test(a[i]), /^\d+$/.test(b[i])]
+    const d = x && y ? Number(a[i]) - Number(b[i]) : x !== y ? (x ? -1 : 1) : a[i] < b[i] ? -1 : a[i] > b[i] ? 1 : 0
     if (d !== 0) return d
   }
-  return 0
+  return a.length - b.length
 }
+
+export function compareVersions(a: string, b: string): number {
+  const [pa, pb] = [parseVersion(a), parseVersion(b)]
+  for (let i = 0; i < Math.max(pa.parts.length, pb.parts.length); i++) {
+    const d = (pa.parts[i] ?? 0) - (pb.parts[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return comparePre(pa.pre, pb.pre)
+}
+
+/** The part a breaking release bumps: the major, or for 0.x the first part that is not zero. */
+const breakingPart = (parts: number[]) => Math.min(parts.findIndex((p) => p !== 0) < 0 ? parts.length - 1 : parts.findIndex((p) => p !== 0), 2, parts.length - 1)
 
 /**
  * True when `current` is older than `target`, compared only as precisely as
  * `current` is written: a floating `v7` is not behind `v7.0.1`.
  */
 export function isBehind(current: string, target: string): boolean {
-  const parse = (v: string) => v.replace(/^v/i, '').split('-')[0].split('.').map((p) => Number.parseInt(p, 10))
-  const c = parse(current)
-  const t = parse(target)
+  const raw = (v: string) => v.replace(/^v/i, '').split(/[-+]/)[0].split('.').map((p) => Number.parseInt(p, 10))
+  const c = raw(current)
+  const t = raw(target)
   if (c.some(Number.isNaN) || t.some(Number.isNaN)) return false
   for (let i = 0; i < c.length; i++) {
     const d = c[i] - (t[i] ?? 0)
     if (d !== 0) return d < 0
   }
-  return false
+  return !!parseVersion(current).pre && compareVersions(current, target) < 0
 }
 
 /** Default commit message for an update, conventional-commit style. */
@@ -274,11 +295,13 @@ function levelTarget(dep: Dependency, policy: VersionPolicy): string | null {
 /** How big the jump from `current` to `target` is. */
 export function bumpOf(current: string, target: string): Exclude<Risk, 'security'> {
   // Tolerates a written spec like `^5.1.2` or `>=5` as well as a version.
-  const parse = (v: string) => v.replace(/^[^\d]+/, '').split(/[.-]/).map((p) => Number.parseInt(p, 10) || 0)
-  const [c, t] = [parse(current), parse(target)]
-  if ((t[0] ?? 0) !== (c[0] ?? 0)) return 'major'
-  if ((t[1] ?? 0) !== (c[1] ?? 0)) return 'minor'
-  return 'patch'
+  // Levels follow `holdLine`: 0.12 to 0.13 is major, and so is leaving a prerelease.
+  const [c, t] = [parseVersion(current), parseVersion(target)]
+  if (c.pre && compareVersions(current, target) !== 0) return 'major'
+  const shift = breakingPart(c.parts)
+  const at = Array.from({ length: Math.max(c.parts.length, t.parts.length) }, (_, i) => i).find((i) => (c.parts[i] ?? 0) !== (t.parts[i] ?? 0))
+  if (at === undefined) return t.pre ? 'major' : 'patch'
+  return at <= shift ? 'major' : at === shift + 1 ? 'minor' : 'patch'
 }
 
 export function riskOf(usages: { dep: Dependency; target?: string }[]): Risk {
@@ -402,10 +425,10 @@ export function projectTypes(projects: Project[]): ProjectType[] {
   return (Object.keys(PROJECT_TYPE_LABEL) as ProjectType[]).filter((t) => types.has(t))
 }
 
-/** The release line a version sits on: `5` for 5.1.2, `0.13` for 0.13.4 (where minors break). */
+/** The release line a version sits on: `5` for 5.1.2, `0.13` for 0.13.4, `0.0.9` for 0.0.9 (where every release can break). */
 export function holdLine(version: string): string {
-  const parts = version.replace(/^v/i, '').split(/[.-]/)
-  return parts[0] === '0' && parts[1] ? `0.${parts[1]}` : parts[0]
+  const { parts } = parseVersion(version)
+  return parts.slice(0, breakingPart(parts) + 1).join('.')
 }
 
 /** A package an update left behind after it broke the project, and what went in instead. */
@@ -445,7 +468,7 @@ export function withoutCulprits(targets: { project: Project; changes: Change[] }
       changes: t.changes.flatMap((c) => {
         const dep = t.project.dependencies.find((d) => lower(d.name) === lower(c.name))
         const from = dep?.current ?? bare(c.from)
-        const leaves = holdLine(from) !== holdLine(bare(c.to))
+        const leaves = bumpOf(from, bare(c.to)) === 'major'
         const own = culpritOf(c.name)
         const mate = own ? null : partner(c.name)
         // Only an update that leaves its line is held back.
@@ -460,6 +483,78 @@ export function withoutCulprits(targets: { project: Project; changes: Change[] }
     }))
     .filter((t) => t.changes.length > 0)
   return changed && next.length ? { targets: next, fallbacks } : null
+}
+
+/** One package's update across a repository's projects, with the packages that only move with it. */
+export interface UpdateUnit {
+  key: string
+  /** A breaking move (see `bumpOf`), tried on its own so it can only hold back itself. */
+  major: boolean
+  parts: { project: Project; change: Change }[]
+}
+
+const depFor = (project: Project, change: Change) => {
+  const named = project.dependencies.filter((d) => d.name.toLowerCase() === change.name.toLowerCase())
+  return named.find((d) => d.requested === change.from) ?? named[0]
+}
+
+export function unitsOf(targets: { project: Project; changes: Change[] }[]): UpdateUnit[] {
+  const units = new Map<string, UpdateUnit>()
+  for (const t of targets) {
+    for (const change of t.changes) {
+      const dep = depFor(t.project, change)
+      const key = `${t.project.ecosystem}:${dep?.group ?? change.name}`.toLowerCase()
+      const unit = units.get(key) ?? { key, major: false, parts: [] }
+      unit.major ||= bumpOf(dep?.current ?? change.from, change.to) === 'major'
+      unit.parts.push({ project: t.project, change })
+      units.set(key, unit)
+    }
+  }
+  return [...units.values()]
+}
+
+export function targetsOf(units: UpdateUnit[]): { project: Project; changes: Change[] }[] {
+  const byProject = new Map<string, { project: Project; changes: Change[] }>()
+  for (const { project, change } of units.flatMap((u) => u.parts)) {
+    const target = byProject.get(project.id) ?? { project, changes: [] }
+    target.changes.push(change)
+    byProject.set(project.id, target)
+  }
+  return [...byProject.values()]
+}
+
+/**
+ * The order a repository's updates are tried in: everything that stays on
+ * its release line together first, then each breaking move on its own, so
+ * one that breaks the project holds back only itself.
+ */
+export function stagesOf(units: UpdateUnit[]): UpdateUnit[][] {
+  const small = units.filter((u) => !u.major)
+  return [...(small.length ? [small] : []), ...units.filter((u) => u.major).map((u) => [u])]
+}
+
+/** A failed try split in two, to find the part that breaks. */
+export function halves<T>(list: T[]): T[][] {
+  const mid = Math.ceil(list.length / 2)
+  return [list.slice(0, mid), list.slice(mid)]
+}
+
+/** The packages of a unit that broke the project on its own, as left out. */
+export function leftOut(unit: UpdateUnit): Fallback[] {
+  const lead = unit.key.slice(unit.key.indexOf(':') + 1)
+  return unit.parts
+    .filter((p, i, all) => all.findIndex((q) => q.change.name === p.change.name) === i)
+    .map(({ project, change }) => {
+      const stays = depFor(project, change)?.current ?? change.from.replace(/^[^\d]*/, '')
+      return {
+        name: change.name,
+        tried: change.to,
+        to: null,
+        stays,
+        with: change.name.toLowerCase() === lead ? null : (unit.parts.find((p) => p.change.name.toLowerCase() === lead)?.change.name ?? null),
+        keep: { ecosystem: project.ecosystem, name: change.name, line: holdLine(stays), from: stays, to: change.to },
+      }
+    })
 }
 
 /** The engine's reason, as a sentence: "kept on 5.x" -> "Kept on 5.x". */

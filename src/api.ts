@@ -523,6 +523,7 @@ const mock = (() => {
         }
         const major = (a: string, b: string) => a.replace(/^\D+/, '').split('.')[0] !== b.replace(/^\D+/, '').split('.')[0]
         const clash = list.flatMap((p) => p.changes).find((c) => /eslint/.test(c.name) && major(c.from, c.to))
+        const breaks = list.flatMap((p) => p.changes).some((c) => c.name === 'express' && major(c.from, c.to))
         if (clash) {
           const line = clash.from.replace(/^\D+/, '').split('.')[0]
           const range = `^${line}.0.0`
@@ -572,6 +573,12 @@ npm error peer ${clash.name}@"${range}" from eslint-plugin-react-hooks@5.2.0`
           for (let t = 0; t < 14 && !stopped(); t++) await new Promise((r) => setTimeout(r, 200))
           release()
           if (stopped()) return cancelled()
+          // A build that breaks without naming the package, so finding it takes splitting the update.
+          if (step.kind === 'verify' && breaks) {
+            results.push({ label: step.label, kind: step.kind, ok: false, output: "src/server.ts(41,7): error TS2339: Property 'del' does not exist on type 'Express'.", ms: 2800 })
+            emit({ job, projects, state: 'rolled-back', label: `${step.label} failed`, lane: null })
+            return { job, name: job.split(/[\\/]/).pop() ?? job, repo: list[0].repo, projects, ok: false, rolledBack: true, cancelled: false, error: `\`${step.label}\` failed`, steps: results, committed: null, commitError: null, commitSkipped: null, conflicts: [], failedBefore: false }
+          }
           results.push({ label: step.label, kind: step.kind, ok: true, output: 'done', ms: 2800 })
         }
         emit({ job, projects, state: 'done', label: null, lane: null })

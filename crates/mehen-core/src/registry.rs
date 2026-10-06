@@ -262,6 +262,18 @@ async fn crates(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInf
         yanked: bool,
         #[serde(default)]
         rust_version: Option<String>,
+        #[serde(default)]
+        deps: Vec<Dep>,
+    }
+    #[derive(Deserialize)]
+    struct Dep {
+        name: String,
+        req: String,
+        #[serde(default)]
+        kind: Option<String>,
+        /// The real crate name when the dependency is renamed.
+        #[serde(default)]
+        package: Option<String>,
     }
     let lower = name.to_ascii_lowercase();
     let prefix = match lower.len() {
@@ -272,10 +284,17 @@ async fn crates(http: &reqwest::Client, name: &str) -> anyhow::Result<PackageInf
     };
     let body = get(http, &format!("https://index.crates.io/{prefix}/{lower}"), None).await?.text().await?;
     let entries: Vec<Entry> = body.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).filter(|e| !e.yanked).collect();
-    let requirements = entries
-        .iter()
-        .filter_map(|e| e.rust_version.as_ref().map(|r| (e.vers.clone(), Requirement::Rust { version: r.clone() })))
-        .collect();
+    let mut requirements: Vec<(String, Requirement)> = Vec::new();
+    for e in &entries {
+        if let Some(r) = &e.rust_version {
+            requirements.push((e.vers.clone(), Requirement::Rust { version: r.clone() }));
+        }
+        let deps: Vec<(String, String)> =
+            e.deps.iter().filter(|d| d.kind.as_deref() != Some("dev")).map(|d| (d.package.clone().unwrap_or_else(|| d.name.clone()), d.req.clone())).collect();
+        if !deps.is_empty() {
+            requirements.push((e.vers.clone(), Requirement::Crates { deps }));
+        }
+    }
     let versions: Vec<String> = entries.into_iter().map(|e| e.vers).collect();
     Ok(PackageInfo { latest: max_version(versions.iter().map(String::as_str)), versions, requirements, ..Default::default() })
 }

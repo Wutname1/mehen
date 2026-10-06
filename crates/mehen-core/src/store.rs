@@ -404,6 +404,16 @@ impl Store {
                 conn.execute_batch("PRAGMA user_version = 11;")?;
             }
         }
+        if version < 12 {
+            // Crates cached before their dependencies were kept are fetched
+            // again, so crates that pin each other can move together. Version
+            // 11 may still be waiting on its VACUUM; this waits with it.
+            conn.execute_batch("DELETE FROM package WHERE ecosystem = 'cargo';")?;
+            let now: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if now >= 11 {
+                conn.execute_batch("PRAGMA user_version = 12;")?;
+            }
+        }
         Ok(Self { conn: Mutex::new(conn), path })
     }
 

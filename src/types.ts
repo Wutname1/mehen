@@ -331,6 +331,7 @@ export type Requirement =
   | { kind: 'rust'; version: string }
   | { kind: 'node'; range: string }
   | { kind: 'peers'; peers: [string, string][] }
+  | { kind: 'crates'; deps: [string, string][] }
   | { kind: 'python' | 'dart' | 'php' | 'ruby'; range: string }
 
 /** One published version, as one project sees it. */

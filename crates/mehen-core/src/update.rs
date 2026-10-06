@@ -1432,6 +1432,13 @@ mod tests {
     }
 
     #[test]
+    fn cargo_keeps_an_exact_pin_exact() {
+        assert_eq!(cargo_spec("=2.0.0-rc.22", "2.0.0-rc.25").as_deref(), Some("=2.0.0-rc.25"));
+        assert_eq!(cargo_spec("~2.12.0", "2.13.1").as_deref(), Some("~2.13.1"));
+        assert_eq!(cargo_spec("0.0.9", "0.0.12").as_deref(), Some("0.0.12"));
+    }
+
+    #[test]
     fn cargo_keeps_precision_comments_and_tables() {
         let dir = temp("cargo");
         std::fs::write(
