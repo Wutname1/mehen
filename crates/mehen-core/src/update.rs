@@ -390,7 +390,7 @@ fn held_in_group(dep: &Dependency, to: &str) -> bool {
 /// A tag like `latest` or `*` follows whatever is published, so the lockfile
 /// alone decides what is installed; it becomes `^19.1.0`, which says so.
 fn keep_prefix(old: &str, to: &str) -> Option<String> {
-    if matches!(old.trim(), "latest" | "*" | "x" | "") {
+    if any_version(old) {
         return Some(format!("^{to}"));
     }
     if old.contains(' ') || old.contains("||") || from_spec(old).is_none() {
@@ -398,6 +398,23 @@ fn keep_prefix(old: &str, to: &str) -> Option<String> {
     }
     let prefix: String = old.chars().take_while(|c| !c.is_ascii_digit()).collect();
     Some(format!("{prefix}{to}"))
+}
+
+/// An npm spec that accepts every version: `latest`, `*`, `x`, `x.x`, empty.
+fn any_version(spec: &str) -> bool {
+    let s = spec.trim();
+    s.eq_ignore_ascii_case("latest") || s.chars().all(|c| matches!(c, '*' | 'x' | 'X' | '.'))
+}
+
+/// An npm dist-tag other than `latest` (`next`, `beta`, `canary`): it
+/// follows whatever is published under that tag, so there is no version in
+/// package.json to move. Only the lockfile can catch up.
+fn npm_dist_tag(spec: &str) -> bool {
+    let s = spec.trim();
+    !any_version(s)
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && from_spec(s).is_none()
 }
 
 /// `rewrite(old, to)`, or with `loosen` an exact pin written as a range instead.
@@ -415,7 +432,21 @@ fn replace_middle(re: &Regex, text: &str, new: &str) -> Option<String> {
 fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Path>, deps: &[(&Dependency, &Change)]) -> anyhow::Result<()> {
     let before = read(manifest)?;
     let mut text = before.clone();
+    // Packages that follow a dist-tag: package.json stays, the lockfile moves.
+    let mut refresh: Vec<&str> = Vec::new();
     for (dep, change) in deps {
+        if !change.loosen && npm_dist_tag(&dep.requested) {
+            plan.warnings.push(format!("{} follows the `{}` tag, so package.json stays as it is and only the lockfile is refreshed.", dep.name, dep.requested.trim()));
+            plan.changes.push(PlannedChange {
+                name: dep.name.clone(),
+                from: dep.current.clone().unwrap_or_else(|| dep.requested.clone()),
+                to: change.to.clone(),
+                written_before: dep.requested.clone(),
+                written_after: dep.requested.clone(),
+            });
+            refresh.push(&dep.name);
+            continue;
+        }
         let mut new_spec = respec(Ecosystem::Npm, change.loosen, &dep.requested, &change.to, keep_prefix).ok_or_else(|| anyhow!("{}: cannot rewrite the range `{}` automatically", dep.name, dep.requested))?;
         // Moving with a group but kept below its newest (TypeScript at 6.0.x
         // for Angular 22): `^` would let npm take a newer minor the group
@@ -450,6 +481,16 @@ fn plan_npm(plan: &mut UpdatePlan, manifest: &Path, dir: &Path, repo: Option<&Pa
                 args.push("--no-frozen-lockfile");
             }
             push_step(plan, StepKind::Install, &format!("{pm} install"), pm, &args, &lock_dir);
+            if !refresh.is_empty() {
+                // Re-resolves only these from their tag, without touching package.json.
+                let verb: &[&str] = match pm {
+                    "yarn" if lock_dir.join(".yarnrc.yml").is_file() => &["up", "-R"],
+                    "yarn" => &["upgrade"],
+                    _ => &["update"],
+                };
+                let args: Vec<&str> = verb.iter().copied().chain(refresh.iter().copied()).collect();
+                push_step(plan, StepKind::Install, &format!("{pm} {}", args.join(" ")), pm, &args, &lock_dir);
+            }
             if scripts_build {
                 push_step(plan, StepKind::Verify, &format!("{pm} run build"), pm, &["run", "build"], dir);
             }
@@ -1324,6 +1365,46 @@ mod tests {
         let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("@vitejs/plugin-react", Ecosystem::Npm, "latest", "6.1.1")]);
         let plan = plan(&p, &[Change { from: None, name: "@vitejs/plugin-react".into(), to: "6.1.2".into(), loosen: false }], |_| None).unwrap();
         assert!(plan.edits[0].after.contains("\"@vitejs/plugin-react\": \"^6.1.2\""), "{}", plan.edits[0].after);
+    }
+
+    #[test]
+    fn npm_writes_a_range_for_every_wildcard_spelling() {
+        for spec in ["X", "x.x", "*.*", ""] {
+            let dir = temp("npm-wildcard");
+            std::fs::write(dir.join("package.json"), format!("{{\n  \"dependencies\": {{\n    \"react\": \"{spec}\"\n  }}\n}}\n")).unwrap();
+            let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, spec, "18.2.0")]);
+            let plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap_or_else(|e| panic!("`{spec}`: {e}"));
+            assert!(plan.edits[0].after.contains("\"react\": \"^19.1.0\""), "`{spec}`: {}", plan.edits[0].after);
+        }
+    }
+
+    #[test]
+    fn npm_leaves_a_dist_tag_alone_and_refreshes_the_lockfile() {
+        let dir = temp("npm-next");
+        let manifest = "{\n  \"dependencies\": {\n    \"react\": \"next\",\n    \"left-pad\": \"^1.0.0\"\n  }\n}\n";
+        std::fs::write(dir.join("package.json"), manifest).unwrap();
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "next", "19.0.0"), dep("left-pad", Ecosystem::Npm, "^1.0.0", "1.0.0")]);
+        let changes = [Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }, Change { from: None, name: "left-pad".into(), to: "1.3.0".into(), loosen: false }];
+        let plan = plan(&p, &changes, |_| None).expect("a dist-tag must not fail the plan");
+        assert!(plan.edits[0].after.contains("\"react\": \"next\""), "{}", plan.edits[0].after);
+        assert!(plan.edits[0].after.contains("\"left-pad\": \"^1.3.0\""));
+        let react = plan.changes.iter().find(|c| c.name == "react").unwrap();
+        assert_eq!((react.written_before.as_str(), react.written_after.as_str()), ("next", "next"));
+        let installs: Vec<Vec<String>> = plan.steps.iter().filter(|s| s.kind == StepKind::Install).map(|s| s.args.clone()).collect();
+        assert_eq!(installs, vec![vec!["install".to_string()], vec!["update".to_string(), "react".to_string()]]);
+        assert_eq!(plan.warnings.len(), 1);
+    }
+
+    #[test]
+    fn a_dist_tag_alone_still_makes_a_plan() {
+        let dir = temp("npm-next-only");
+        std::fs::write(dir.join("package.json"), "{\n  \"dependencies\": {\n    \"react\": \"canary\"\n  }\n}\n").unwrap();
+        std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
+        let p = project(&dir, "package.json", Ecosystem::Npm, vec![dep("react", Ecosystem::Npm, "canary", "19.0.0")]);
+        let plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap();
+        assert!(plan.edits.is_empty());
+        assert!(plan.steps.iter().any(|s| s.program == "pnpm" && s.args == ["update", "react"]));
     }
 
     #[test]
