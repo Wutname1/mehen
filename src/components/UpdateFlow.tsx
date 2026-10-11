@@ -2,7 +2,7 @@ import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { applyPins, bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
-import type { AiTool, BatchEvent, Change, CommitOutcome, Conflict, FixEvent, FixOutcome, Inventory, JobOutcome, JobState, KnownFailure, Project, Step, UpdatePlan } from '../types'
+import type { AiTool, BatchEvent, Change, CommitOutcome, Conflict, FixEvent, FixOutcome, Inventory, JobOutcome, JobState, KnownFailure, MissingTool, Project, Step, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { FeedbackDialog } from './FeedbackDialog'
@@ -295,6 +295,8 @@ export function UpdateFlow({
   const resume = useRef<Stage | null>(null)
   /** Checks left out of the next run (by step key) because they failed before the update too. */
   const [skipSteps, setSkipSteps] = useState<Set<string>>(new Set())
+  /** Tools the planned updates need that this computer does not have. */
+  const [missing, setMissing] = useState<MissingTool[]>([])
 
   useEffect(() => {
     let cancelled = false
@@ -328,6 +330,17 @@ export function UpdateFlow({
   }, [])
 
   const jobs = useMemo(() => jobsOf(plans, nameOf), [plans, nameOf])
+
+  useEffect(() => {
+    let cancelled = false
+    api.missingTools(plans).then(
+      (found) => !cancelled && setMissing(found),
+      () => !cancelled && setMissing([]),
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [plans])
   const busy = stage === 'planning' || stage === 'running'
   const close = () => !busy && stage !== 'fix' && onClose(refreshed)
 
@@ -769,6 +782,7 @@ export function UpdateFlow({
             </section>
           )
         })}
+        {missing.length > 0 && <MissingTools missing={missing} />}
         {failed.length > 0 && <Unplannable failed={failed} roots={roots} onNote={setNote} />}
       </Dialog>
     )
@@ -794,6 +808,7 @@ export function UpdateFlow({
           </>
         }
       >
+        {missing.length > 0 && <MissingTools missing={missing} />}
         {failed.length > 0 && <Unplannable failed={failed} roots={roots} onNote={setNote} />}
         {pins}
         <div className="grid gap-2.5">
@@ -1188,7 +1203,9 @@ export function UpdateFlow({
                 </small>
               ) : o.missingTool ? (
                 <>
-                  <small className="text-[12px] text-risk-security">`{o.missingTool}` is not installed on this computer, so this project could not be updated. Files restored.</small>
+                  <small className="text-[12px] text-risk-security">
+                    {toolName(o.missingTool)} is not installed on this computer, so this project could not be updated. {o.rolledBack ? 'Files restored.' : 'Nothing was changed.'}
+                  </small>
                   <div className="mt-1.5">
                     <Button onClick={() => void api.openLink(installLink(o.missingTool!).url)}>Install {installLink(o.missingTool).name}</Button>
                   </div>
@@ -1418,6 +1435,36 @@ function ReportButton({ make, onNote }: { make: () => Report & { title: string }
       </button>
       {state.step === 'failed' && <span className="text-[12px] text-risk-security">{state.message}</span>}
     </span>
+  )
+}
+
+/** What a missing tool is called where people download it: "Node.js", not "node". */
+function toolName(tool: string) {
+  const name = installLink(tool).name
+  return name === tool ? '`' + tool + '`' : name
+}
+
+/** Said before anything runs: these projects need a tool this computer does not have. */
+function MissingTools({ missing }: { missing: MissingTool[] }) {
+  return (
+    <div className="mb-3 rounded-[3px] border border-[color-mix(in_oklab,var(--risk-review)_35%,var(--line))] px-3 py-2.5">
+      {missing.map((m) => {
+        const link = installLink(m.tool)
+        const one = m.projects.length === 1
+        return (
+          <div key={m.tool} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 py-0.5">
+            <b className="flex min-w-0 flex-1 items-center gap-2 text-[13px] text-risk-review">
+              <AlertTriangle size={15} className="shrink-0" />
+              {toolName(m.tool)} is not installed on this computer, so {one ? '1 project' : `${m.projects.length} projects`} will be left as {one ? 'it is' : 'they are'}.
+            </b>
+            <Button onClick={() => void api.openLink(link.url)} className="h-7 px-2.5 text-[12px]">
+              Install {link.name}
+            </Button>
+          </div>
+        )
+      })}
+      <small className="mt-1 block text-[12px] text-muted">Everything else still updates. After installing, restart Mehen and run the update again.</small>
+    </div>
   )
 }
 

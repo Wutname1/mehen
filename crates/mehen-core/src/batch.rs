@@ -371,6 +371,27 @@ pub fn group(plans: Vec<UpdatePlan>) -> Vec<Job> {
 
 const CANCELLED: &str = "Cancelled";
 
+/// Sets aside the repositories whose steps need a tool `installed` says is
+/// missing (`npm`, `node`, `dotnet`, `cargo`, ...). Their files are never
+/// touched: each gets an outcome naming the tool, and the rest go on to
+/// [`run`].
+pub fn without_missing_tools(plans: Vec<UpdatePlan>, installed: impl Fn(&str) -> bool) -> (Vec<UpdatePlan>, Vec<JobOutcome>) {
+    let mut runnable = Vec::new();
+    let mut skipped = Vec::new();
+    for job in group(plans) {
+        match update::missing_tool(job.plans.iter().flat_map(|p| &p.steps), &installed) {
+            Some(tool) => {
+                let mut outcome = job.outcome();
+                outcome.error = Some(format!("`{tool}` {} Nothing was changed.", update::NOT_INSTALLED));
+                outcome.missing_tool = Some(tool);
+                skipped.push(outcome);
+            }
+            None => runnable.extend(job.plans),
+        }
+    }
+    (runnable, skipped)
+}
+
 /// Runs every plan. `run_step` executes one command (tests pass a fake);
 /// `on_event` reports progress per repository. A job stops, and its files
 /// are put back, when its switch in `cancels` is thrown.
@@ -520,7 +541,7 @@ where
         } else if !ok {
             failed.push(step.clone());
         }
-        let missing = !ok && output.ends_with(update::NOT_INSTALLED);
+        let missing = if ok { None } else { update::missing_tool_in_output(&step, &output) };
         outcome.steps.push(StepResult { label: step.label.clone(), kind: step.kind, ok, output: update::tail(&output), ms: started.elapsed().as_millis() as u64 });
         if cancel.is_cancelled() {
             roll_back(&mut outcome, CANCELLED.into());
@@ -528,9 +549,9 @@ where
         }
         // Nothing else can run without it, and trying again without the
         // updates would only fail the same way.
-        if missing {
-            outcome.missing_tool = Some(lane.clone());
-            roll_back(&mut outcome, format!("`{lane}` {}", update::NOT_INSTALLED.trim_end_matches('.')));
+        if let Some(tool) = missing {
+            roll_back(&mut outcome, format!("`{tool}` {}", update::NOT_INSTALLED.trim_end_matches('.')));
+            outcome.missing_tool = Some(tool);
             return outcome;
         }
         if !ok {
@@ -1058,6 +1079,34 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert!(outcome.rolled_back && !outcome.ok);
         assert_eq!(outcome.failed_before, None);
         assert_eq!(std::fs::read_to_string(dir.join("package.json")).unwrap(), "before");
+    }
+
+    #[tokio::test]
+    async fn node_missing_behind_npm_counts_as_a_missing_tool() {
+        let dir = temp("missing-node");
+        let p = plan(&dir, "package.json", Some(&dir), vec![step("npm", StepKind::Install, &dir)]);
+        let fake = |_: Step, _: Cancel| async { (false, "'node' is not recognized as an internal or external command,
+operable program or batch file.".to_string()) };
+        let opts = BatchOptions { build: false, test: false, commit: false, force_commit: false, push: false, parallel: 1, stop_on_failure: true };
+        let outcome = run(vec![p], opts, &Cancels::default(), fake, |_| {}).await.remove(0);
+        assert_eq!(outcome.missing_tool.as_deref(), Some("node"));
+        assert_eq!(outcome.failed_before, None, "not tried again without the update");
+    }
+
+    #[test]
+    fn repositories_missing_a_tool_are_set_aside_untouched() {
+        let (npm_dir, dotnet_dir) = (temp("aside-npm"), temp("aside-dotnet"));
+        let plans = vec![
+            plan(&npm_dir, "package.json", Some(&npm_dir), vec![step("npm", StepKind::Install, &npm_dir)]),
+            plan(&dotnet_dir, "app.csproj", Some(&dotnet_dir), vec![step("dotnet", StepKind::Install, &dotnet_dir)]),
+        ];
+        let (runnable, skipped) = without_missing_tools(plans, |p| p != "node");
+        assert_eq!(runnable.len(), 1);
+        assert!(runnable[0].project_id.ends_with("app.csproj"));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].missing_tool.as_deref(), Some("node"));
+        assert!(!skipped[0].ok && !skipped[0].rolled_back);
+        assert_eq!(std::fs::read_to_string(npm_dir.join("package.json")).unwrap(), "before", "nothing written");
     }
 
     #[tokio::test]

@@ -596,12 +596,42 @@ async fn apply_batch(app: AppHandle, plans: Vec<UpdatePlan>, build: bool, test: 
     let options = BatchOptions { build, test, commit, force_commit: force_commit.unwrap_or(false), push: push.unwrap_or(false), parallel, stop_on_failure: stop_on_failure.unwrap_or(true) };
     let cancels = Arc::new(Cancels::default());
     *app.state::<AppState>().cancels.lock().unwrap_or_else(|e| e.into_inner()) = cancels.clone();
-    let outcomes = batch::run(plans, options, &cancels, |step, cancel| async move { update::run_step(&step, &cancel).await }, |e: BatchEvent| {
-        let _ = app.emit("mehen://batch", e);
-    })
-    .await;
+    // A repository whose tools are not installed is not tried at all.
+    let (plans, mut outcomes) = batch::without_missing_tools(plans, |program| update::find_program(program).is_some());
+    for outcome in &outcomes {
+        let _ = app.emit("mehen://batch", BatchEvent { job: outcome.job.clone(), projects: outcome.projects.clone(), state: batch::JobState::Failed, label: outcome.error.clone(), lane: outcome.missing_tool.clone() });
+    }
+    outcomes.extend(
+        batch::run(plans, options, &cancels, |step, cancel| async move { update::run_step(&step, &cancel).await }, |e: BatchEvent| {
+            let _ = app.emit("mehen://batch", e);
+        })
+        .await,
+    );
     let inventory = if outcomes.iter().any(|o| o.ok) { Some(check_now(&app, false, None).await?) } else { None };
     Ok(BatchResult { outcomes, inventory })
+}
+
+/// Tools the plans' steps need that are not installed, each with the
+/// projects that need it, so the review can say so before anything runs.
+#[tauri::command]
+fn missing_tools(plans: Vec<UpdatePlan>) -> Vec<MissingTool> {
+    let mut found: Vec<MissingTool> = Vec::new();
+    for plan in &plans {
+        if let Some(tool) = update::missing_tool(&plan.steps, |program| update::find_program(program).is_some()) {
+            match found.iter_mut().find(|m| m.tool == tool) {
+                Some(m) => m.projects.push(plan.project_id.clone()),
+                None => found.push(MissingTool { tool, projects: vec![plan.project_id.clone()] }),
+            }
+        }
+    }
+    found
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MissingTool {
+    tool: String,
+    projects: Vec<String>,
 }
 
 /// A package's published versions for one project: whether each fits and
@@ -752,6 +782,7 @@ pub fn run() {
             scan_and_check,
             plan_update,
             apply_batch,
+            missing_tools,
             cancel_update,
             ai::ai_tools,
             ai::fix_update,

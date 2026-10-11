@@ -331,7 +331,7 @@ export interface JobOutcome {
   knownFailures?: KnownFailure[]
   /** Projects whose own step fails without the update, with nothing to accept. */
   brokenProjects?: string[]
-  /** The tool a step needed that is not installed: npm, dotnet... */
+  /** The tool a step needed that is not installed: npm, node, dotnet... */
   missingTool?: string | null
   /** Steps that fail the same way without the update: the project was already broken there. */
   alreadyFailing?: FailingStep[]
@@ -343,6 +343,12 @@ export interface FailingStep {
   step: string
   label: string
   kind: StepKind
+}
+
+/** A tool an update needs that is not installed, and the projects that need it. */
+export interface MissingTool {
+  tool: string
+  projects: string[]
 }
 
 export interface Conflict {

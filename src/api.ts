@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
 import { compareVersions, isWithin, samePath } from './derive'
-import type { OpenRepoRequest, AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move, AiTool, AiToolId, FixEvent, FixOutcome } from './types'
+import type { OpenRepoRequest, AppUpdateProgress, BatchEvent, BatchResult, Change, Ecosystem, Hold, CheckCommands, VersionPolicies, VersionPolicy, CommitOutcome, DiscoveredProject, IgnoreKind, IgnoreRule, Inventory, JobOutcome, Progress, Project, Settings, StepResult, ReleaseNotes, StoreStats, UpdatePlan, VersionView, Move, AiTool, AiToolId, FixEvent, FixOutcome, MissingTool } from './types'
 
 /** False when the UI runs in a plain browser (vite dev without Tauri). */
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
@@ -245,6 +245,12 @@ export async function planUpdate(projectId: string, changes: Change[]): Promise<
 export async function applyBatch(plans: UpdatePlan[], run: { build: boolean; test: boolean }, commit: boolean, stopOnFailure = true, forceCommit = false, push = false): Promise<BatchResult> {
   if (!inTauri) return mock.applyBatch(plans, run, commit, push)
   return invoke<BatchResult>('apply_batch', { plans, build: run.build, test: run.test, commit, stopOnFailure, forceCommit, push })
+}
+
+/** Tools the plans need that are not installed on this computer. */
+export async function missingTools(plans: UpdatePlan[]): Promise<MissingTool[]> {
+  if (!inTauri) return []
+  return invoke<MissingTool[]>('missing_tools', { plans })
 }
 
 export async function onBatchEvent(handler: (e: BatchEvent) => void): Promise<UnlistenFn> {

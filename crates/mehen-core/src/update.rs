@@ -1155,6 +1155,58 @@ pub(crate) fn resolve_program(program: &str) -> PathBuf {
         .unwrap_or(given)
 }
 
+/// Where `program` is on PATH, or `None` when it is not installed (or not
+/// on PATH, which for running it is the same thing).
+pub fn find_program(program: &str) -> Option<PathBuf> {
+    let given = Path::new(program);
+    if given.components().count() > 1 {
+        return given.is_file().then(|| given.to_path_buf());
+    }
+    let exts: Vec<String> = if cfg!(windows) && given.extension().is_none() {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into()).split(';').filter(|e| !e.is_empty()).map(str::to_lowercase).collect()
+    } else {
+        vec![String::new()]
+    };
+    let dirs = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    dirs.iter().flat_map(|dir| exts.iter().map(move |ext| dir.join(format!("{program}{ext}")))).find(|candidate| candidate.is_file())
+}
+
+/// Package managers that are Node.js programs: they are on PATH as small
+/// launchers that fail with an ordinary error when Node itself is missing.
+fn needs_node(program: &str) -> bool {
+    matches!(program.to_ascii_lowercase().trim_end_matches(".cmd").trim_end_matches(".exe"), "npm" | "npx" | "pnpm" | "yarn")
+}
+
+/// The first tool `steps` need that `installed` says is missing: the step's
+/// own program, or Node.js behind npm, pnpm and yarn.
+pub fn missing_tool<'a>(steps: impl IntoIterator<Item = &'a Step>, installed: impl Fn(&str) -> bool) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    for step in steps {
+        let program = step.program.to_ascii_lowercase();
+        if !seen.insert(program.clone()) {
+            continue;
+        }
+        if !installed(&step.program) {
+            return Some(program.trim_end_matches(".cmd").trim_end_matches(".exe").to_string());
+        }
+        if needs_node(&program) && seen.insert("node".into()) && !installed("node") {
+            return Some("node".into());
+        }
+    }
+    None
+}
+
+/// The tool a failed step's output says is missing: the program itself
+/// (it could not start), or Node.js behind an npm launcher.
+pub fn missing_tool_in_output(step: &Step, output: &str) -> Option<String> {
+    if output.trim_end().ends_with(NOT_INSTALLED) {
+        return Some(step.program.to_ascii_lowercase().trim_end_matches(".cmd").trim_end_matches(".exe").to_string());
+    }
+    let lower = output.to_ascii_lowercase();
+    let node_missing = ["'node' is not recognized as an internal or external command", "node: not found", "node: command not found", "env: node: no such file or directory", "env: 'node': no such file or directory"];
+    (needs_node(&step.program) && node_missing.iter().any(|m| lower.contains(m))).then(|| "node".into())
+}
+
 /// How a step's output ends when its program could not be found.
 pub const NOT_INSTALLED: &str = "is not installed on this computer.";
 
@@ -1405,6 +1457,30 @@ mod tests {
         let plan = plan(&p, &[Change { from: None, name: "react".into(), to: "19.1.0".into(), loosen: false }], |_| None).unwrap();
         assert!(plan.edits.is_empty());
         assert!(plan.steps.iter().any(|s| s.program == "pnpm" && s.args == ["update", "react"]));
+    }
+
+    fn step_of(program: &str) -> Step {
+        Step { kind: StepKind::Install, label: format!("{program} install"), program: program.into(), args: vec!["install".into()], cwd: ".".into() }
+    }
+
+    #[test]
+    fn missing_tool_names_the_program_or_node_behind_it() {
+        let steps = [step_of("npm"), step_of("dotnet")];
+        assert_eq!(missing_tool(&steps, |_| true), None);
+        assert_eq!(missing_tool(&steps, |p| p != "dotnet"), Some("dotnet".into()));
+        assert_eq!(missing_tool(&steps, |p| p != "npm"), Some("npm".into()));
+        assert_eq!(missing_tool(&steps, |p| p != "node"), Some("node".into()), "npm is only a launcher for Node");
+        assert_eq!(missing_tool(&[step_of("bun")], |p| p != "node"), None, "bun does not need Node");
+    }
+
+    #[test]
+    fn missing_tool_is_read_from_a_failed_steps_output() {
+        let npm = step_of("npm");
+        assert_eq!(missing_tool_in_output(&npm, &format!("`npm` {NOT_INSTALLED}")), Some("npm".into()));
+        assert_eq!(missing_tool_in_output(&npm, "'node' is not recognized as an internal or external command,\r\noperable program or batch file."), Some("node".into()));
+        assert_eq!(missing_tool_in_output(&npm, "/usr/bin/env: node: No such file or directory"), Some("node".into()));
+        assert_eq!(missing_tool_in_output(&npm, "npm ERR! code ERESOLVE"), None);
+        assert_eq!(missing_tool_in_output(&step_of("dotnet"), "node: not found"), None);
     }
 
     #[test]
