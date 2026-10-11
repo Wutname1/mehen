@@ -115,6 +115,19 @@ pub struct JobOutcome {
     /// to accept (a package that cannot be found, say): the rest of the job
     /// can go ahead without them.
     pub broken_projects: Vec<String>,
+    /// Steps that fail the same way without the update: the project was
+    /// already broken there, so the failure says nothing about the update.
+    pub already_failing: Vec<FailingStep>,
+}
+
+/// A step that failed before the update too.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailingStep {
+    /// As [`update::step_key`] names it, so the step can be left out of a run.
+    pub step: String,
+    pub label: String,
+    pub kind: StepKind,
 }
 
 /// One repository's share of the batch.
@@ -128,6 +141,33 @@ pub struct Job {
 impl Job {
     fn projects(&self) -> Vec<String> {
         self.plans.iter().map(|p| p.project_id.clone()).collect()
+    }
+
+    /// A blank outcome: not done, nothing run yet.
+    fn outcome(&self) -> JobOutcome {
+        JobOutcome {
+            job: self.key.clone(),
+            name: self.name.clone(),
+            repo: self.repo.as_ref().map(|r| r.display().to_string()),
+            projects: self.projects(),
+            ok: false,
+            rolled_back: false,
+            cancelled: false,
+            error: None,
+            steps: Vec::new(),
+            committed: None,
+            commit_error: None,
+            commit_skipped: None,
+            pushed: false,
+            push_error: None,
+            conflicts: Vec::new(),
+            notes: Vec::new(),
+            failed_before: None,
+            missing_tool: None,
+            known_failures: Vec::new(),
+            broken_projects: Vec::new(),
+            already_failing: Vec::new(),
+        }
     }
 
     fn event(&self, state: JobState, label: Option<String>, lane: Option<String>) -> BatchEvent {
@@ -366,28 +406,7 @@ where
     F: Future<Output = (bool, String)>,
     E: Fn(BatchEvent),
 {
-    let mut outcome = JobOutcome {
-        job: job.key.clone(),
-        name: job.name.clone(),
-        repo: job.repo.as_ref().map(|r| r.display().to_string()),
-        projects: job.projects(),
-        ok: false,
-        rolled_back: false,
-        cancelled: false,
-        error: None,
-        steps: Vec::new(),
-        committed: None,
-        commit_error: None,
-        commit_skipped: None,
-        pushed: false,
-        push_error: None,
-        conflicts: Vec::new(),
-        notes: Vec::new(),
-        failed_before: None,
-        missing_tool: None,
-        known_failures: Vec::new(),
-        broken_projects: Vec::new(),
-    };
+    let mut outcome = job.outcome();
     let fail = |outcome: &mut JobOutcome, error: String| {
         outcome.error = Some(error.clone());
         on_event(job.event(JobState::Failed, Some(error), None));
@@ -651,7 +670,11 @@ async fn settle<R, F, E>(
         let (before, after) = (failures::signatures(&before), reported.get(&key).cloned().unwrap_or_default());
         let added: BTreeSet<String> = after.difference(&before).cloned().collect();
         let comparable = !ok && step.kind.is_check() && !before.is_empty() && !after.is_empty();
-        outcome.failed_before = Some(outcome.failed_before.unwrap_or(false) || (!ok && !(comparable && !added.is_empty())));
+        let was_failing = !ok && !(comparable && !added.is_empty());
+        outcome.failed_before = Some(outcome.failed_before.unwrap_or(false) || was_failing);
+        if was_failing {
+            outcome.already_failing.push(FailingStep { step: key.clone(), label: step.label.clone(), kind: step.kind });
+        }
         outcome.notes.push(if ok {
             format!("`{}` works without these updates, so one of them broke it.", step.label)
         } else if comparable && added.is_empty() {
@@ -1015,6 +1038,7 @@ npm error peer package.json-dep@\"^1.0.0\" from some-plugin@3.0.0";
         assert_eq!(calls.get(), 2, "the restore, then the restore on the original files; no build");
         assert_eq!(outcome.failed_before, Some(true));
         assert_eq!(outcome.broken_projects.len(), 1, "the project whose restore fails anyway");
+        assert_eq!(outcome.already_failing.iter().map(|f| (f.label.as_str(), f.kind)).collect::<Vec<_>>(), vec![("dotnet Install", StepKind::Install)]);
         assert!(outcome.notes.iter().any(|n| n.contains("fails without these updates too")), "{:?}", outcome.notes);
     }
 

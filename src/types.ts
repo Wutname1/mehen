@@ -333,6 +333,16 @@ export interface JobOutcome {
   brokenProjects?: string[]
   /** The tool a step needed that is not installed: npm, dotnet... */
   missingTool?: string | null
+  /** Steps that fail the same way without the update: the project was already broken there. */
+  alreadyFailing?: FailingStep[]
+}
+
+/** A step that failed before the update too. */
+export interface FailingStep {
+  /** The engine's key for the step (`program|args|cwd`, lowercased), to leave it out of a run. */
+  step: string
+  label: string
+  kind: StepKind
 }
 
 export interface Conflict {

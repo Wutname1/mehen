@@ -2,7 +2,7 @@ import { AlertTriangle, Ban, Box, Check, ChevronRight, Copy, FileText, GitBranch
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import * as api from '../api'
 import { applyPins, bumpOf, folderName, halves, leftOut, relativePath, runLabel, stagesOf, targetsOf, unitsOf, withoutCulprits, type Fallback, type UpdateUnit } from '../derive'
-import type { AiTool, BatchEvent, Change, CommitOutcome, Conflict, FixEvent, FixOutcome, Inventory, JobOutcome, JobState, KnownFailure, Project, UpdatePlan } from '../types'
+import type { AiTool, BatchEvent, Change, CommitOutcome, Conflict, FixEvent, FixOutcome, Inventory, JobOutcome, JobState, KnownFailure, Project, Step, UpdatePlan } from '../types'
 import { GitWyrmMark, cx } from './bits'
 import { Button, Dialog } from './Dialog'
 import { FeedbackDialog } from './FeedbackDialog'
@@ -143,15 +143,18 @@ function changesOf(job: Job) {
 
 export const commitSubject = (n: number) => `Updated ${n} ${n === 1 ? 'Dependency' : 'Dependencies'}`
 
-function stepsOf(job: Job, build: boolean, test: boolean) {
+/** The engine's name for a step (`update::step_key`), the same however many plans share it. */
+const stepKey = (s: Step) => `${s.program}|${s.args.join(' ')}|${s.cwd}`.toLowerCase()
+
+function stepsOf(job: Job, build: boolean, test: boolean, skip: Set<string> = new Set()) {
   const seen = new Set<string>()
   const pick = (kind: string) =>
     job.plans
       .flatMap((p) => p.steps)
       .filter((s) => s.kind === kind)
       .filter((s) => {
-        const k = `${s.program}|${s.args.join(' ')}|${s.cwd}`.toLowerCase()
-        return !seen.has(k) && !!seen.add(k)
+        const k = stepKey(s)
+        return !skip.has(k) && !seen.has(k) && !!seen.add(k)
       })
   const install = pick('install')
   return { install, checks: [...(build ? pick('verify') : []), ...(test ? pick('test') : [])] }
@@ -290,6 +293,8 @@ export function UpdateFlow({
   const [ready, setReady] = useState<UpdateTarget[]>([])
   /** The step to come back to when the plans are worked out again (pins changed on it). */
   const resume = useRef<Stage | null>(null)
+  /** Checks left out of the next run (by step key) because they failed before the update too. */
+  const [skipSteps, setSkipSteps] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     let cancelled = false
@@ -415,7 +420,11 @@ export function UpdateFlow({
           const fine = planned.flatMap((p) => (p.target && p.plan ? [{ target: p.target, plan: p.plan }] : []))
           if (!fine.length) continue
           const dirty = dirtyBefore.get(key) ?? new Set()
-          round.push({ key, units: unitsOf(fine.map((f) => f.target)), plans: fine.map((f) => ({ ...f.plan, uncommitted: (f.plan.uncommitted ?? []).filter((x) => dirty.has(x)), acceptedFailures: accepted.get(key) ?? [] })) })
+          round.push({
+            key,
+            units: unitsOf(fine.map((f) => f.target)),
+            plans: fine.map((f) => ({ ...f.plan, steps: f.plan.steps.filter((x) => !skipSteps.has(stepKey(x))), uncommitted: (f.plan.uncommitted ?? []).filter((x) => dirty.has(x)), acceptedFailures: accepted.get(key) ?? [] })),
+          })
         }
         if (!round.length) break
         const result = await api.applyBatch(
@@ -553,7 +562,7 @@ export function UpdateFlow({
   const commands = () =>
     jobs
       .map((job) => {
-        const { install, checks: steps } = stepsOf(job, build, test)
+        const { install, checks: steps } = stepsOf(job, build, test, skipSteps)
         const lines = [`# ${job.name}${job.branch ? ` (${job.branch})` : ''}`, `cd ${job.key}`, ...[...install, ...steps].map((s) => [s.program, ...s.args].join(' '))]
         if (commit && willCommit(job)) lines.push(`git commit -m "${commitSubject(changesOf(job).length)}" -- <changed files>`)
         if (push && willCommit(job)) lines.push('git push')
@@ -736,7 +745,7 @@ export function UpdateFlow({
       >
         {pins}
         {jobs.map((job) => {
-          const { install, checks: steps } = stepsOf(job, build, test)
+          const { install, checks: steps } = stepsOf(job, build, test, skipSteps)
           return (
             <section key={job.key} className="mb-5">
               <h3 className="mb-2 flex items-center gap-2 text-[13px] font-semibold">
@@ -792,7 +801,7 @@ export function UpdateFlow({
             const changes = changesOf(job)
             const edited = new Set(job.plans.flatMap((p) => p.edits.map((e) => e.path.toLowerCase())))
             const lockfiles = [...new Set(job.plans.flatMap((p) => p.snapshots).filter((f) => !edited.has(f.toLowerCase())))].map((f) => relativePath([job.key], f))
-            const { install, checks: steps } = stepsOf(job, build, test)
+            const { install, checks: steps } = stepsOf(job, build, test, skipSteps)
             const warnings = [...new Set(job.plans.flatMap((p) => p.warnings))]
             return (
               <section key={job.key} className="rounded-[3px] border border-line bg-paper">
@@ -1094,6 +1103,11 @@ export function UpdateFlow({
         const culprits = [...new Set(blocking.flatMap((x) => (x.keep ? [x.keep.name] : [])))]
         const rest = changes.filter((ch) => !culprits.includes(ch.name)).length
         const log = [o.error, ...failing.map((s) => s.output)].filter(Boolean).join('\n\n')
+        // Every failed step fails the same way without the update: the project was broken already.
+        const already = o.alreadyFailing ?? []
+        const onlyOld = !o.ok && !o.cancelled && !o.missingTool && failing.length > 0 && failing.every((s) => already.some((a) => a.label === s.label))
+        const skippable = already.filter((a) => a.kind !== 'install' && !skipSteps.has(a.step))
+        const quoted = (list: { label: string }[]) => [...new Set(list.map((a) => a.label))].map((l) => '`' + l + '`').join(' and ')
         const failNotes = (o.notes ?? []).map((note) => (
           <small key={note} className="mt-0.5 block text-[12px] text-muted">
             {note}
@@ -1180,6 +1194,29 @@ export function UpdateFlow({
                   </div>
                   <small className="mt-0.5 block text-[12px] text-muted">After installing it, restart Mehen and run the update again.</small>
                 </>
+              ) : onlyOld ? (
+                <>
+                  <small className="text-[12px] text-risk-review">This project's {quoted(already)} was already failing before the update, so the update is not what broke it. Files restored.</small>
+                  {failNotes}
+                  {skippable.length > 0 && (
+                    <div className="mt-1.5">
+                      <Button
+                        onClick={() => {
+                          setSkipSteps((prev) => new Set([...prev, ...skippable.map((a) => a.step)]))
+                          retry(job, [])
+                        }}
+                        title="Run the update again without the check that was already failing. The install still has to work."
+                      >
+                        <Play size={14} />
+                        Update anyway, skip {quoted(skippable)}
+                      </Button>
+                    </div>
+                  )}
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-[12px] text-muted hover:text-ink">Show output</summary>
+                    <pre className="mt-1 max-h-60 overflow-auto rounded-[3px] bg-sunken px-2.5 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-ink">{log}</pre>
+                  </details>
+                </>
               ) : blocking.length ? (
                 <>
                   <small className="text-[12px] text-risk-security">
@@ -1231,7 +1268,7 @@ export function UpdateFlow({
                   </pre>
                 </>
               )}
-              {!o.ok && !o.cancelled && !o.missingTool && (
+              {!o.ok && !o.cancelled && !o.missingTool && !onlyOld && (
                 <div className="mt-1.5">
                   <ReportButton make={() => updateFailureReport(job, o, ran)} onNote={setNote} />
                 </div>
