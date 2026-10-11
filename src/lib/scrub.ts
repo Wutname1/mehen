@@ -23,6 +23,13 @@ const SECRET_PATTERNS: Array<[RegExp, string]> = [
   [/\bAIza[A-Za-z0-9_-]{30,}/g, 'AIza[redacted]'],
   // AWS access key ids.
   [/\b(?:AKIA|ASIA)[A-Z0-9]{16}/g, 'AKIA[redacted]'],
+  // npm access tokens, and auth lines from .npmrc (`//registry/:_authToken=...`).
+  [/\bnpm_[A-Za-z0-9]{30,}/g, 'npm_[redacted]'],
+  [/(_auth(?:Token)?|_password)\s*=\s*\S+/gi, '$1=[redacted]'],
+  // NuGet.org API keys.
+  [/\boy2[a-z0-9]{40,}/g, 'oy2[redacted]'],
+  // password=... / pwd=... in connection strings and command lines.
+  [/\b(password|passwd|pwd)(\s*[:=]\s*)[^\s;"']+/gi, '$1$2[redacted]'],
   // Bearer/token/key in a header or query string.
   [/\b(Bearer|token|api[-_]?key|x-api-key)(\s*[:=]\s*|\s+)[A-Za-z0-9._~+/-]{12,}=*/gi, '$1 [redacted]'],
   // Credentials embedded in a URL: https://user:pass@host

@@ -17,7 +17,7 @@ use crate::registry::PackageInfo;
 use crate::version::{Version, from_spec};
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const OUTPUT_TAIL_LINES: usize = 80;
+const OUTPUT_TAIL_LINES: usize = 100;
 
 /// One package to move to a new version, as chosen in the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]

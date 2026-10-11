@@ -88,6 +88,12 @@ export interface Report {
   tags?: Record<string, string>
   /** Small structured facts shown on the report itself. */
   context?: Record<string, unknown>
+  /**
+   * Bigger details carried on the report itself (failed command output, the
+   * packages that moved), so they are there even where attachments are not
+   * shown or kept.
+   */
+  extra?: Record<string, unknown>
   /** Send the app version and platform along. On unless turned off. */
   includeDetails?: boolean
 }
@@ -125,7 +131,8 @@ export async function sendReport(report: Report): Promise<SendResult> {
       setTimeout(() => resolve(undefined), 15000)
     })
     if (details) eventScope.setContext('mehen', details)
-    if (report.context) eventScope.setContext('report', scrubDeep(report.context))
+    if (report.context) eventScope.setContext('report', scrubDeep(structuredClone(report.context)))
+    if (report.extra) eventScope.setExtras(scrubDeep(structuredClone(report.extra)))
     eventScope.setTag('report_kind', report.kind)
     for (const [k, v] of Object.entries(report.tags ?? {})) eventScope.setTag(k, scrubText(v))
     Sentry.captureFeedback(

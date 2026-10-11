@@ -23,6 +23,9 @@ const SECRET_PREFIXES: &[&str] = &[
     "AKIA",
     "ASIA",
     "eyJ",
+    // npm access tokens and NuGet.org API keys.
+    "npm_",
+    "oy2",
 ];
 
 /// Minimum tail length after a prefix before it is treated as a real token, so

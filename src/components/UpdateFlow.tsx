@@ -1399,7 +1399,7 @@ function Unplannable({ failed, roots, onNote }: { failed: { project: Project; er
         ))}
       </ul>
       <div className="mt-2">
-        <ReportButton make={() => planFailureReport(failed)} onNote={onNote} />
+        <ReportButton make={() => planFailureReport(failed, roots)} onNote={onNote} />
       </div>
     </div>
   )
